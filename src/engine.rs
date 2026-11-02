@@ -434,9 +434,8 @@ pub fn sample_greedy_argmax(logits: &[f32]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k3_core::GgufFile;
-    use k3_core::QuantType;
-    use k3_core::test_helpers::create_synthetic_gguf_v3;
+    #[cfg(feature = "arch-synthetic")]
+    use k3_core::{GgufFile, QuantType, test_helpers::create_synthetic_gguf_v3};
 
     #[cfg(feature = "arch-synthetic")]
     #[test]

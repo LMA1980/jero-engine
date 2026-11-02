@@ -152,6 +152,7 @@ mod tests {
     #[test]
     fn test_supported_architectures_list() {
         let archs = RecipeRegistry::supported_architectures();
+        let _ = &archs;
         #[cfg(feature = "arch-synthetic")]
         assert!(archs.contains(&"synthetic"));
         #[cfg(feature = "arch-llama")]

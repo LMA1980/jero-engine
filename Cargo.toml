@@ -21,10 +21,15 @@ undocumented_unsafe_blocks = "warn"
 [[bin]]
 name = "k3-diag"
 path = "src/bin/k3-diag/main.rs"
+required-features = ["kernels-rvv"]
 
 [[bin]]
 name = "k3-worker"
 path = "src/bin/k3-worker/main.rs"
+
+[[test]]
+name = "empirical_challenge_m4_bounds"
+required-features = ["arch-mistral"]
 
 [dependencies]
 arch-synthetic = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-synthetic.git", optional = true }
