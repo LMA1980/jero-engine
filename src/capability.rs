@@ -24,6 +24,34 @@ impl RecipeRegistry {
             return Some(&SYNTHETIC);
         }
 
+        #[cfg(feature = "arch-llama")]
+        if architecture == "llama" || architecture == "qwen2" {
+            static LLAMA: k3_arch_llama::LlamaRecipe = k3_arch_llama::LlamaRecipe::new();
+            return Some(&LLAMA);
+        } else if architecture == "llama4" {
+            static LLAMA4: k3_arch_llama::LlamaRecipe = k3_arch_llama::LlamaRecipe::new_llama4();
+            return Some(&LLAMA4);
+        }
+
+        #[cfg(feature = "arch-mistral")]
+        if architecture == "mistral" || architecture == "mistral3" {
+            static MISTRAL: k3_arch_mistral::MistralRecipe = k3_arch_mistral::MistralRecipe::new();
+            return Some(&MISTRAL);
+        } else if architecture == "mixtral" {
+            static MIXTRAL: k3_arch_mistral::MistralRecipe =
+                k3_arch_mistral::MistralRecipe::new_mixtral();
+            return Some(&MIXTRAL);
+        }
+
+        #[cfg(feature = "arch-phi3")]
+        if architecture == "phi3" {
+            static PHI3: k3_arch_phi3::Phi3Recipe = k3_arch_phi3::Phi3Recipe::new();
+            return Some(&PHI3);
+        } else if architecture == "phi4" {
+            static PHI4: k3_arch_phi3::Phi3Recipe = k3_arch_phi3::Phi3Recipe::new_phi4();
+            return Some(&PHI4);
+        }
+
         let _ = architecture;
         None
     }
@@ -31,15 +59,27 @@ impl RecipeRegistry {
     /// Returns a list of architecture identifiers compiled into the current binary.
     #[must_use]
     pub const fn supported_architectures() -> &'static [&'static str] {
-        #[cfg(feature = "arch-synthetic")]
-        {
-            &["synthetic"]
-        }
-
-        #[cfg(not(feature = "arch-synthetic"))]
-        {
-            &[]
-        }
+        const ARCHS: &[&str] = &[
+            #[cfg(feature = "arch-synthetic")]
+            "synthetic",
+            #[cfg(feature = "arch-llama")]
+            "llama",
+            #[cfg(feature = "arch-llama")]
+            "llama4",
+            #[cfg(feature = "arch-llama")]
+            "qwen2",
+            #[cfg(feature = "arch-mistral")]
+            "mistral",
+            #[cfg(feature = "arch-mistral")]
+            "mistral3",
+            #[cfg(feature = "arch-mistral")]
+            "mixtral",
+            #[cfg(feature = "arch-phi3")]
+            "phi3",
+            #[cfg(feature = "arch-phi3")]
+            "phi4",
+        ];
+        ARCHS
     }
 }
 
@@ -112,8 +152,26 @@ mod tests {
     #[test]
     fn test_supported_architectures_list() {
         let archs = RecipeRegistry::supported_architectures();
+        let _ = &archs;
         #[cfg(feature = "arch-synthetic")]
         assert!(archs.contains(&"synthetic"));
+        #[cfg(feature = "arch-llama")]
+        {
+            assert!(archs.contains(&"llama"));
+            assert!(archs.contains(&"llama4"));
+            assert!(archs.contains(&"qwen2"));
+        }
+        #[cfg(feature = "arch-mistral")]
+        {
+            assert!(archs.contains(&"mistral"));
+            assert!(archs.contains(&"mistral3"));
+            assert!(archs.contains(&"mixtral"));
+        }
+        #[cfg(feature = "arch-phi3")]
+        {
+            assert!(archs.contains(&"phi3"));
+            assert!(archs.contains(&"phi4"));
+        }
     }
 
     #[cfg(feature = "arch-synthetic")]
@@ -160,5 +218,36 @@ mod tests {
         assert!(err.to_string().contains(
             "quantization format 'Q8_0' of tensor 'blk.0.attn_q.weight' is not supported"
         ));
+    }
+
+    #[test]
+    fn test_recipe_registry_find_llama_and_mistral() {
+        #[cfg(feature = "arch-llama")]
+        {
+            let llama = RecipeRegistry::find_recipe("llama").expect("llama found");
+            assert_eq!(llama.architecture_id(), "llama");
+            let llama4 = RecipeRegistry::find_recipe("llama4").expect("llama4 found");
+            assert_eq!(llama4.architecture_id(), "llama4");
+            let qwen2 = RecipeRegistry::find_recipe("qwen2").expect("qwen2 found");
+            assert_eq!(qwen2.architecture_id(), "llama");
+        }
+
+        #[cfg(feature = "arch-mistral")]
+        {
+            let dense_recipe = RecipeRegistry::find_recipe("mistral").expect("mistral found");
+            assert_eq!(dense_recipe.architecture_id(), "mistral");
+            let mistral3 = RecipeRegistry::find_recipe("mistral3").expect("mistral3 found");
+            assert_eq!(mistral3.architecture_id(), "mistral");
+            let moe_recipe = RecipeRegistry::find_recipe("mixtral").expect("mixtral found");
+            assert_eq!(moe_recipe.architecture_id(), "mixtral");
+        }
+
+        #[cfg(feature = "arch-phi3")]
+        {
+            let phi3 = RecipeRegistry::find_recipe("phi3").expect("phi3 found");
+            assert_eq!(phi3.architecture_id(), "phi3");
+            let phi4 = RecipeRegistry::find_recipe("phi4").expect("phi4 found");
+            assert_eq!(phi4.architecture_id(), "phi4");
+        }
     }
 }

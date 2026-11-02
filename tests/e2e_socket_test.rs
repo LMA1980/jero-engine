@@ -59,7 +59,11 @@ fn test_e2e_worker_engine_socket_loop_and_zerocopy_dispatch() {
         kv_blocks_offset: 1024,
         output_slabs_offset: 2048,
         generation_counter: 0,
-        _reserved: [0; 40],
+        swa_window_size: 0,
+        num_experts: 0,
+        num_experts_per_tok: 0,
+        derived_weights_offset: 0,
+        _reserved: [0; 24],
     };
     let hdr_slice = arena.slice_mut(0, size_of::<ArenaHeader>()).unwrap();
     hdr_slice.copy_from_slice(header.as_bytes());

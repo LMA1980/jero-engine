@@ -1,0 +1,28 @@
+name = "k3-engine"
+# Crate-embedded Symposium manifest for k3-engine.
+
+[[plugins]]
+depends-on = ["k3-core"]
+source.cargo = "k3-core"
+
+[[plugins]]
+depends-on = ["kernels-rvv"]
+source.cargo = "kernels-rvv"
+
+[[plugins]]
+depends-on = ["k3-kv"]
+source.cargo = "k3-kv"
+
+[[plugins]]
+depends-on = ["k3-tokenizer"]
+source.cargo = "k3-tokenizer"
+
+[[installations]]
+name = "k3-diag"
+executable = "k3-diag"
+
+[subcommand.k3-diag]
+description = "Run SpacemiT K3 hardware capability probes, cluster affinity checks, and synthetic/model diagnostics"
+audience = "agents"
+command = "k3-diag"
+predicates = ["path_exists(k3-diag)"]
