@@ -25,7 +25,7 @@ impl RecipeRegistry {
         }
 
         #[cfg(feature = "arch-llama")]
-        if architecture == "llama" {
+        if architecture == "llama" || architecture == "qwen2" {
             static LLAMA: k3_arch_llama::LlamaRecipe = k3_arch_llama::LlamaRecipe::new();
             return Some(&LLAMA);
         } else if architecture == "llama4" {
@@ -34,7 +34,7 @@ impl RecipeRegistry {
         }
 
         #[cfg(feature = "arch-mistral")]
-        if architecture == "mistral" {
+        if architecture == "mistral" || architecture == "mistral3" {
             static MISTRAL: k3_arch_mistral::MistralRecipe = k3_arch_mistral::MistralRecipe::new();
             return Some(&MISTRAL);
         } else if architecture == "mixtral" {
@@ -66,8 +66,12 @@ impl RecipeRegistry {
             "llama",
             #[cfg(feature = "arch-llama")]
             "llama4",
+            #[cfg(feature = "arch-llama")]
+            "qwen2",
             #[cfg(feature = "arch-mistral")]
             "mistral",
+            #[cfg(feature = "arch-mistral")]
+            "mistral3",
             #[cfg(feature = "arch-mistral")]
             "mixtral",
             #[cfg(feature = "arch-phi3")]
@@ -154,10 +158,12 @@ mod tests {
         {
             assert!(archs.contains(&"llama"));
             assert!(archs.contains(&"llama4"));
+            assert!(archs.contains(&"qwen2"));
         }
         #[cfg(feature = "arch-mistral")]
         {
             assert!(archs.contains(&"mistral"));
+            assert!(archs.contains(&"mistral3"));
             assert!(archs.contains(&"mixtral"));
         }
         #[cfg(feature = "arch-phi3")]
@@ -221,12 +227,16 @@ mod tests {
             assert_eq!(llama.architecture_id(), "llama");
             let llama4 = RecipeRegistry::find_recipe("llama4").expect("llama4 found");
             assert_eq!(llama4.architecture_id(), "llama4");
+            let qwen2 = RecipeRegistry::find_recipe("qwen2").expect("qwen2 found");
+            assert_eq!(qwen2.architecture_id(), "llama");
         }
 
         #[cfg(feature = "arch-mistral")]
         {
             let dense_recipe = RecipeRegistry::find_recipe("mistral").expect("mistral found");
             assert_eq!(dense_recipe.architecture_id(), "mistral");
+            let mistral3 = RecipeRegistry::find_recipe("mistral3").expect("mistral3 found");
+            assert_eq!(mistral3.architecture_id(), "mistral");
             let moe_recipe = RecipeRegistry::find_recipe("mixtral").expect("mixtral found");
             assert_eq!(moe_recipe.architecture_id(), "mixtral");
         }
