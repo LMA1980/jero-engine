@@ -250,7 +250,11 @@ fn test_b06_scm_rights_edge_conditions() {
 // ============================================================================
 #[test]
 fn test_b07_advisory_file_locking_conflicts() {
-    let temp_file = std::env::temp_dir().join(format!("k3_lock_test_{}.bin", next_seq()));
+    let temp_file = std::env::temp_dir().join(format!(
+        "k3_lock_test_{}_{}.bin",
+        std::process::id(),
+        next_seq()
+    ));
     let mut f = File::create(&temp_file).expect("create file");
     f.write_all(b"K3_WEIGHT_DATA").expect("write");
 
