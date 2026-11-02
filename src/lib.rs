@@ -55,6 +55,8 @@ pub use k3_arch_mistral::{COMPACT_MOE_ADVISORY, MistralRecipe, evaluate_moe_meml
 
 #[cfg(feature = "arch-phi3")]
 pub use k3_arch_phi3 as arch_phi3;
+#[cfg(feature = "arch-phi3")]
+pub use k3_arch_phi3::Phi3Recipe;
 
 #[cfg(feature = "arch-synthetic")]
 pub use arch_synthetic;
@@ -136,6 +138,8 @@ mod tests {
 
         let recipe = Phi3Recipe::new();
         assert_eq!(recipe.architecture_id(), "phi3");
+        let recipe4 = Phi3Recipe::new_phi4();
+        assert_eq!(recipe4.architecture_id(), "phi4");
     }
 
     #[cfg(feature = "kernels-rvv")]

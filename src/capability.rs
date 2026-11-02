@@ -44,9 +44,12 @@ impl RecipeRegistry {
         }
 
         #[cfg(feature = "arch-phi3")]
-        if architecture == "phi3" || architecture == "phi4" {
+        if architecture == "phi3" {
             static PHI3: k3_arch_phi3::Phi3Recipe = k3_arch_phi3::Phi3Recipe::new();
             return Some(&PHI3);
+        } else if architecture == "phi4" {
+            static PHI4: k3_arch_phi3::Phi3Recipe = k3_arch_phi3::Phi3Recipe::new_phi4();
+            return Some(&PHI4);
         }
 
         let _ = architecture;
@@ -226,6 +229,14 @@ mod tests {
             assert_eq!(dense_recipe.architecture_id(), "mistral");
             let moe_recipe = RecipeRegistry::find_recipe("mixtral").expect("mixtral found");
             assert_eq!(moe_recipe.architecture_id(), "mixtral");
+        }
+
+        #[cfg(feature = "arch-phi3")]
+        {
+            let phi3 = RecipeRegistry::find_recipe("phi3").expect("phi3 found");
+            assert_eq!(phi3.architecture_id(), "phi3");
+            let phi4 = RecipeRegistry::find_recipe("phi4").expect("phi4 found");
+            assert_eq!(phi4.architecture_id(), "phi4");
         }
     }
 }
