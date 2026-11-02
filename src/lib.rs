@@ -43,11 +43,29 @@ pub use memory::{
 };
 pub use weights::LockedModelWeights;
 
+#[cfg(feature = "arch-llama")]
+pub use k3_arch_llama as arch_llama;
+
+#[cfg(feature = "arch-mistral")]
+pub use k3_arch_mistral as arch_mistral;
+
+#[cfg(feature = "arch-phi3")]
+pub use k3_arch_phi3 as arch_phi3;
+
 #[cfg(feature = "arch-synthetic")]
 pub use arch_synthetic;
 
 #[cfg(feature = "kernels-rvv")]
 pub use kernels_rvv;
+
+/// Indicates whether the `arch-llama` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_LLAMA: bool = cfg!(feature = "arch-llama");
+
+/// Indicates whether the `arch-mistral` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_MISTRAL: bool = cfg!(feature = "arch-mistral");
+
+/// Indicates whether the `arch-phi3` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_PHI3: bool = cfg!(feature = "arch-phi3");
 
 /// Indicates whether the `arch-synthetic` architecture recipe feature gate is enabled.
 pub const HAS_ARCH_SYNTHETIC: bool = cfg!(feature = "arch-synthetic");
@@ -57,10 +75,16 @@ pub const HAS_KERNELS_RVV: bool = cfg!(feature = "kernels-rvv");
 
 #[cfg(test)]
 mod tests {
-    use super::{HAS_ARCH_SYNTHETIC, HAS_KERNELS_RVV, QuantType};
+    use super::{
+        HAS_ARCH_LLAMA, HAS_ARCH_MISTRAL, HAS_ARCH_PHI3, HAS_ARCH_SYNTHETIC, HAS_KERNELS_RVV,
+        QuantType,
+    };
 
     #[test]
     fn feature_gates_match_cfg() {
+        assert_eq!(HAS_ARCH_LLAMA, cfg!(feature = "arch-llama"));
+        assert_eq!(HAS_ARCH_MISTRAL, cfg!(feature = "arch-mistral"));
+        assert_eq!(HAS_ARCH_PHI3, cfg!(feature = "arch-phi3"));
         assert_eq!(HAS_ARCH_SYNTHETIC, cfg!(feature = "arch-synthetic"));
         assert_eq!(HAS_KERNELS_RVV, cfg!(feature = "kernels-rvv"));
         assert_eq!(QuantType::Q4_K_M.as_str(), "Q4_K_M");
@@ -74,6 +98,36 @@ mod tests {
 
         let recipe = SyntheticRecipe::new();
         assert_eq!(recipe.architecture_id(), "synthetic");
+    }
+
+    #[cfg(feature = "arch-llama")]
+    #[test]
+    fn arch_llama_recipe_wired() {
+        use super::ArchRecipe;
+        use super::arch_llama::LlamaRecipe;
+
+        let recipe = LlamaRecipe::new();
+        assert_eq!(recipe.architecture_id(), "llama");
+    }
+
+    #[cfg(feature = "arch-mistral")]
+    #[test]
+    fn arch_mistral_recipe_wired() {
+        use super::ArchRecipe;
+        use super::arch_mistral::MistralRecipe;
+
+        let recipe = MistralRecipe::new();
+        assert_eq!(recipe.architecture_id(), "mistral");
+    }
+
+    #[cfg(feature = "arch-phi3")]
+    #[test]
+    fn arch_phi3_recipe_wired() {
+        use super::ArchRecipe;
+        use super::arch_phi3::Phi3Recipe;
+
+        let recipe = Phi3Recipe::new();
+        assert_eq!(recipe.architecture_id(), "phi3");
     }
 
     #[cfg(feature = "kernels-rvv")]

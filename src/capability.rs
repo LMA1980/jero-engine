@@ -24,6 +24,24 @@ impl RecipeRegistry {
             return Some(&SYNTHETIC);
         }
 
+        #[cfg(feature = "arch-llama")]
+        if architecture == "llama" || architecture == "llama4" {
+            static LLAMA: k3_arch_llama::LlamaRecipe = k3_arch_llama::LlamaRecipe::new();
+            return Some(&LLAMA);
+        }
+
+        #[cfg(feature = "arch-mistral")]
+        if architecture == "mistral" || architecture == "mixtral" {
+            static MISTRAL: k3_arch_mistral::MistralRecipe = k3_arch_mistral::MistralRecipe::new();
+            return Some(&MISTRAL);
+        }
+
+        #[cfg(feature = "arch-phi3")]
+        if architecture == "phi3" || architecture == "phi4" {
+            static PHI3: k3_arch_phi3::Phi3Recipe = k3_arch_phi3::Phi3Recipe::new();
+            return Some(&PHI3);
+        }
+
         let _ = architecture;
         None
     }
@@ -31,15 +49,23 @@ impl RecipeRegistry {
     /// Returns a list of architecture identifiers compiled into the current binary.
     #[must_use]
     pub const fn supported_architectures() -> &'static [&'static str] {
-        #[cfg(feature = "arch-synthetic")]
-        {
-            &["synthetic"]
-        }
-
-        #[cfg(not(feature = "arch-synthetic"))]
-        {
-            &[]
-        }
+        const ARCHS: &[&str] = &[
+            #[cfg(feature = "arch-synthetic")]
+            "synthetic",
+            #[cfg(feature = "arch-llama")]
+            "llama",
+            #[cfg(feature = "arch-llama")]
+            "llama4",
+            #[cfg(feature = "arch-mistral")]
+            "mistral",
+            #[cfg(feature = "arch-mistral")]
+            "mixtral",
+            #[cfg(feature = "arch-phi3")]
+            "phi3",
+            #[cfg(feature = "arch-phi3")]
+            "phi4",
+        ];
+        ARCHS
     }
 }
 
@@ -114,6 +140,21 @@ mod tests {
         let archs = RecipeRegistry::supported_architectures();
         #[cfg(feature = "arch-synthetic")]
         assert!(archs.contains(&"synthetic"));
+        #[cfg(feature = "arch-llama")]
+        {
+            assert!(archs.contains(&"llama"));
+            assert!(archs.contains(&"llama4"));
+        }
+        #[cfg(feature = "arch-mistral")]
+        {
+            assert!(archs.contains(&"mistral"));
+            assert!(archs.contains(&"mixtral"));
+        }
+        #[cfg(feature = "arch-phi3")]
+        {
+            assert!(archs.contains(&"phi3"));
+            assert!(archs.contains(&"phi4"));
+        }
     }
 
     #[cfg(feature = "arch-synthetic")]
