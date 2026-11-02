@@ -25,15 +25,22 @@ impl RecipeRegistry {
         }
 
         #[cfg(feature = "arch-llama")]
-        if architecture == "llama" || architecture == "llama4" {
+        if architecture == "llama" {
             static LLAMA: k3_arch_llama::LlamaRecipe = k3_arch_llama::LlamaRecipe::new();
             return Some(&LLAMA);
+        } else if architecture == "llama4" {
+            static LLAMA4: k3_arch_llama::LlamaRecipe = k3_arch_llama::LlamaRecipe::new_llama4();
+            return Some(&LLAMA4);
         }
 
         #[cfg(feature = "arch-mistral")]
-        if architecture == "mistral" || architecture == "mixtral" {
+        if architecture == "mistral" {
             static MISTRAL: k3_arch_mistral::MistralRecipe = k3_arch_mistral::MistralRecipe::new();
             return Some(&MISTRAL);
+        } else if architecture == "mixtral" {
+            static MIXTRAL: k3_arch_mistral::MistralRecipe =
+                k3_arch_mistral::MistralRecipe::new_mixtral();
+            return Some(&MIXTRAL);
         }
 
         #[cfg(feature = "arch-phi3")]
@@ -201,5 +208,24 @@ mod tests {
         assert!(err.to_string().contains(
             "quantization format 'Q8_0' of tensor 'blk.0.attn_q.weight' is not supported"
         ));
+    }
+
+    #[test]
+    fn test_recipe_registry_find_llama_and_mistral() {
+        #[cfg(feature = "arch-llama")]
+        {
+            let llama = RecipeRegistry::find_recipe("llama").expect("llama found");
+            assert_eq!(llama.architecture_id(), "llama");
+            let llama4 = RecipeRegistry::find_recipe("llama4").expect("llama4 found");
+            assert_eq!(llama4.architecture_id(), "llama4");
+        }
+
+        #[cfg(feature = "arch-mistral")]
+        {
+            let dense_recipe = RecipeRegistry::find_recipe("mistral").expect("mistral found");
+            assert_eq!(dense_recipe.architecture_id(), "mistral");
+            let moe_recipe = RecipeRegistry::find_recipe("mixtral").expect("mixtral found");
+            assert_eq!(moe_recipe.architecture_id(), "mixtral");
+        }
     }
 }

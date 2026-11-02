@@ -45,9 +45,13 @@ pub use weights::LockedModelWeights;
 
 #[cfg(feature = "arch-llama")]
 pub use k3_arch_llama as arch_llama;
+#[cfg(feature = "arch-llama")]
+pub use k3_arch_llama::{LlamaRecipe, project_lm_head_row_split};
 
 #[cfg(feature = "arch-mistral")]
 pub use k3_arch_mistral as arch_mistral;
+#[cfg(feature = "arch-mistral")]
+pub use k3_arch_mistral::{COMPACT_MOE_ADVISORY, MistralRecipe, evaluate_moe_memlock_admission};
 
 #[cfg(feature = "arch-phi3")]
 pub use k3_arch_phi3 as arch_phi3;
@@ -108,6 +112,8 @@ mod tests {
 
         let recipe = LlamaRecipe::new();
         assert_eq!(recipe.architecture_id(), "llama");
+        let recipe4 = LlamaRecipe::new_llama4();
+        assert_eq!(recipe4.architecture_id(), "llama4");
     }
 
     #[cfg(feature = "arch-mistral")]
@@ -118,6 +124,8 @@ mod tests {
 
         let recipe = MistralRecipe::new();
         assert_eq!(recipe.architecture_id(), "mistral");
+        let mixtral = MistralRecipe::new_mixtral();
+        assert_eq!(mixtral.architecture_id(), "mixtral");
     }
 
     #[cfg(feature = "arch-phi3")]
