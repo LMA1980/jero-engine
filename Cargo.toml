@@ -32,17 +32,17 @@ name = "empirical_challenge_m4_bounds"
 required-features = ["arch-mistral"]
 
 [dependencies]
-arch-synthetic = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-synthetic.git", branch = "feat/m4-epic1-llama-mistral-phi3", optional = true }
+arch-synthetic = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-synthetic.git", branch = "main", optional = true }
 arrow-array = "59.3.1"
 arrow-buffer = "59.3.1"
 fory = "1.7.7"
 fory-derive = "1.7.7"
-k3-arch-llama = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-llama.git", branch = "feat/m4-epic1-llama-mistral-phi3", optional = true }
-k3-arch-mistral = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-mistral.git", branch = "feat/m4-epic1-llama-mistral-phi3", optional = true }
-k3-arch-phi3 = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-phi3.git", branch = "feat/m4-epic1-llama-mistral-phi3", optional = true }
-k3-core = { version = "0.1.0", git = "https://github.com/LMA1980/k3-core.git", branch = "feat/m4-epic1-llama-mistral-phi3" }
-k3-tokenizer = { version = "0.1.0", git = "https://github.com/LMA1980/k3-tokenizer.git", branch = "feat/m4-epic1-llama-mistral-phi3" }
-kernels-rvv = { version = "0.1.0", git = "https://github.com/LMA1980/k3-kernels-rvv.git", branch = "feat/m4-epic1-llama-mistral-phi3", optional = true }
+k3-arch-llama = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-llama.git", branch = "main", optional = true }
+k3-arch-mistral = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-mistral.git", branch = "main", optional = true }
+k3-arch-phi3 = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-phi3.git", branch = "main", optional = true }
+k3-core = { version = "0.1.0", git = "https://github.com/LMA1980/k3-core.git", branch = "feat/m4-epic2-bitnet-tq1-tq2" }
+k3-tokenizer = { version = "0.1.0", git = "https://github.com/LMA1980/k3-tokenizer.git", branch = "main" }
+kernels-rvv = { version = "0.1.0", git = "https://github.com/LMA1980/k3-kernels-rvv.git", branch = "feat/m4-epic2-bitnet-tq1-tq2", optional = true }
 libc = "0.2"
 rayon = "1.12"
 sendfd = "0.4.5"
