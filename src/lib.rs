@@ -63,14 +63,6 @@ pub use k3_arch_bitnet as arch_bitnet;
 #[cfg(feature = "arch-bitnet")]
 pub use k3_arch_bitnet::BitNetRecipe;
 
-#[cfg(feature = "arch-flint")]
-pub use k3_arch_flint as arch_flint;
-#[cfg(feature = "arch-flint")]
-pub use k3_arch_flint::{
-    FLINT_MEMLOCK_ADVISORY, FlintAttentionType, FlintRecipe, evaluate_flint_memlock_admission,
-    route_sigmoid_topk_experts,
-};
-
 #[cfg(feature = "arch-synthetic")]
 pub use arch_synthetic;
 
@@ -79,9 +71,6 @@ pub use kernels_rvv;
 
 /// Indicates whether the `arch-bitnet` architecture recipe feature gate is enabled.
 pub const HAS_ARCH_BITNET: bool = cfg!(feature = "arch-bitnet");
-
-/// Indicates whether the `arch-flint` architecture recipe feature gate is enabled.
-pub const HAS_ARCH_FLINT: bool = cfg!(feature = "arch-flint");
 
 /// Indicates whether the `arch-llama` architecture recipe feature gate is enabled.
 pub const HAS_ARCH_LLAMA: bool = cfg!(feature = "arch-llama");
@@ -101,33 +90,19 @@ pub const HAS_KERNELS_RVV: bool = cfg!(feature = "kernels-rvv");
 #[cfg(test)]
 mod tests {
     use super::{
-        HAS_ARCH_BITNET, HAS_ARCH_FLINT, HAS_ARCH_LLAMA, HAS_ARCH_MISTRAL, HAS_ARCH_PHI3,
-        HAS_ARCH_SYNTHETIC, HAS_KERNELS_RVV, QuantType,
+        HAS_ARCH_BITNET, HAS_ARCH_LLAMA, HAS_ARCH_MISTRAL, HAS_ARCH_PHI3, HAS_ARCH_SYNTHETIC,
+        HAS_KERNELS_RVV, QuantType,
     };
 
     #[test]
     fn feature_gates_match_cfg() {
         assert_eq!(HAS_ARCH_BITNET, cfg!(feature = "arch-bitnet"));
-        assert_eq!(HAS_ARCH_FLINT, cfg!(feature = "arch-flint"));
         assert_eq!(HAS_ARCH_LLAMA, cfg!(feature = "arch-llama"));
         assert_eq!(HAS_ARCH_MISTRAL, cfg!(feature = "arch-mistral"));
         assert_eq!(HAS_ARCH_PHI3, cfg!(feature = "arch-phi3"));
         assert_eq!(HAS_ARCH_SYNTHETIC, cfg!(feature = "arch-synthetic"));
         assert_eq!(HAS_KERNELS_RVV, cfg!(feature = "kernels-rvv"));
         assert_eq!(QuantType::Q4_K_M.as_str(), "Q4_K_M");
-    }
-
-    #[cfg(feature = "arch-flint")]
-    #[test]
-    fn arch_flint_recipe_wired() {
-        use super::ArchRecipe;
-        use super::arch_flint::FlintRecipe;
-
-        let recipe = FlintRecipe::new();
-        assert_eq!(recipe.architecture_id(), "flint");
-        assert_eq!(recipe.num_layers, 49);
-        assert_eq!(recipe.num_experts, 256);
-        assert_eq!(recipe.num_experts_per_tok, 6);
     }
 
     #[cfg(feature = "arch-bitnet")]

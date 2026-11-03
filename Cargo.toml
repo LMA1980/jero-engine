@@ -38,7 +38,6 @@ arrow-buffer = "59.3.1"
 fory = "1.7.7"
 fory-derive = "1.7.7"
 k3-arch-bitnet = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-bitnet.git", branch = "feat/m4-epic2-bitnet-tq1-tq2", optional = true }
-k3-arch-flint = { version = "0.1.0", path = "../arch-flint", optional = true }
 k3-arch-llama = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-llama.git", branch = "main", optional = true }
 k3-arch-mistral = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-mistral.git", branch = "main", optional = true }
 k3-arch-phi3 = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-phi3.git", branch = "main", optional = true }
@@ -54,11 +53,10 @@ tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "net", "io-ut
 zerocopy = { version = "0.8.63", features = ["derive"] }
 
 [features]
-default = ["arch-synthetic", "arch-llama", "arch-mistral", "arch-phi3", "arch-bitnet", "arch-flint", "kernels-rvv"]
+default = ["arch-synthetic", "arch-llama", "arch-mistral", "arch-phi3", "arch-bitnet", "kernels-rvv"]
 # In-process architecture recipe and compute kernel feature gates (ADR-024)
 arch-synthetic = ["dep:arch-synthetic"]
 arch-bitnet = ["dep:k3-arch-bitnet"]
-arch-flint = ["dep:k3-arch-flint"]
 arch-llama = ["dep:k3-arch-llama"]
 arch-mistral = ["dep:k3-arch-mistral"]
 arch-phi3 = ["dep:k3-arch-phi3"]
@@ -66,7 +64,6 @@ kernels-rvv = [
     "dep:kernels-rvv",
     "arch-synthetic?/with-kernels",
     "k3-arch-bitnet?/with-kernels",
-    "k3-arch-flint?/with-kernels",
     "k3-arch-llama?/with-kernels",
     "k3-arch-mistral?/with-kernels",
     "k3-arch-phi3?/with-kernels",

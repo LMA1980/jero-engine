@@ -65,12 +65,6 @@ impl RecipeRegistry {
             return Some(&BITNET_25);
         }
 
-        #[cfg(feature = "arch-flint")]
-        if architecture == "flint" {
-            static FLINT: k3_arch_flint::FlintRecipe = k3_arch_flint::FlintRecipe::new();
-            return Some(&FLINT);
-        }
-
         let _ = architecture;
         None
     }
@@ -103,8 +97,6 @@ impl RecipeRegistry {
             "bitnet-b1.58",
             #[cfg(feature = "arch-bitnet")]
             "bitnet-25",
-            #[cfg(feature = "arch-flint")]
-            "flint",
         ];
         ARCHS
     }
@@ -205,10 +197,6 @@ mod tests {
             assert!(archs.contains(&"bitnet-b1.58"));
             assert!(archs.contains(&"bitnet-25"));
         }
-        #[cfg(feature = "arch-flint")]
-        {
-            assert!(archs.contains(&"flint"));
-        }
     }
 
     #[cfg(feature = "arch-synthetic")]
@@ -296,12 +284,6 @@ mod tests {
             assert_eq!(bitnet_b158.architecture_id(), "bitnet-b1.58");
             let bitnet_25 = RecipeRegistry::find_recipe("bitnet-25").expect("bitnet-25 found");
             assert_eq!(bitnet_25.architecture_id(), "bitnet-25");
-        }
-
-        #[cfg(feature = "arch-flint")]
-        {
-            let flint = RecipeRegistry::find_recipe("flint").expect("flint found");
-            assert_eq!(flint.architecture_id(), "flint");
         }
     }
 }
