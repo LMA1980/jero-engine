@@ -29,6 +29,9 @@ use kernels_rvv::ime::{
 use crate::affinity::{ClusterPreset, WorkerPool};
 use crate::engine::{PassTiming, compute_pass_timing};
 
+#[cfg(feature = "arch-bitnet")]
+pub use k3_arch_bitnet::BitNetRecipe;
+
 /// Hidden dimension of the benchmark model (multiple of [`TILE_K`]).
 pub const MODEL_DIM: usize = 512;
 /// FFN inner dimension of the benchmark model (multiple of [`TILE_K`]).
