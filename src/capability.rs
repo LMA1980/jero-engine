@@ -191,6 +191,12 @@ mod tests {
             assert!(archs.contains(&"phi3"));
             assert!(archs.contains(&"phi4"));
         }
+        #[cfg(feature = "arch-bitnet")]
+        {
+            assert!(archs.contains(&"bitnet"));
+            assert!(archs.contains(&"bitnet-b1.58"));
+            assert!(archs.contains(&"bitnet-25"));
+        }
     }
 
     #[cfg(feature = "arch-synthetic")]
