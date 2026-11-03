@@ -16,6 +16,9 @@
 )]
 
 mod bench;
+pub mod eval;
+
+use eval::EvalSuite;
 
 use std::env;
 use std::io::{self, Write};
@@ -91,6 +94,14 @@ pub struct DiagConfig {
     pub export_profile: Option<String>,
     /// Explicit human-readable benchmark summary request.
     pub summary: bool,
+    /// Open-source capability benchmark suite selector (`mmlu_pro`, `gsm8k`, `humaneval`, `ifeval`, `truthfulqa`, `all`).
+    pub eval_suite: Option<EvalSuite>,
+    /// Optional path to JSONL dataset file for `--eval-suite`.
+    pub eval_dataset: Option<String>,
+    /// Optional path to FP16 reference baseline JSON file for quantization fidelity delta.
+    pub reference_baseline: Option<String>,
+    /// Optional path to export the machine-readable `PublicBenchmarkReport` JSON.
+    pub export_eval: Option<String>,
 }
 
 impl Default for DiagConfig {
@@ -110,6 +121,10 @@ impl Default for DiagConfig {
             json: false,
             export_profile: None,
             summary: false,
+            eval_suite: None,
+            eval_dataset: None,
+            reference_baseline: None,
+            export_eval: None,
         }
     }
 }
@@ -275,6 +290,41 @@ impl DiagConfig {
                 "--summary" | "--bench" => {
                     config.summary = true;
                 }
+                "--eval-suite" => {
+                    let val = args.next().ok_or_else(|| {
+                        "--eval-suite requires 'mmlu_pro', 'gsm8k', 'humaneval', 'ifeval', 'truthfulqa', or 'all'".to_owned()
+                    })?;
+                    config.eval_suite = Some(EvalSuite::parse(&val)?);
+                }
+                "--eval-dataset" => {
+                    let path = args
+                        .next()
+                        .ok_or_else(|| "--eval-dataset requires a JSONL file path".to_owned())?;
+                    if path.trim().is_empty() {
+                        return Err("--eval-dataset requires a non-empty file path".to_owned());
+                    }
+                    config.eval_dataset = Some(path);
+                }
+                "--reference-baseline" => {
+                    let path = args.next().ok_or_else(|| {
+                        "--reference-baseline requires a JSON file path".to_owned()
+                    })?;
+                    if path.trim().is_empty() {
+                        return Err(
+                            "--reference-baseline requires a non-empty file path".to_owned()
+                        );
+                    }
+                    config.reference_baseline = Some(path);
+                }
+                "--export-eval" => {
+                    let path = args
+                        .next()
+                        .ok_or_else(|| "--export-eval requires a JSON file path".to_owned())?;
+                    if path.trim().is_empty() {
+                        return Err("--export-eval requires a non-empty file path".to_owned());
+                    }
+                    config.export_eval = Some(path);
+                }
                 unknown => {
                     return Err(format!("unknown option '{unknown}'"));
                 }
@@ -293,6 +343,15 @@ impl DiagConfig {
         }
 
         Ok(Some(config))
+    }
+
+    /// Returns `true` when the open-source capability benchmark evaluator should run.
+    #[must_use]
+    pub const fn is_eval_benchmark(&self) -> bool {
+        self.eval_suite.is_some()
+            || self.eval_dataset.is_some()
+            || self.export_eval.is_some()
+            || self.reference_baseline.is_some()
     }
 
     /// Returns `true` when the matrix-forward benchmark / hardware ceiling profiling should run.
@@ -756,10 +815,13 @@ pub fn run_single_eval_session<W: Write>(config: &DiagConfig, mut out: W) -> Res
     Ok(())
 }
 
-/// Executes diagnostic session dispatcher: routes to multi-run benchmark if `--repeat` is specified,
-/// or single-eval streaming pipeline if `--repeat` is absent.
+/// Executes diagnostic session dispatcher: routes to open-source capability benchmark if
+/// `--eval-suite` is specified, matrix-forward benchmark, multi-run benchmark if `--repeat` is
+/// specified, or single-eval streaming pipeline.
 pub fn run_diagnostic_session<W: Write>(config: &DiagConfig, out: W) -> Result<(), K3Error> {
-    if config.is_matrix_benchmark() {
+    if config.is_eval_benchmark() {
+        eval::run_public_eval_benchmark(config, out)
+    } else if config.is_matrix_benchmark() {
         bench::run_matrix_benchmark(config, out)
     } else if config.repeat.is_some() {
         run_multi_run_benchmark(config, out)
@@ -966,6 +1028,10 @@ mod tests {
             json: false,
             export_profile: None,
             summary: false,
+            eval_suite: None,
+            eval_dataset: None,
+            reference_baseline: None,
+            export_eval: None,
         };
 
         let mut output_buf = Vec::new();
@@ -1006,6 +1072,10 @@ mod tests {
             json: true,
             export_profile: None,
             summary: false,
+            eval_suite: None,
+            eval_dataset: None,
+            reference_baseline: None,
+            export_eval: None,
         };
 
         let mut output_buf = Vec::new();
