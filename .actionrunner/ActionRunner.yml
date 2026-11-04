@@ -1,5 +1,5 @@
 version: "3"
-name: "k3-engine declarative pipeline: Hygiene, Coverage & Hardware Benchmarks"
+name: "k3-engine declarative pipeline: Hygiene, Build, Test, Coverage, Miri & Benchmarks"
 
 env:
   CARGO_TERM_COLOR: "always"
@@ -24,23 +24,32 @@ tasks:
     timeout_seconds: 180
     sandbox_profile: "default_ci"
 
+  build-release-task:
+    tool: "cargo-build"
+    args: ["--release"]
+    timeout_seconds: 1800
+    sandbox_profile: "k3_hardware_bench"
+
+  test-task:
+    tool: "cargo-test"
+    args: ["--lib", "--bins", "--tests"]
+    timeout_seconds: 1800
+    sandbox_profile: "k3_hardware_bench"
+
   coverage-task:
     tool: "cargo-llvm-cov"
     args: ["--summary-only"]
     timeout_seconds: 1800
     sandbox_profile: "k3_hardware_bench"
 
-  bench-task:
-    tool: "cargo-bench"
-    args: ["--package", "k3-engine"]
+  miri-task:
+    tool: "cargo-miri"
+    args: ["test", "--lib"]
+    env:
+      CARGO_TARGET_DIR: "target"
+      MIRIFLAGS: "-Zmiri-disable-isolation"
     timeout_seconds: 1800
-    sandbox_profile: "k3_hardware_bench"
-
-  build-release-task:
-    tool: "cargo-build"
-    args: ["--release"]
-    timeout_seconds: 1800
-    sandbox_profile: "k3_hardware_bench"
+    sandbox_profile: "default_ci"
 
 stages:
   - id: fmt-check
@@ -69,37 +78,42 @@ stages:
     exclusive: false
     max_concurrent_per_node: 1
 
-  - id: coverage-check
-    name: "Evaluate Test Suite & Line Code Coverage (cargo llvm-cov)"
-    tasks: ["coverage-task"]
-    depends_on: ["clippy-check", "audit-check"]
-    tags: ["k3"]
-    threads: 6
-    toolchain: "llvm-24"
-    exclusive: true
-    max_concurrent_per_node: 1
-
-  - id: bench-run
-    name: "Execute Native Micro-Benchmarks (cargo bench)"
-    tasks: ["bench-task"]
-    depends_on:
-      - "fmt-check"
-      - "clippy-check"
-      - "audit-check"
-      - "coverage-check"
-    tags: ["k3"]
-    threads: 6
-    toolchain: "llvm-24"
-    exclusive: true
-    max_concurrent_per_node: 1
-
   - id: build-release
     name: "Build Release Binaries (cargo build --release)"
     tasks: ["build-release-task"]
-    depends_on: ["bench-run"]
+    depends_on: ["clippy-check"]
     tags: ["k3"]
     threads: 6
     toolchain: "llvm-24"
+    exclusive: false
+    max_concurrent_per_node: 1
+
+  - id: test-check
+    name: "Execute Test Suite (cargo test)"
+    tasks: ["test-task"]
+    depends_on: ["build-release"]
+    tags: ["k3"]
+    threads: 6
+    toolchain: "llvm-24"
+    exclusive: true
+    max_concurrent_per_node: 1
+
+  - id: coverage-check
+    name: "Evaluate Line Code Coverage (cargo llvm-cov)"
+    tasks: ["coverage-task"]
+    depends_on: ["test-check", "audit-check"]
+    tags: ["k3"]
+    threads: 6
+    toolchain: "llvm-24"
+    exclusive: true
+    max_concurrent_per_node: 1
+
+  - id: miri-check
+    name: "Verify Safe Execution & Undefined Behavior via Miri (cargo miri test)"
+    tasks: ["miri-task"]
+    depends_on: ["test-check"]
+    tags: ["k3"]
+    threads: 6
     exclusive: false
     max_concurrent_per_node: 1
 
@@ -108,20 +122,33 @@ on_action:
     - fmt-check
     - clippy-check
     - audit-check
+    - build-release
+    - test-check
     - coverage-check
-    - bench-run
+    - miri-check
   pull_request:
     - fmt-check
     - clippy-check
     - audit-check
+    - build-release
+    - test-check
     - coverage-check
-    - bench-run
+    - miri-check
+  pullrequest:
+    - fmt-check
+    - clippy-check
+    - audit-check
+    - build-release
+    - test-check
+    - coverage-check
+    - miri-check
   merge:
     - fmt-check
     - clippy-check
     - audit-check
-    - coverage-check
-    - bench-run
     - build-release
+    - test-check
+    - coverage-check
+    - miri-check
   tag:
     - build-release

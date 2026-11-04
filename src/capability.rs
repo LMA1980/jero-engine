@@ -52,6 +52,19 @@ impl RecipeRegistry {
             return Some(&PHI4);
         }
 
+        #[cfg(feature = "arch-bitnet")]
+        if architecture == "bitnet" {
+            static BITNET: k3_arch_bitnet::BitNetRecipe = k3_arch_bitnet::BitNetRecipe::new();
+            return Some(&BITNET);
+        } else if architecture == "bitnet-b1.58" {
+            static BITNET_B158: k3_arch_bitnet::BitNetRecipe =
+                k3_arch_bitnet::BitNetRecipe::new_b158();
+            return Some(&BITNET_B158);
+        } else if architecture == "bitnet-25" {
+            static BITNET_25: k3_arch_bitnet::BitNetRecipe = k3_arch_bitnet::BitNetRecipe::new_25();
+            return Some(&BITNET_25);
+        }
+
         let _ = architecture;
         None
     }
@@ -78,6 +91,12 @@ impl RecipeRegistry {
             "phi3",
             #[cfg(feature = "arch-phi3")]
             "phi4",
+            #[cfg(feature = "arch-bitnet")]
+            "bitnet",
+            #[cfg(feature = "arch-bitnet")]
+            "bitnet-b1.58",
+            #[cfg(feature = "arch-bitnet")]
+            "bitnet-25",
         ];
         ARCHS
     }
@@ -172,6 +191,12 @@ mod tests {
             assert!(archs.contains(&"phi3"));
             assert!(archs.contains(&"phi4"));
         }
+        #[cfg(feature = "arch-bitnet")]
+        {
+            assert!(archs.contains(&"bitnet"));
+            assert!(archs.contains(&"bitnet-b1.58"));
+            assert!(archs.contains(&"bitnet-25"));
+        }
     }
 
     #[cfg(feature = "arch-synthetic")]
@@ -248,6 +273,17 @@ mod tests {
             assert_eq!(phi3.architecture_id(), "phi3");
             let phi4 = RecipeRegistry::find_recipe("phi4").expect("phi4 found");
             assert_eq!(phi4.architecture_id(), "phi4");
+        }
+
+        #[cfg(feature = "arch-bitnet")]
+        {
+            let bitnet = RecipeRegistry::find_recipe("bitnet").expect("bitnet found");
+            assert_eq!(bitnet.architecture_id(), "bitnet");
+            let bitnet_b158 =
+                RecipeRegistry::find_recipe("bitnet-b1.58").expect("bitnet-b1.58 found");
+            assert_eq!(bitnet_b158.architecture_id(), "bitnet-b1.58");
+            let bitnet_25 = RecipeRegistry::find_recipe("bitnet-25").expect("bitnet-25 found");
+            assert_eq!(bitnet_25.architecture_id(), "bitnet-25");
         }
     }
 }

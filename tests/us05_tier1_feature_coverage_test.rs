@@ -622,8 +622,8 @@ fn test_f18_target_hardware_verification() {
     assert!(ime_supported_cluster_1);
 
     // 5. Target hardware hostname
-    let target_host = "pey-wail-deu";
-    assert_eq!(target_host, "pey-wail-deu");
+    let target_host = "worker-riscv64";
+    assert_eq!(target_host, "worker-riscv64");
 }
 
 // ============================================================================

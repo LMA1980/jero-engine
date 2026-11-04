@@ -185,14 +185,17 @@ impl SingleSlotKvArena {
 
         // 2. Best-effort huge page hint (ADR-037)
         // SAFETY: madvise is called on the valid anonymous memory mapping.
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(miri)))]
         unsafe {
             libc::madvise(raw_ptr, layout.aligned_bytes, libc::MADV_HUGEPAGE);
         }
 
         // 3. Mandatory mlock() (ADR-037)
         // SAFETY: mlock is called on the valid anonymous memory mapping.
+        #[cfg(not(miri))]
         let mlock_res = unsafe { libc::mlock(raw_ptr, layout.aligned_bytes) };
+        #[cfg(miri)]
+        let mlock_res = 0;
         if mlock_res != 0 {
             // SAFETY: Clean up mmap on mlock failure.
             unsafe {
@@ -437,6 +440,7 @@ impl Drop for SingleSlotKvArena {
 
         // SAFETY: self.ptr was mapped by mmap and locked by mlock with size aligned_bytes.
         unsafe {
+            #[cfg(not(miri))]
             libc::munlock(ptr, bytes);
             libc::munmap(ptr, bytes);
         }

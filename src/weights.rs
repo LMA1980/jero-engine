@@ -55,14 +55,17 @@ fn map_and_lock_file(fd: std::os::fd::RawFd, file_len: usize) -> Result<*mut u8,
 
     // 4. Best-effort huge page hint (ADR-037)
     // SAFETY: madvise is called on valid mapped range [ptr .. ptr + file_len].
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(miri)))]
     unsafe {
         libc::madvise(ptr, file_len, libc::MADV_HUGEPAGE);
     }
 
     // 5. Mandatory mlock() (ADR-037)
     // SAFETY: mlock is called on valid mapped memory [ptr .. ptr + file_len].
+    #[cfg(not(miri))]
     let mlock_res = unsafe { libc::mlock(ptr, file_len) };
+    #[cfg(miri)]
+    let mlock_res = 0;
     if mlock_res != 0 {
         // SAFETY: Unmapping memory upon mlock failure.
         unsafe {
@@ -170,6 +173,7 @@ impl LockedModelWeights {
                 // Clean up mlock, mmap, and flock on parse error
                 // SAFETY: Cleaning up locked memory and lock on parse error.
                 unsafe {
+                    #[cfg(not(miri))]
                     libc::munlock(raw_ptr.cast(), file_len);
                     libc::munmap(raw_ptr.cast(), file_len);
                     libc::flock(fd, libc::LOCK_UN);
@@ -320,12 +324,15 @@ impl LockedModelWeights {
 
         // 4. Best-effort huge page hint and mandatory mlock() (ADR-037)
         // SAFETY: raw_void_ptr is a valid mapped memory region of length file_len.
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(miri)))]
         unsafe {
             libc::madvise(raw_void_ptr, file_len, libc::MADV_HUGEPAGE);
         }
         // SAFETY: mlock is called on the valid mapped range [raw_void_ptr .. raw_void_ptr + file_len].
+        #[cfg(not(miri))]
         let mlock_res = unsafe { libc::mlock(raw_void_ptr, file_len) };
+        #[cfg(miri)]
+        let mlock_res = 0;
         if mlock_res != 0 {
             let avail = inspector.available_memory_bytes().unwrap_or(0);
             let rlim = inspector.rlimit_memlock_bytes().unwrap_or(0);
@@ -434,6 +441,7 @@ impl Drop for LockedModelWeights {
         // SAFETY: self.ptr and self.len were mapped by mmap and locked with mlock.
         // We munlock, munmap, and release the flock advisory lock.
         unsafe {
+            #[cfg(not(miri))]
             libc::munlock(ptr, len);
             libc::munmap(ptr, len);
             libc::flock(fd, libc::LOCK_UN);
@@ -449,6 +457,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_locked_model_flock_shared_blocks_exclusive() {
         let tensor_specs = [
             ("blk.0.attn_q.weight", QuantType::Q4_K_M, &[256, 2][..]),
@@ -497,6 +506,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_locked_model_vmlck_reflected() {
         let tensor_specs = [("weight", QuantType::F32, &[16][..])];
         let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
