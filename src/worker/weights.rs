@@ -139,7 +139,10 @@ impl LockedWeights {
         // 5. Optional mlock within RLIMIT_MEMLOCK bounds
         let mut is_locked = false;
         // SAFETY: ptr points to len_usize valid mapped bytes.
+        #[cfg(not(miri))]
         let mlock_res = unsafe { libc::mlock(ptr.as_ptr().cast(), len_usize) };
+        #[cfg(miri)]
+        let mlock_res = 0;
         if mlock_res == 0 {
             is_locked = true;
         } else {
@@ -198,6 +201,7 @@ impl Drop for LockedWeights {
     fn drop(&mut self) {
         // SAFETY: Clean teardown of mlock, mmap, and flock on valid pointers and fd.
         unsafe {
+            #[cfg(not(miri))]
             if self.is_locked {
                 libc::munlock(self.ptr.as_ptr().cast(), self.len);
             }

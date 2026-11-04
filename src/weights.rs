@@ -62,7 +62,10 @@ fn map_and_lock_file(fd: std::os::fd::RawFd, file_len: usize) -> Result<*mut u8,
 
     // 5. Mandatory mlock() (ADR-037)
     // SAFETY: mlock is called on valid mapped memory [ptr .. ptr + file_len].
+    #[cfg(not(miri))]
     let mlock_res = unsafe { libc::mlock(ptr, file_len) };
+    #[cfg(miri)]
+    let mlock_res = 0;
     if mlock_res != 0 {
         // SAFETY: Unmapping memory upon mlock failure.
         unsafe {
@@ -170,6 +173,7 @@ impl LockedModelWeights {
                 // Clean up mlock, mmap, and flock on parse error
                 // SAFETY: Cleaning up locked memory and lock on parse error.
                 unsafe {
+                    #[cfg(not(miri))]
                     libc::munlock(raw_ptr.cast(), file_len);
                     libc::munmap(raw_ptr.cast(), file_len);
                     libc::flock(fd, libc::LOCK_UN);
@@ -325,7 +329,10 @@ impl LockedModelWeights {
             libc::madvise(raw_void_ptr, file_len, libc::MADV_HUGEPAGE);
         }
         // SAFETY: mlock is called on the valid mapped range [raw_void_ptr .. raw_void_ptr + file_len].
+        #[cfg(not(miri))]
         let mlock_res = unsafe { libc::mlock(raw_void_ptr, file_len) };
+        #[cfg(miri)]
+        let mlock_res = 0;
         if mlock_res != 0 {
             let avail = inspector.available_memory_bytes().unwrap_or(0);
             let rlim = inspector.rlimit_memlock_bytes().unwrap_or(0);
@@ -434,6 +441,7 @@ impl Drop for LockedModelWeights {
         // SAFETY: self.ptr and self.len were mapped by mmap and locked with mlock.
         // We munlock, munmap, and release the flock advisory lock.
         unsafe {
+            #[cfg(not(miri))]
             libc::munlock(ptr, len);
             libc::munmap(ptr, len);
             libc::flock(fd, libc::LOCK_UN);
