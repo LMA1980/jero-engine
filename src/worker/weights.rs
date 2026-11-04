@@ -222,6 +222,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_empty_model() {
         let temp = std::env::temp_dir().join("k3_worker_empty_model.gguf");
         File::create(&temp).unwrap();
@@ -234,6 +235,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_valid_model_mapping() {
         let temp = std::env::temp_dir().join("k3_worker_valid_model.gguf");
         {
@@ -248,6 +250,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_exclusive_lock_conflict() {
         let temp = std::env::temp_dir().join("k3_worker_locked_model.gguf");
         {

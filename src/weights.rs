@@ -449,6 +449,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_locked_model_flock_shared_blocks_exclusive() {
         let tensor_specs = [
             ("blk.0.attn_q.weight", QuantType::Q4_K_M, &[256, 2][..]),
@@ -497,6 +498,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_locked_model_vmlck_reflected() {
         let tensor_specs = [("weight", QuantType::F32, &[16][..])];
         let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);

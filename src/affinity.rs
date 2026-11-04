@@ -1908,11 +1908,11 @@ fn shutdown_dedicated(
     clippy::unnecessary_wraps
 )]
 unsafe fn raw_pin_thread(assigned_core: usize) -> Result<u64, i32> {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(not(target_os = "linux"), miri))]
     {
         Ok(1u64 << assigned_core)
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(miri)))]
     // SAFETY: Raw Linux syscalls and libc file operations to pin the thread
     // without triggering scalable vector spill allocation in function frame.
     unsafe {
@@ -2002,9 +2002,9 @@ fn verify_pinned_thread(
     }
 
     // SAFETY: SYS_gettid is a read-only syscall taking no arguments.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(miri)))]
     let tid: i64 = unsafe { libc::syscall(libc::SYS_gettid) };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(not(target_os = "linux"), miri))]
     let tid: i64 = 0;
     let proc_cpus_allowed_list =
         read_proc_task_cpus_allowed_list(tid).unwrap_or_else(|| assigned_core.to_string());
@@ -2114,6 +2114,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_worker_pool_pinning_and_proc_status_verification_us01_5_2() {
         let online_mask = SystemCpuTopology::new()
             .online_cpu_mask()
@@ -2159,6 +2160,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_worker_pool_on_a100() {
         let topo = SystemCpuTopology::new();
         let a100 = resolve_affinity_with(Some("a100"), None, Some(1), &topo).unwrap();
@@ -2205,6 +2207,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_spin_barrier_synchronization_and_timing() {
         let barrier = Arc::new(SpinBarrier::new(4));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2229,6 +2232,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_futex_barrier_synchronization_and_timing() {
         let barrier = Arc::new(FutexBarrier::new(4));
         let shutdown = Arc::new(AtomicBool::new(false));

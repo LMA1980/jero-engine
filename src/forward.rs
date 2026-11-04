@@ -975,13 +975,13 @@ pub fn measure_memory_bandwidth(pool: &WorkerPool, lane: Lane) -> Result<f64, K3
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn probe_ime_on_core(core: usize) -> bool {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(not(target_os = "linux"), miri))]
     {
-        // On non-Linux platforms, follow canonical SpacemiT K3 topology: Cluster 1 (A100, cores 8-15)
+        // On non-Linux platforms (or under Miri), follow canonical SpacemiT K3 topology: Cluster 1 (A100, cores 8-15)
         // supports IME matrix acceleration, while Cluster 0 (X100, cores 0-7) does not.
         (8..16).contains(&core)
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(miri)))]
     {
         let mask = 1_u64 << core;
         // SAFETY: the child only issues async-signal-safe operations (registering with

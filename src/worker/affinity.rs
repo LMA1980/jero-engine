@@ -310,7 +310,7 @@ pub fn verify_cluster_capabilities_full(
 /// stack frame to prevent scalable vector spill corruption during cross-cluster migrations.
 #[inline(never)]
 pub unsafe fn pin_worker_core(assigned_core: usize) -> Result<(), WorkerError> {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(miri)))]
     {
         // SAFETY: Direct Linux syscall without vector registers in stack frame.
         unsafe {
@@ -349,7 +349,7 @@ pub unsafe fn pin_worker_core(assigned_core: usize) -> Result<(), WorkerError> {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(not(target_os = "linux"), miri))]
     {
         // Non-Linux hosts (e.g. macOS host development): no-op
         let _ = assigned_core;
