@@ -55,7 +55,7 @@ fn map_and_lock_file(fd: std::os::fd::RawFd, file_len: usize) -> Result<*mut u8,
 
     // 4. Best-effort huge page hint (ADR-037)
     // SAFETY: madvise is called on valid mapped range [ptr .. ptr + file_len].
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(miri)))]
     unsafe {
         libc::madvise(ptr, file_len, libc::MADV_HUGEPAGE);
     }
@@ -320,7 +320,7 @@ impl LockedModelWeights {
 
         // 4. Best-effort huge page hint and mandatory mlock() (ADR-037)
         // SAFETY: raw_void_ptr is a valid mapped memory region of length file_len.
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(miri)))]
         unsafe {
             libc::madvise(raw_void_ptr, file_len, libc::MADV_HUGEPAGE);
         }

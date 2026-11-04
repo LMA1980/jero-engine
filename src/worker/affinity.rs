@@ -1,6 +1,6 @@
 //! Hardware cluster affinity, capability probing, and conditional `/proc/set_ai_thread` registration.
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(miri)))]
 use core::mem::size_of;
 #[cfg(target_arch = "riscv64")]
 use std::path::Path;
