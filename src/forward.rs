@@ -32,6 +32,50 @@ use crate::engine::{PassTiming, compute_pass_timing};
 #[cfg(feature = "arch-bitnet")]
 pub use k3_arch_bitnet::BitNetRecipe;
 
+#[cfg(feature = "arch-dory")]
+pub use k3_arch_dory::DoryRecipe;
+
+/// Canonical vocabulary size for `Dory1.0-4B` parallel LM head row-split (`131,072`).
+pub const DORY_VOCAB_SIZE: usize = 131_072;
+
+/// Applies Dory's final hyperspherical logit scaling (`logits[i] *= output_scale[i] / init_std`)
+/// across the `X100` + `A100` parallel LM head row-split output buffer.
+///
+/// # Errors
+///
+/// Returns [`K3Error::CapabilityMismatch`] if `init_std <= 0.0` or `!init_std.is_finite()`, or
+/// [`K3Error::TensorBoundsError`] if `logits.len() != output_scale.len()`.
+pub fn scale_dory_lm_head_logits(
+    logits: &mut [f32],
+    output_scale: &[f32],
+    init_std: f32,
+) -> Result<(), K3Error> {
+    if !init_std.is_finite() || init_std <= 0.0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "dory".to_owned(),
+            reason: format!("dory.init_std must be a positive finite f32, got {init_std}"),
+        });
+    }
+    if logits.len() != output_scale.len() {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "output_scale.weight".to_owned(),
+            offset: 0,
+            byte_len: output_scale.len(),
+            buffer_len: logits.len(),
+            reason: format!(
+                "output_scale length ({}) does not match LM head vocabulary logits length ({})",
+                output_scale.len(),
+                logits.len()
+            ),
+        });
+    }
+    let inv_std = 1.0_f32 / init_std;
+    for (logit, &scale) in logits.iter_mut().zip(output_scale.iter()) {
+        *logit *= scale * inv_std;
+    }
+    Ok(())
+}
+
 /// Hidden dimension of the benchmark model (multiple of [`TILE_K`]).
 pub const MODEL_DIM: usize = 512;
 /// FFN inner dimension of the benchmark model (multiple of [`TILE_K`]).

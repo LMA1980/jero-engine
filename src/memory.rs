@@ -7,7 +7,169 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
 
-use k3_core::{K3Error, ModelMetadata, align_up};
+use k3_core::{DoryKvCacheMode, K3Error, ModelMetadata, align_up};
+
+/// Default sliding-window attention span (`dory.attention.sliding_window`) for `Dory1.0-4B`.
+pub const DORY_DEFAULT_SLIDING_WINDOW: usize = 1024;
+
+/// Estimates the raw unaligned single-slot KV cache footprint in bytes for a Dory looped nGPT model,
+/// accounting for disaggregated sub-layers (`'-'` MLP = 0 bytes, `'S'` SWA bounded by `min(n_ctx, 1024)`,
+/// `'*'` full attention = `n_ctx`) and `recurrent_kv_cache_mode` (`"per_loop"` vs `"last_loop"`).
+///
+/// # Errors
+///
+/// Returns [`K3Error::CapabilityMismatch`] if `n_ctx == 0`, `loop_override` is outside `1..=4`,
+/// `mode_override` is invalid, or `dory.layer_pattern` contains unrecognized characters.
+/// Returns [`K3Error::ContextLengthExceeded`] if `n_ctx` exceeds `metadata.context_length()`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "computes disaggregated SWA/Full/MLP KV cache bytes across 3 Dory loop segments"
+)]
+pub fn estimate_dory_kv_cache_bytes(
+    metadata: &ModelMetadata,
+    n_ctx: usize,
+    loop_override: Option<u32>,
+    mode_override: Option<&str>,
+) -> Result<usize, K3Error> {
+    if n_ctx == 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: metadata.architecture().to_owned(),
+            reason: "requested context length n_ctx must be greater than zero".to_owned(),
+        });
+    }
+    if metadata.context_length() > 0 && n_ctx > metadata.context_length() {
+        return Err(K3Error::ContextLengthExceeded {
+            requested_tokens: n_ctx,
+            max_context_tokens: metadata.context_length(),
+        });
+    }
+
+    let (n_input, n_recurrent, n_output, default_loops, default_mode, pattern) =
+        if let Some(dory) = metadata.dory() {
+            (
+                dory.input_layer_count(),
+                dory.recurrent_layer_count(),
+                dory.output_layer_count(),
+                dory.num_loops(),
+                dory.recurrent_kv_cache_mode(),
+                dory.layer_pattern(),
+            )
+        } else {
+            (
+                16_u32,
+                40_u32,
+                16_u32,
+                2_u32,
+                DoryKvCacheMode::PerLoop,
+                "S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-",
+            )
+        };
+
+    let n_loops = loop_override.unwrap_or(default_loops);
+    if n_loops == 0 || n_loops > 4 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "dory".to_owned(),
+            reason: format!("dory recurrent loop count must be in 1..=4, got {n_loops}"),
+        });
+    }
+
+    let kv_mode = match mode_override {
+        Some(raw) => DoryKvCacheMode::parse_mode(raw)?,
+        None => default_mode,
+    };
+
+    let n_physical = (n_input + n_recurrent + n_output) as usize;
+    if pattern.len() < n_physical {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "dory".to_owned(),
+            reason: format!(
+                "dory.layer_pattern length ({}) is shorter than physical layer count ({n_physical})",
+                pattern.len()
+            ),
+        });
+    }
+
+    let head_count_kv = metadata.head_count_kv().max(1);
+    let head_dim = if metadata.embedding_dim() == 2560 && metadata.head_count() == 16 {
+        256_usize
+    } else if metadata.head_count() > 0 {
+        (metadata.embedding_dim() / metadata.head_count()).max(1)
+    } else {
+        256_usize
+    };
+
+    let elements_per_kv_token = 2_usize
+        .checked_mul(head_count_kv)
+        .and_then(|v| v.checked_mul(head_dim))
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "dory kv elements per token overflowed usize".to_owned(),
+        })?;
+
+    let full_tokens = n_ctx.div_ceil(KV_BLOCK_SIZE) * KV_BLOCK_SIZE;
+    let swa_tokens = n_ctx
+        .min(DORY_DEFAULT_SLIDING_WINDOW)
+        .div_ceil(KV_BLOCK_SIZE)
+        * KV_BLOCK_SIZE;
+
+    let mut total_elements = 0_usize;
+    for (p, ch) in pattern.chars().take(n_physical).enumerate() {
+        let p_u32 = u32::try_from(p).unwrap_or(0);
+        let is_recurrent = p_u32 >= n_input && p_u32 < (n_input + n_recurrent);
+        let loop_multiplier = if is_recurrent && kv_mode == DoryKvCacheMode::PerLoop {
+            n_loops as usize
+        } else {
+            1_usize
+        };
+
+        let layer_tokens = match ch {
+            '-' => 0_usize,
+            'S' => swa_tokens,
+            '*' => full_tokens,
+            other => {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: "dory".to_owned(),
+                    reason: format!(
+                        "invalid sub-layer character '{other}' at physical layer {p} in dory.layer_pattern"
+                    ),
+                });
+            }
+        };
+
+        let layer_elements = loop_multiplier
+            .checked_mul(layer_tokens)
+            .and_then(|v| v.checked_mul(elements_per_kv_token))
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "dory layer kv elements overflowed usize".to_owned(),
+            })?;
+        total_elements = total_elements.checked_add(layer_elements).ok_or_else(|| {
+            K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "dory total kv elements overflowed usize".to_owned(),
+            }
+        })?;
+    }
+
+    total_elements
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "dory raw kv bytes overflowed usize".to_owned(),
+        })
+}
 
 /// Default system page size fallback in bytes if `sysconf` query fails.
 pub const DEFAULT_PAGE_SIZE: usize = 4096;
@@ -128,47 +290,60 @@ pub fn calculate_footprint_with_slots(
                 reason: "kv allocated tokens overflow usize".to_owned(),
             })?;
 
-    let layer_count = metadata.layer_count().max(1);
-    let head_count_kv = metadata.head_count_kv().max(1);
-    let head_dim = if metadata.head_count() > 0 {
-        metadata.embedding_dim() / metadata.head_count()
+    let raw_kv_bytes = if metadata.architecture() == "dory" {
+        let single_slot_dory_bytes = estimate_dory_kv_cache_bytes(metadata, n_ctx, None, None)?;
+        single_slot_dory_bytes
+            .checked_mul(slots)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "dory multi-slot kv bytes calculation overflowed usize".to_owned(),
+            })?
     } else {
-        metadata.embedding_dim()
-    }
-    .max(1);
+        let layer_count = metadata.layer_count().max(1);
+        let head_count_kv = metadata.head_count_kv().max(1);
+        let head_dim = if metadata.head_count() > 0 {
+            metadata.embedding_dim() / metadata.head_count()
+        } else {
+            metadata.embedding_dim()
+        }
+        .max(1);
 
-    // Each token stores Key and Value vectors: 2 * layer_count * head_count_kv * head_dim (f32 elements)
-    let elements_per_token = 2usize
-        .checked_mul(layer_count)
-        .and_then(|v| v.checked_mul(head_count_kv))
-        .and_then(|v| v.checked_mul(head_dim))
-        .ok_or_else(|| K3Error::TensorBoundsError {
-            tensor_name: "kv_cache".to_owned(),
-            offset: 0,
-            byte_len: 0,
-            buffer_len: usize::MAX,
-            reason: "kv elements per token calculation overflowed usize".to_owned(),
-        })?;
+        // Each token stores Key and Value vectors: 2 * layer_count * head_count_kv * head_dim (f32 elements)
+        let elements_per_token = 2usize
+            .checked_mul(layer_count)
+            .and_then(|v| v.checked_mul(head_count_kv))
+            .and_then(|v| v.checked_mul(head_dim))
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "kv elements per token calculation overflowed usize".to_owned(),
+            })?;
 
-    let total_elements = kv_allocated_tokens
-        .checked_mul(elements_per_token)
-        .ok_or_else(|| K3Error::TensorBoundsError {
-            tensor_name: "kv_cache".to_owned(),
-            offset: 0,
-            byte_len: 0,
-            buffer_len: usize::MAX,
-            reason: "total kv elements calculation overflowed usize".to_owned(),
-        })?;
+        let total_elements = kv_allocated_tokens
+            .checked_mul(elements_per_token)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "total kv elements calculation overflowed usize".to_owned(),
+            })?;
 
-    let raw_kv_bytes = total_elements
-        .checked_mul(size_of::<f32>())
-        .ok_or_else(|| K3Error::TensorBoundsError {
-            tensor_name: "kv_cache".to_owned(),
-            offset: 0,
-            byte_len: 0,
-            buffer_len: usize::MAX,
-            reason: "raw kv bytes calculation overflowed usize".to_owned(),
-        })?;
+        total_elements
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "raw kv bytes calculation overflowed usize".to_owned(),
+            })?
+    };
 
     let kv_bytes_aligned = align_up(raw_kv_bytes, page_size);
     let kv_bytes = u64::try_from(kv_bytes_aligned).map_err(|_| K3Error::TensorBoundsError {
@@ -548,5 +723,78 @@ mod tests {
         assert_eq!(fp4.kv_allocated_tokens, 128);
         assert!(fp4.kv_bytes > fp1.kv_bytes);
         assert_eq!(fp4.weight_bytes, fp1.weight_bytes);
+    }
+
+    #[test]
+    fn test_dory_kv_admission_per_loop_and_last_loop() {
+        use k3_core::GgufValue;
+        use k3_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
+
+        let canonical_pattern =
+            "S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-";
+        let extra_kvs = [
+            ("dory.block_count", GgufValue::Uint32(0)),
+            ("dory.input_layer_count", GgufValue::Uint32(16)),
+            ("dory.recurrent_layer_count", GgufValue::Uint32(40)),
+            ("dory.output_layer_count", GgufValue::Uint32(16)),
+            ("dory.num_loops", GgufValue::Uint32(2)),
+            (
+                "dory.recurrent_kv_cache_mode",
+                GgufValue::String("per_loop"),
+            ),
+            ("dory.layer_pattern", GgufValue::String(canonical_pattern)),
+        ];
+        let bytes = create_synthetic_gguf_v3_with_kvs("dory", 32, &extra_kvs, &[]);
+        let model = GgufFile::parse(&bytes).expect("parse synthetic dory gguf");
+        let meta = model.metadata();
+
+        // At n_ctx = 2048 (> sliding_window = 1024):
+        // 'S' sub-layers cap at 1024 tokens, '*' sub-layers use 2048 tokens, '-' MLP sub-layers allocate 0 bytes.
+        let per_loop_k1 =
+            estimate_dory_kv_cache_bytes(meta, 2048, Some(1), Some("per_loop")).unwrap();
+        let per_loop_k2 =
+            estimate_dory_kv_cache_bytes(meta, 2048, Some(2), Some("per_loop")).unwrap();
+        let per_loop_k4 =
+            estimate_dory_kv_cache_bytes(meta, 2048, Some(4), Some("per_loop")).unwrap();
+
+        let last_loop_k1 =
+            estimate_dory_kv_cache_bytes(meta, 2048, Some(1), Some("last_loop")).unwrap();
+        let last_loop_k2 =
+            estimate_dory_kv_cache_bytes(meta, 2048, Some(2), Some("last_loop")).unwrap();
+        let last_loop_k4 =
+            estimate_dory_kv_cache_bytes(meta, 2048, Some(4), Some("last_loop")).unwrap();
+
+        // In last_loop mode, KV bytes remain strictly invariant across K=1, 2, 4 and equal K=1 per_loop
+        assert_eq!(last_loop_k1, per_loop_k1);
+        assert_eq!(last_loop_k2, last_loop_k1);
+        assert_eq!(last_loop_k4, last_loop_k1);
+
+        // In per_loop mode, KV bytes grow monotonically with K
+        assert!(per_loop_k2 > per_loop_k1);
+        assert!(per_loop_k4 > per_loop_k2);
+
+        // Default from GGUF metadata (num_loops=2, per_loop) matches per_loop_k2
+        let default_bytes = estimate_dory_kv_cache_bytes(meta, 2048, None, None).unwrap();
+        assert_eq!(default_bytes, per_loop_k2);
+
+        // Verify pure MLP ('-') sub-layers allocate 0 KV bytes
+        let mlp_only_kvs = [
+            ("dory.block_count", GgufValue::Uint32(0)),
+            ("dory.input_layer_count", GgufValue::Uint32(2)),
+            ("dory.recurrent_layer_count", GgufValue::Uint32(2)),
+            ("dory.output_layer_count", GgufValue::Uint32(2)),
+            ("dory.num_loops", GgufValue::Uint32(2)),
+            (
+                "dory.recurrent_kv_cache_mode",
+                GgufValue::String("per_loop"),
+            ),
+            ("dory.layer_pattern", GgufValue::String("------")),
+        ];
+        let mlp_bytes = create_synthetic_gguf_v3_with_kvs("dory", 32, &mlp_only_kvs, &[]);
+        let mlp_model = GgufFile::parse(&mlp_bytes).expect("parse mlp-only dory gguf");
+        assert_eq!(
+            estimate_dory_kv_cache_bytes(mlp_model.metadata(), 512, None, None).unwrap(),
+            0
+        );
     }
 }

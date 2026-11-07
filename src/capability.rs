@@ -65,6 +65,12 @@ impl RecipeRegistry {
             return Some(&BITNET_25);
         }
 
+        #[cfg(feature = "arch-dory")]
+        if architecture == "dory" {
+            static DORY: k3_arch_dory::DoryRecipe = k3_arch_dory::DoryRecipe::new();
+            return Some(&DORY);
+        }
+
         let _ = architecture;
         None
     }
@@ -97,6 +103,8 @@ impl RecipeRegistry {
             "bitnet-b1.58",
             #[cfg(feature = "arch-bitnet")]
             "bitnet-25",
+            #[cfg(feature = "arch-dory")]
+            "dory",
         ];
         ARCHS
     }
@@ -197,6 +205,8 @@ mod tests {
             assert!(archs.contains(&"bitnet-b1.58"));
             assert!(archs.contains(&"bitnet-25"));
         }
+        #[cfg(feature = "arch-dory")]
+        assert!(archs.contains(&"dory"));
     }
 
     #[cfg(feature = "arch-synthetic")]
@@ -285,5 +295,17 @@ mod tests {
             let bitnet_25 = RecipeRegistry::find_recipe("bitnet-25").expect("bitnet-25 found");
             assert_eq!(bitnet_25.architecture_id(), "bitnet-25");
         }
+    }
+
+    #[cfg(feature = "arch-dory")]
+    #[test]
+    fn test_recipe_registry_find_dory() {
+        let dory = RecipeRegistry::find_recipe("dory").expect("dory recipe registered");
+        assert_eq!(dory.architecture_id(), "dory");
+        assert!(dory.supports_quant(QuantType::Q4_K_M));
+        assert!(dory.supports_quant(QuantType::Q5_K));
+        assert!(dory.supports_quant(QuantType::Q6_K));
+        assert!(dory.supports_quant(QuantType::BF16));
+        assert!(RecipeRegistry::supported_architectures().contains(&"dory"));
     }
 }
