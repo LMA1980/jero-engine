@@ -25,9 +25,9 @@ Low-level compute runtime for the SpacemiT K3 AI platform (16 RISC-V cores, 32GB
 - **Memory**: Paged KV cache allocator and eviction engine.
 
 ## Architecture & Specifications
-For master architecture and detailed component specifications, see the parent [model-runner](https://github.com/LMA1980/model-runner) repository:
-- Master Plan: [PLAN.md](https://github.com/LMA1980/model-runner/blob/main/PLAN.md)
-- Specs: [specs/runtime/](https://github.com/LMA1980/model-runner/tree/main/specs/runtime)
+For master architecture and detailed component specifications, see the parent [jero-runner](https://github.com/LMA1980/jero-runner) repository:
+- Master Plan: [PLAN.md](https://github.com/LMA1980/jero-runner/blob/main/PLAN.md)
+- Specs: [specs/runtime/](https://github.com/LMA1980/jero-runner/tree/main/specs/runtime)
 
 ## License
 

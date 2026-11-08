@@ -1,5 +1,6 @@
 version: "3"
-name: "jero-engine declarative pipeline: Hygiene, Build, Test, Coverage, Miri & Benchmarks"
+name: "jero-engine 3-Tier Declarative Pipeline: Hygiene, Build, Test, Coverage, Miri & Benchmarks"
+sccache: try
 
 env:
   CARGO_TERM_COLOR: "always"
@@ -48,6 +49,7 @@ tasks:
     env:
       CARGO_TARGET_DIR: "target"
       MIRIFLAGS: "-Zmiri-disable-isolation"
+      TMPDIR: "/var/lib/action-runner/.cache"
     timeout_seconds: 1800
     sandbox_profile: "default_ci"
 
