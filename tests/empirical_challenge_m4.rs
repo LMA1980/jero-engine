@@ -14,18 +14,18 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use k3_core::ipc::layout::{
+use jero_core::ipc::layout::{
     ARENA_MAGIC, ARENA_VERSION, ArenaHeader, KvBlockTag, OutputSlabHeader, SLAB_STATUS_WRITTEN,
     TokenInputSlotHeader,
 };
-use k3_core::ipc::protocol::{
+use jero_core::ipc::protocol::{
     AttachArenaCommand, ForwardPassCommand, IpcMessage, ShutdownCommand, StatusCode,
     WorkerHeartbeatRequest, global_fory, recv_frame, recv_msg_frame, send_frame, send_msg_frame,
 };
-use k3_core::ipc::shm::{DEFAULT_LIMIT_MEMLOCK_BYTES, SharedMemoryArena};
+use jero_core::ipc::shm::{DEFAULT_LIMIT_MEMLOCK_BYTES, SharedMemoryArena};
 use zerocopy::{FromBytes, IntoBytes};
 
-const BIN_PATH: &str = env!("CARGO_BIN_EXE_k3-worker");
+const BIN_PATH: &str = env!("CARGO_BIN_EXE_jero-worker");
 
 /// Helper to create a dummy valid model file
 fn create_dummy_model(name: &str) -> std::path::PathBuf {

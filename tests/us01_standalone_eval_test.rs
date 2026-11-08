@@ -14,14 +14,14 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
-use k3_core::test_helpers::create_synthetic_gguf_v3;
-use k3_core::{GgufFile, K3Error, QuantType};
-use k3_engine::{
+use jero_core::test_helpers::create_synthetic_gguf_v3;
+use jero_core::{GgufFile, K3Error, QuantType};
+use jero_engine::{
     ClusterPreset, CpuTopologyInspector, LockedModelWeights, MockCpuTopology, MockMemoryInspector,
     SinglePromptEngine, SingleSlotKvArena, StreamAction, SystemCpuTopology, SystemMemoryInspector,
     VlenDomain, WorkerPool, X100_CLUSTER_MASK, resolve_affinity, resolve_affinity_with,
 };
-use k3_tokenizer::{DetokenizeStep, GgufTokenizer};
+use jero_tokenizer::{DetokenizeStep, GgufTokenizer};
 
 fn write_synthetic_gguf_fixture(tag: &str, architecture: &str) -> PathBuf {
     let tensor_specs = [

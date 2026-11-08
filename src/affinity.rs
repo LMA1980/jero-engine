@@ -11,7 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use k3_core::{ComputePool, CoordinationProfile, K3Error};
+use jero_core::{ComputePool, CoordinationProfile, K3Error};
 use serde::{Deserialize, Serialize};
 
 thread_local! {

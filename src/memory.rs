@@ -7,7 +7,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
 
-use k3_core::{DoryKvCacheMode, K3Error, ModelMetadata, align_up};
+use jero_core::{DoryKvCacheMode, K3Error, ModelMetadata, align_up};
 
 /// Default sliding-window attention span (`dory.attention.sliding_window`) for `Dory1.0-4B`.
 pub const DORY_DEFAULT_SLIDING_WINDOW: usize = 1024;
@@ -580,9 +580,9 @@ pub fn check_memory_admission_with_slots<I: MemoryInspector>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k3_core::GgufFile;
-    use k3_core::QuantType;
-    use k3_core::test_helpers::create_synthetic_gguf_v3;
+    use jero_core::GgufFile;
+    use jero_core::QuantType;
+    use jero_core::test_helpers::create_synthetic_gguf_v3;
 
     #[test]
     fn test_footprint_calculation_page_aligned() {
@@ -727,8 +727,8 @@ mod tests {
 
     #[test]
     fn test_dory_kv_admission_per_loop_and_last_loop() {
-        use k3_core::GgufValue;
-        use k3_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
+        use jero_core::GgufValue;
+        use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
 
         let canonical_pattern =
             "S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-";

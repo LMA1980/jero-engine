@@ -23,7 +23,7 @@
 
 use std::str::FromStr;
 
-use k3_engine::{
+use jero_engine::{
     A100_CLUSTER_MASK, CONSERVATIVE_DEFAULT_A100_CORES, CONSERVATIVE_DEFAULT_N_CTX,
     CONSERVATIVE_DEFAULT_X100_CORES, CONSERVATIVE_TUNING_ADVISORY, CONSTRAINED_TEST_N_CTX,
     ClusterPreset, ComputePool, IntoClusterPreset, K3Error, ModelEntry, ModelListResponse,
@@ -549,7 +549,7 @@ fn test_omitted_optional_fields_deserialization() {
 
 #[test]
 fn test_cost_profile_unprofiled_baseline_and_attachment() {
-    use k3_engine::k3_core::{CostProfile, ModelIdentity};
+    use jero_engine::jero_core::{CostProfile, ModelIdentity};
 
     let identity = ModelIdentity {
         name: "test-model".to_owned(),

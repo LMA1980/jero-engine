@@ -34,8 +34,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use k3_core::test_helpers::create_synthetic_gguf_v3;
-use k3_core::{CostProfile, QuantType};
+use jero_core::test_helpers::create_synthetic_gguf_v3;
+use jero_core::{CostProfile, QuantType};
 use serde_json::Value;
 
 static RAND_SEED: AtomicU64 = AtomicU64::new(100);
@@ -90,7 +90,7 @@ impl Drop for TempModelFixture {
 }
 
 fn run_diag(args: &[&str]) -> (std::process::Output, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_k3-diag"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_jero-diag"));
     cmd.env("K3_CPU_ONLINE_MASK", "0xFFFF");
     for arg in args {
         cmd.arg(arg);

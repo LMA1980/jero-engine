@@ -1,5 +1,5 @@
 version: "2"
-name: "k3-engine Release Pipeline"
+name: "jero-engine Release Pipeline"
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,7 +31,7 @@ stages:
     tags: ["k3"]
     depends_on: ["coverage-check"]
     threads: 6
-    run: "cargo +nightly miri test -p k3-engine --lib || true"
+    run: "cargo +nightly miri test -p jero-engine --lib || true"
     timeout_seconds: 600
 
   - id: build-release
@@ -39,5 +39,5 @@ stages:
     tags: ["k3"]
     depends_on: ["miri-check"]
     threads: 6
-    run: "cargo build --release --package k3-engine"
+    run: "cargo build --release --package jero-engine"
     timeout_seconds: 600

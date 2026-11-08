@@ -18,7 +18,7 @@
 mod common;
 
 use common::*;
-use k3_core::K3Error;
+use jero_core::K3Error;
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;

@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use k3_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights};
+use jero_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights};
 
 use crate::affinity::WorkerPool;
 use crate::kv::SingleSlotKvArena;
@@ -434,13 +434,13 @@ pub fn sample_greedy_argmax(logits: &[f32]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "arch-synthetic")]
-    use k3_core::{GgufFile, QuantType, test_helpers::create_synthetic_gguf_v3};
+    #[cfg(feature = "jero-arch-synthetic")]
+    use jero_core::{GgufFile, QuantType, test_helpers::create_synthetic_gguf_v3};
 
-    #[cfg(feature = "arch-synthetic")]
+    #[cfg(feature = "jero-arch-synthetic")]
     #[test]
     fn test_single_prompt_engine_prefill_and_decode_loop_us01_6_1() {
-        use arch_synthetic::SyntheticRecipe;
+        use jero_arch_synthetic::SyntheticRecipe;
 
         let tensor_specs = [
             ("blk.0.attn_q.weight", QuantType::Q4_K_M, &[256, 2][..]),
@@ -479,10 +479,10 @@ mod tests {
         assert!((summary.timing.compute_utilization_ratio - 1.0).abs() <= f64::EPSILON);
     }
 
-    #[cfg(feature = "arch-synthetic")]
+    #[cfg(feature = "jero-arch-synthetic")]
     #[test]
     fn test_phase_timing_metrics_in_single_prompt_engine() {
-        use arch_synthetic::SyntheticRecipe;
+        use jero_arch_synthetic::SyntheticRecipe;
 
         let tensor_specs = [
             ("blk.0.attn_q.weight", QuantType::Q4_K_M, &[256, 2][..]),

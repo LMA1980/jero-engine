@@ -5,7 +5,7 @@
 
 use std::ptr;
 
-use k3_core::{K3Error, ModelMetadata, align_up};
+use jero_core::{K3Error, ModelMetadata, align_up};
 
 use crate::memory::{KV_BLOCK_SIZE, system_page_size};
 
@@ -450,9 +450,9 @@ impl Drop for SingleSlotKvArena {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k3_core::GgufFile;
-    use k3_core::QuantType;
-    use k3_core::test_helpers::create_synthetic_gguf_v3;
+    use jero_core::GgufFile;
+    use jero_core::QuantType;
+    use jero_core::test_helpers::create_synthetic_gguf_v3;
 
     #[test]
     fn test_kv_arena_allocation_and_indexing() {

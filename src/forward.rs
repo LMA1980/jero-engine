@@ -19,9 +19,9 @@ use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use k3_core::K3Error;
+use jero_core::K3Error;
 #[allow(unused_imports)]
-use kernels_rvv::ime::{
+use jero_kernels_rvv::ime::{
     TILE_C, TILE_K, TILE_M, TILE_N, dot_i8_vector, gemm_i8_ime, gemm_i8_vector, ime_probe_exec,
     ime_vmadot_count, pack_tiles, tile_count, vector_dot_count,
 };
@@ -29,11 +29,11 @@ use kernels_rvv::ime::{
 use crate::affinity::{ClusterPreset, WorkerPool};
 use crate::engine::{PassTiming, compute_pass_timing};
 
-#[cfg(feature = "arch-bitnet")]
-pub use k3_arch_bitnet::BitNetRecipe;
+#[cfg(feature = "jero-arch-bitnet")]
+pub use jero_arch_bitnet::BitNetRecipe;
 
-#[cfg(feature = "arch-dory")]
-pub use k3_arch_dory::DoryRecipe;
+#[cfg(feature = "jero-arch-dory")]
+pub use jero_arch_dory::DoryRecipe;
 
 /// Canonical vocabulary size for `Dory1.0-4B` parallel LM head row-split (`131,072`).
 pub const DORY_VOCAB_SIZE: usize = 131_072;

@@ -1,11 +1,11 @@
 [package]
-name = "k3-engine"
+name = "jero-engine"
 description = "Low-level compute runtime for the SpacemiT K3 AI platform"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "LGPL-3.0-only WITH LGPL-3.0-linking-exception"
-repository = "https://github.com/LMA1980/k3-engine"
+repository = "https://github.com/LMA1980/jero-engine"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -19,32 +19,32 @@ pedantic = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
 
 [[bin]]
-name = "k3-diag"
-path = "src/bin/k3-diag/main.rs"
-required-features = ["kernels-rvv"]
+name = "jero-diag"
+path = "src/bin/jero-diag/main.rs"
+required-features = ["jero-kernels-rvv"]
 
 [[bin]]
-name = "k3-worker"
-path = "src/bin/k3-worker/main.rs"
+name = "jero-worker"
+path = "src/bin/jero-worker/main.rs"
 
 [[test]]
 name = "empirical_challenge_m4_bounds"
-required-features = ["arch-mistral"]
+required-features = ["jero-arch-mistral"]
 
 [dependencies]
-arch-synthetic = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-synthetic.git", optional = true }
 arrow-array = "59.3.1"
 arrow-buffer = "59.3.1"
 fory = "1.7.7"
 fory-derive = "1.7.7"
-k3-arch-bitnet = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-bitnet.git", optional = true }
-k3-arch-dory = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-dory.git", optional = true }
-k3-arch-llama = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-llama.git", optional = true }
-k3-arch-mistral = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-mistral.git", optional = true }
-k3-arch-phi3 = { version = "0.1.0", git = "https://github.com/LMA1980/k3-arch-phi3.git", optional = true }
-k3-core = { version = "0.1.0", git = "https://github.com/LMA1980/k3-core.git" }
-k3-tokenizer = { version = "0.1.0", git = "https://github.com/LMA1980/k3-tokenizer.git", branch = "feat/m4-dory-ngpt" }
-kernels-rvv = { version = "0.1.0", git = "https://github.com/LMA1980/k3-kernels-rvv.git", optional = true }
+jero-arch-bitnet = { version = "0.1.0", git = "https://github.com/LMA1980/jero-arch-bitnet.git", branch = "feat/m8-naming-alignment", optional = true }
+jero-arch-dory = { version = "0.1.0", git = "https://github.com/LMA1980/jero-arch-dory.git", branch = "feat/m8-naming-alignment", optional = true }
+jero-arch-llama = { version = "0.1.0", git = "https://github.com/LMA1980/jero-arch-llama.git", branch = "feat/m8-naming-alignment", optional = true }
+jero-arch-mistral = { version = "0.1.0", git = "https://github.com/LMA1980/jero-arch-mistral.git", branch = "feat/m8-naming-alignment", optional = true }
+jero-arch-phi3 = { version = "0.1.0", git = "https://github.com/LMA1980/jero-arch-phi3.git", branch = "feat/m8-naming-alignment", optional = true }
+jero-arch-synthetic = { version = "0.1.0", git = "https://github.com/LMA1980/jero-arch-synthetic.git", branch = "feat/m8-naming-alignment", optional = true }
+jero-core = { version = "0.1.0", git = "https://github.com/LMA1980/jero-core.git", branch = "feat/m8-naming-alignment" }
+jero-kernels-rvv = { version = "0.1.0", git = "https://github.com/LMA1980/jero-kernels-rvv.git", branch = "feat/m8-naming-alignment", optional = true }
+jero-tokenizer = { version = "0.1.0", git = "https://github.com/LMA1980/jero-tokenizer.git", branch = "feat/m8-naming-alignment" }
 libc = "0.2"
 rayon = "1.12"
 sendfd = "0.4.5"
@@ -54,20 +54,28 @@ tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "net", "io-ut
 zerocopy = { version = "0.8.63", features = ["derive"] }
 
 [features]
-default = ["arch-synthetic", "arch-llama", "arch-mistral", "arch-phi3", "arch-bitnet", "arch-dory", "kernels-rvv"]
+default = ["jero-arch-synthetic", "jero-arch-llama", "jero-arch-mistral", "jero-arch-phi3", "jero-arch-bitnet", "jero-arch-dory", "jero-kernels-rvv"]
 # In-process architecture recipe and compute kernel feature gates (ADR-024)
-arch-synthetic = ["dep:arch-synthetic"]
-arch-bitnet = ["dep:k3-arch-bitnet"]
-arch-dory = ["dep:k3-arch-dory"]
-arch-llama = ["dep:k3-arch-llama"]
-arch-mistral = ["dep:k3-arch-mistral"]
-arch-phi3 = ["dep:k3-arch-phi3"]
-kernels-rvv = [
-    "dep:kernels-rvv",
-    "arch-synthetic?/with-kernels",
-    "k3-arch-bitnet?/with-kernels",
-    "k3-arch-dory?/with-kernels",
-    "k3-arch-llama?/with-kernels",
-    "k3-arch-mistral?/with-kernels",
-    "k3-arch-phi3?/with-kernels",
+jero-arch-synthetic = ["dep:jero-arch-synthetic"]
+jero-arch-bitnet = ["dep:jero-arch-bitnet"]
+jero-arch-dory = ["dep:jero-arch-dory"]
+jero-arch-llama = ["dep:jero-arch-llama"]
+jero-arch-mistral = ["dep:jero-arch-mistral"]
+jero-arch-phi3 = ["dep:jero-arch-phi3"]
+jero-kernels-rvv = [
+    "dep:jero-kernels-rvv",
+    "jero-arch-synthetic?/with-kernels",
+    "jero-arch-bitnet?/with-kernels",
+    "jero-arch-dory?/with-kernels",
+    "jero-arch-llama?/with-kernels",
+    "jero-arch-mistral?/with-kernels",
+    "jero-arch-phi3?/with-kernels",
 ]
+# Backward-compatible feature aliases
+arch-synthetic = ["jero-arch-synthetic"]
+arch-bitnet = ["jero-arch-bitnet"]
+arch-dory = ["jero-arch-dory"]
+arch-llama = ["jero-arch-llama"]
+arch-mistral = ["jero-arch-mistral"]
+arch-phi3 = ["jero-arch-phi3"]
+kernels-rvv = ["jero-kernels-rvv"]

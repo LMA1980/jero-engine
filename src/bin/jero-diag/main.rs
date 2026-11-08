@@ -25,13 +25,13 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use k3_core::{CoordinationProfile, GgufFile, K3Error};
-use k3_engine::affinity::SplitStrategy;
-use k3_engine::{
+use jero_core::{CoordinationProfile, GgufFile, K3Error};
+use jero_engine::affinity::SplitStrategy;
+use jero_engine::{
     LockedModelWeights, SinglePromptEngine, SingleSlotKvArena, StreamAction, SystemMemoryInspector,
     WorkerPool, resolve_affinity,
 };
-use k3_tokenizer::{DetokenizeStep, GgufTokenizer};
+use jero_tokenizer::{DetokenizeStep, GgufTokenizer};
 use serde::{Deserialize, Serialize};
 
 /// Global atomic flag set when `SIGINT` or `SIGTERM` is received so the decode loop
@@ -891,8 +891,8 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k3_core::QuantType;
-    use k3_core::test_helpers::create_synthetic_gguf_v3;
+    use jero_core::QuantType;
+    use jero_core::test_helpers::create_synthetic_gguf_v3;
     use std::fs::File;
 
     #[test]

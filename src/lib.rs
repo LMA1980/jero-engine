@@ -1,18 +1,19 @@
-//! `k3-engine`: Low-level compute runtime for the `SpacemiT` K3 AI platform.
+//! `jero-engine`: Low-level compute runtime for the `SpacemiT` K3 AI platform.
 //!
-//! Architecture recipes (`arch-*`) and compute kernels (`kernels-*`) are compiled
+//! Architecture recipes (`jero-arch-*`) and compute kernels (`jero-kernels-*`) are compiled
 //! in-process via Cargo feature gates per ADR-024, targeting `riscv64gc-unknown-linux-gnu`
 //! with RVV 1.0 (`+v`) per ADR-029.
 
 pub mod affinity;
 pub mod capability;
 pub mod engine;
-#[cfg(feature = "kernels-rvv")]
+#[cfg(feature = "jero-kernels-rvv")]
 pub mod forward;
 pub mod kv;
 pub mod memory;
 pub mod weights;
 pub mod worker;
+pub use worker as jero_worker;
 pub use worker as k3_worker;
 
 pub use affinity::{
@@ -27,7 +28,8 @@ pub use engine::{
     EnginePhase, EvaluationSummary, PassTiming, SinglePromptEngine, StreamAction,
     sample_greedy_argmax,
 };
-pub use k3_core::{
+pub use jero_core as k3_core;
+pub use jero_core::{
     self, ArchRecipe, CONSERVATIVE_DEFAULT_A100_CORES, CONSERVATIVE_DEFAULT_N_CTX,
     CONSERVATIVE_DEFAULT_X100_CORES, CONSERVATIVE_TUNING_ADVISORY, CONSTRAINED_TEST_N_CTX,
     ComputePool, CoordinationProfile, ExecutionContext, GgufFile, K3Error, ModelEntry,
@@ -43,57 +45,61 @@ pub use memory::{
 };
 pub use weights::LockedModelWeights;
 
-#[cfg(feature = "arch-llama")]
-pub use k3_arch_llama as arch_llama;
-#[cfg(feature = "arch-llama")]
-pub use k3_arch_llama::{LlamaRecipe, project_lm_head_row_split};
+#[cfg(feature = "jero-arch-llama")]
+pub use jero_arch_llama as arch_llama;
+#[cfg(feature = "jero-arch-llama")]
+pub use jero_arch_llama::{LlamaRecipe, project_lm_head_row_split};
 
-#[cfg(feature = "arch-mistral")]
-pub use k3_arch_mistral as arch_mistral;
-#[cfg(feature = "arch-mistral")]
-pub use k3_arch_mistral::{COMPACT_MOE_ADVISORY, MistralRecipe, evaluate_moe_memlock_admission};
+#[cfg(feature = "jero-arch-mistral")]
+pub use jero_arch_mistral as arch_mistral;
+#[cfg(feature = "jero-arch-mistral")]
+pub use jero_arch_mistral::{COMPACT_MOE_ADVISORY, MistralRecipe, evaluate_moe_memlock_admission};
 
-#[cfg(feature = "arch-phi3")]
-pub use k3_arch_phi3 as arch_phi3;
-#[cfg(feature = "arch-phi3")]
-pub use k3_arch_phi3::Phi3Recipe;
+#[cfg(feature = "jero-arch-phi3")]
+pub use jero_arch_phi3 as arch_phi3;
+#[cfg(feature = "jero-arch-phi3")]
+pub use jero_arch_phi3::Phi3Recipe;
 
-#[cfg(feature = "arch-bitnet")]
-pub use k3_arch_bitnet as arch_bitnet;
-#[cfg(feature = "arch-bitnet")]
-pub use k3_arch_bitnet::BitNetRecipe;
+#[cfg(feature = "jero-arch-bitnet")]
+pub use jero_arch_bitnet as arch_bitnet;
+#[cfg(feature = "jero-arch-bitnet")]
+pub use jero_arch_bitnet::BitNetRecipe;
 
-#[cfg(feature = "arch-dory")]
-pub use k3_arch_dory as arch_dory;
-#[cfg(feature = "arch-dory")]
-pub use k3_arch_dory::DoryRecipe;
+#[cfg(feature = "jero-arch-dory")]
+pub use jero_arch_dory as arch_dory;
+#[cfg(feature = "jero-arch-dory")]
+pub use jero_arch_dory::DoryRecipe;
 
-#[cfg(feature = "arch-synthetic")]
-pub use arch_synthetic;
+#[cfg(feature = "jero-arch-synthetic")]
+pub use jero_arch_synthetic;
+#[cfg(feature = "jero-arch-synthetic")]
+pub use jero_arch_synthetic as arch_synthetic;
 
-#[cfg(feature = "kernels-rvv")]
-pub use kernels_rvv;
+#[cfg(feature = "jero-kernels-rvv")]
+pub use jero_kernels_rvv;
+#[cfg(feature = "jero-kernels-rvv")]
+pub use jero_kernels_rvv as kernels_rvv;
 
-/// Indicates whether the `arch-bitnet` architecture recipe feature gate is enabled.
-pub const HAS_ARCH_BITNET: bool = cfg!(feature = "arch-bitnet");
+/// Indicates whether the `jero-arch-bitnet` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_BITNET: bool = cfg!(feature = "jero-arch-bitnet");
 
-/// Indicates whether the `arch-dory` architecture recipe feature gate is enabled.
-pub const HAS_ARCH_DORY: bool = cfg!(feature = "arch-dory");
+/// Indicates whether the `jero-arch-dory` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_DORY: bool = cfg!(feature = "jero-arch-dory");
 
-/// Indicates whether the `arch-llama` architecture recipe feature gate is enabled.
-pub const HAS_ARCH_LLAMA: bool = cfg!(feature = "arch-llama");
+/// Indicates whether the `jero-arch-llama` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_LLAMA: bool = cfg!(feature = "jero-arch-llama");
 
-/// Indicates whether the `arch-mistral` architecture recipe feature gate is enabled.
-pub const HAS_ARCH_MISTRAL: bool = cfg!(feature = "arch-mistral");
+/// Indicates whether the `jero-arch-mistral` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_MISTRAL: bool = cfg!(feature = "jero-arch-mistral");
 
-/// Indicates whether the `arch-phi3` architecture recipe feature gate is enabled.
-pub const HAS_ARCH_PHI3: bool = cfg!(feature = "arch-phi3");
+/// Indicates whether the `jero-arch-phi3` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_PHI3: bool = cfg!(feature = "jero-arch-phi3");
 
-/// Indicates whether the `arch-synthetic` architecture recipe feature gate is enabled.
-pub const HAS_ARCH_SYNTHETIC: bool = cfg!(feature = "arch-synthetic");
+/// Indicates whether the `jero-arch-synthetic` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_SYNTHETIC: bool = cfg!(feature = "jero-arch-synthetic");
 
-/// Indicates whether the `kernels-rvv` RVV 1.0 kernel feature gate is enabled.
-pub const HAS_KERNELS_RVV: bool = cfg!(feature = "kernels-rvv");
+/// Indicates whether the `jero-kernels-rvv` RVV 1.0 kernel feature gate is enabled.
+pub const HAS_KERNELS_RVV: bool = cfg!(feature = "jero-kernels-rvv");
 
 #[cfg(test)]
 mod tests {
@@ -104,17 +110,17 @@ mod tests {
 
     #[test]
     fn feature_gates_match_cfg() {
-        assert_eq!(HAS_ARCH_BITNET, cfg!(feature = "arch-bitnet"));
-        assert_eq!(HAS_ARCH_DORY, cfg!(feature = "arch-dory"));
-        assert_eq!(HAS_ARCH_LLAMA, cfg!(feature = "arch-llama"));
-        assert_eq!(HAS_ARCH_MISTRAL, cfg!(feature = "arch-mistral"));
-        assert_eq!(HAS_ARCH_PHI3, cfg!(feature = "arch-phi3"));
-        assert_eq!(HAS_ARCH_SYNTHETIC, cfg!(feature = "arch-synthetic"));
-        assert_eq!(HAS_KERNELS_RVV, cfg!(feature = "kernels-rvv"));
+        assert_eq!(HAS_ARCH_BITNET, cfg!(feature = "jero-arch-bitnet"));
+        assert_eq!(HAS_ARCH_DORY, cfg!(feature = "jero-arch-dory"));
+        assert_eq!(HAS_ARCH_LLAMA, cfg!(feature = "jero-arch-llama"));
+        assert_eq!(HAS_ARCH_MISTRAL, cfg!(feature = "jero-arch-mistral"));
+        assert_eq!(HAS_ARCH_PHI3, cfg!(feature = "jero-arch-phi3"));
+        assert_eq!(HAS_ARCH_SYNTHETIC, cfg!(feature = "jero-arch-synthetic"));
+        assert_eq!(HAS_KERNELS_RVV, cfg!(feature = "jero-kernels-rvv"));
         assert_eq!(QuantType::Q4_K_M.as_str(), "Q4_K_M");
     }
 
-    #[cfg(feature = "arch-dory")]
+    #[cfg(feature = "jero-arch-dory")]
     #[test]
     fn arch_dory_recipe_wired() {
         use super::ArchRecipe;
@@ -124,7 +130,7 @@ mod tests {
         assert_eq!(recipe.architecture_id(), "dory");
     }
 
-    #[cfg(feature = "arch-bitnet")]
+    #[cfg(feature = "jero-arch-bitnet")]
     #[test]
     fn arch_bitnet_recipe_wired() {
         use super::ArchRecipe;
@@ -138,7 +144,7 @@ mod tests {
         assert_eq!(recipe_25.architecture_id(), "bitnet-25");
     }
 
-    #[cfg(feature = "arch-synthetic")]
+    #[cfg(feature = "jero-arch-synthetic")]
     #[test]
     fn arch_synthetic_recipe_wired() {
         use super::ArchRecipe;
@@ -148,7 +154,7 @@ mod tests {
         assert_eq!(recipe.architecture_id(), "synthetic");
     }
 
-    #[cfg(feature = "arch-llama")]
+    #[cfg(feature = "jero-arch-llama")]
     #[test]
     fn arch_llama_recipe_wired() {
         use super::ArchRecipe;
@@ -160,7 +166,7 @@ mod tests {
         assert_eq!(recipe4.architecture_id(), "llama4");
     }
 
-    #[cfg(feature = "arch-mistral")]
+    #[cfg(feature = "jero-arch-mistral")]
     #[test]
     fn arch_mistral_recipe_wired() {
         use super::ArchRecipe;
@@ -172,7 +178,7 @@ mod tests {
         assert_eq!(mixtral.architecture_id(), "mixtral");
     }
 
-    #[cfg(feature = "arch-phi3")]
+    #[cfg(feature = "jero-arch-phi3")]
     #[test]
     fn arch_phi3_recipe_wired() {
         use super::ArchRecipe;
@@ -184,7 +190,7 @@ mod tests {
         assert_eq!(recipe4.architecture_id(), "phi4");
     }
 
-    #[cfg(feature = "kernels-rvv")]
+    #[cfg(feature = "jero-kernels-rvv")]
     #[test]
     fn kernels_rvv_wired() {
         use super::kernels_rvv::{BaselineKernel, VectorKernel};

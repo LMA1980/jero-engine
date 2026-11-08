@@ -10,12 +10,12 @@ use std::fs::File;
 use std::io::Write;
 use std::process::Command;
 
-use k3_core::QuantType;
-use k3_core::test_helpers::create_synthetic_gguf_v3;
+use jero_core::QuantType;
+use jero_core::test_helpers::create_synthetic_gguf_v3;
 use serde_json::Value;
 
 fn k3_diag_bin() -> String {
-    env!("CARGO_BIN_EXE_k3-diag").to_owned()
+    env!("CARGO_BIN_EXE_jero-diag").to_owned()
 }
 
 fn create_temp_synthetic_gguf(tag: &str) -> std::path::PathBuf {

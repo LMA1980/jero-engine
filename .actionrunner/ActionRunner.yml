@@ -1,5 +1,5 @@
 version: "3"
-name: "k3-engine declarative pipeline: Hygiene, Build, Test, Coverage, Miri & Benchmarks"
+name: "jero-engine declarative pipeline: Hygiene, Build, Test, Coverage, Miri & Benchmarks"
 
 env:
   CARGO_TERM_COLOR: "always"
