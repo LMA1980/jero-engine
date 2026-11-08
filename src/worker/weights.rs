@@ -5,7 +5,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 use std::ptr::NonNull;
 
-use k3_core::ipc::shm::DEFAULT_LIMIT_MEMLOCK_BYTES;
+use jero_core::ipc::shm::DEFAULT_LIMIT_MEMLOCK_BYTES;
 
 use super::error::WorkerError;
 

@@ -3,9 +3,9 @@
 use std::fmt;
 use std::io;
 
-use k3_core::error::K3Error;
-use k3_core::ipc::protocol::StatusCode;
-use k3_core::ipc::shm::IpcError;
+use jero_core::error::K3Error;
+use jero_core::ipc::protocol::StatusCode;
+use jero_core::ipc::shm::IpcError;
 
 /// Process exit codes per K3 architecture specifications.
 pub const EXIT_SUCCESS: i32 = 0;

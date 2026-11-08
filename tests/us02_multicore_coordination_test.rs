@@ -15,9 +15,9 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
-use k3_core::test_helpers::create_synthetic_gguf_v3;
-use k3_core::{CoordinationProfile, QuantType};
-use k3_engine::{
+use jero_core::test_helpers::create_synthetic_gguf_v3;
+use jero_core::{CoordinationProfile, QuantType};
+use jero_engine::{
     CpuTopologyInspector, LockedModelWeights, SinglePromptEngine, SingleSlotKvArena, StreamAction,
     SystemCpuTopology, SystemMemoryInspector, WorkerPool, X100_CLUSTER_MASK, resolve_affinity,
 };

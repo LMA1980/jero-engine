@@ -12,19 +12,19 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::thread;
 
-use k3_core::ipc::layout::{
+use jero_core::ipc::layout::{
     ARENA_MAGIC, ARENA_VERSION, ArenaHeader, KvBlockTag, OutputSlabHeader, SLAB_STATUS_WRITTEN,
     TokenInputSlotHeader,
 };
-use k3_core::ipc::protocol::{
+use jero_core::ipc::protocol::{
     AttachArenaCommand, ForwardPassCommand, IpcMessage, ShutdownCommand, StatusCode,
     WorkerHeartbeatRequest, create_uds_socket_pair, global_fory, recv_frame, recv_msg_frame,
     send_frame, send_msg_frame,
 };
-use k3_core::ipc::shm::SharedMemoryArena;
-use k3_engine::worker::cli::WorkerConfig;
-use k3_engine::worker::weights::LockedWeights;
-use k3_engine::worker::worker::WorkerEngine;
+use jero_core::ipc::shm::SharedMemoryArena;
+use jero_engine::worker::cli::WorkerConfig;
+use jero_engine::worker::weights::LockedWeights;
+use jero_engine::worker::worker::WorkerEngine;
 use zerocopy::{FromBytes, IntoBytes};
 
 #[test]
@@ -247,7 +247,7 @@ fn test_e2e_worker_engine_socket_loop_and_zerocopy_dispatch() {
 
 #[test]
 fn test_e2e_worker_subprocess_lifecycle_and_shutdown() {
-    let bin_path = env!("CARGO_BIN_EXE_k3-worker");
+    let bin_path = env!("CARGO_BIN_EXE_jero-worker");
 
     // 1. Prepare dummy model file
     let model_path = std::env::temp_dir().join("k3_worker_e2e_subproc_model.gguf");

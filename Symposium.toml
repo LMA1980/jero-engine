@@ -1,28 +1,28 @@
-name = "k3-engine"
-# Crate-embedded Symposium manifest for k3-engine.
+name = "jero-engine"
+# Crate-embedded Symposium manifest for jero-engine.
 
 [[plugins]]
-depends-on = ["k3-core"]
-source.cargo = "k3-core"
+depends-on = ["jero-core"]
+source.cargo = "jero-core"
 
 [[plugins]]
-depends-on = ["kernels-rvv"]
-source.cargo = "kernels-rvv"
+depends-on = ["jero-kernels-rvv"]
+source.cargo = "jero-kernels-rvv"
 
 [[plugins]]
-depends-on = ["k3-kv"]
-source.cargo = "k3-kv"
+depends-on = ["jero-kv-cache"]
+source.cargo = "jero-kv-cache"
 
 [[plugins]]
-depends-on = ["k3-tokenizer"]
-source.cargo = "k3-tokenizer"
+depends-on = ["jero-tokenizer"]
+source.cargo = "jero-tokenizer"
 
 [[installations]]
-name = "k3-diag"
-executable = "k3-diag"
+name = "jero-diag"
+executable = "jero-diag"
 
-[subcommand.k3-diag]
+[subcommand.jero-diag]
 description = "Run SpacemiT K3 hardware capability probes, cluster affinity checks, and synthetic/model diagnostics"
 audience = "agents"
-command = "k3-diag"
-predicates = ["path_exists(k3-diag)"]
+command = "jero-diag"
+predicates = ["path_exists(jero-diag)"]

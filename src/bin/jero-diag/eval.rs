@@ -19,15 +19,15 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 
-use k3_core::{CoordinationProfile, GgufFile, K3Error, QuantizationInfo};
-use k3_engine::forward::{
+use jero_core::{CoordinationProfile, GgufFile, K3Error, QuantizationInfo};
+use jero_engine::forward::{
     ForwardModel, Lane, MatKernel, PlacementPlan, measure_memory_bandwidth, measure_peak_macs,
 };
-use k3_engine::{
+use jero_engine::{
     LockedModelWeights, SinglePromptEngine, SingleSlotKvArena, StreamAction, SystemMemoryInspector,
     WorkerPool, resolve_affinity,
 };
-use k3_tokenizer::{DetokenizeStep, GgufTokenizer};
+use jero_tokenizer::{DetokenizeStep, GgufTokenizer};
 use serde::{Deserialize, Serialize};
 
 use crate::{DiagConfig, is_abort_requested};

@@ -24,17 +24,17 @@ use std::fs::File;
 use std::io::Write;
 use std::process::Command;
 
-use k3_arch_mistral::admission::{
+use jero_arch_mistral::admission::{
     COMPACT_MOE_ADVISORY, DEFAULT_MEMLOCK_LIMIT_BYTES, MIXTRAL_KV_BYTES_PER_TOKEN,
     evaluate_moe_memlock_admission,
 };
-use k3_arch_mistral::recipe::route_top2_experts;
-use k3_core::ipc::layout::{ARENA_MAGIC, ARENA_VERSION, ArenaHeader, BLOCK_SIZE_TOKENS};
-use k3_core::test_helpers::{create_synthetic_gguf_v3, create_synthetic_gguf_v3_with_kvs};
-use k3_core::{GgufValue, K3Error, ModelManifest, QuantType};
+use jero_arch_mistral::recipe::route_top2_experts;
+use jero_core::ipc::layout::{ARENA_MAGIC, ARENA_VERSION, ArenaHeader, BLOCK_SIZE_TOKENS};
+use jero_core::test_helpers::{create_synthetic_gguf_v3, create_synthetic_gguf_v3_with_kvs};
+use jero_core::{GgufValue, K3Error, ModelManifest, QuantType};
 use zerocopy::{FromBytes, IntoBytes};
 
-const DIAG_BIN: &str = env!("CARGO_BIN_EXE_k3-diag");
+const DIAG_BIN: &str = env!("CARGO_BIN_EXE_jero-diag");
 
 // ============================================================================
 // Suite 1: ArenaHeader 128-Byte Size, Layout Geometry & Backward Compatibility

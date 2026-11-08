@@ -10,7 +10,7 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::ptr;
 
-use k3_core::{
+use jero_core::{
     ArchRecipe, GgufFile, K3Error, ModelMetadata, ModelWeights, TensorDescriptor, TensorView,
 };
 
@@ -452,8 +452,8 @@ impl Drop for LockedModelWeights {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k3_core::QuantType;
-    use k3_core::test_helpers::create_synthetic_gguf_v3;
+    use jero_core::QuantType;
+    use jero_core::test_helpers::create_synthetic_gguf_v3;
     use std::io::Write;
 
     #[test]

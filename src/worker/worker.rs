@@ -6,16 +6,16 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Instant;
 
-use k3_core::ipc::arrow::wrap_tokens_as_uint32_array;
-use k3_core::ipc::layout::{
+use jero_core::ipc::arrow::wrap_tokens_as_uint32_array;
+use jero_core::ipc::layout::{
     BLOCK_SIZE_TOKENS, KvBlockTag, OutputSlabHeader, SLAB_STATUS_WRITTEN, TokenInputSlotHeader,
 };
-use k3_core::ipc::protocol::{
+use jero_core::ipc::protocol::{
     AttachArenaCommand, ForwardPassCommand, ForwardPassCompleted, IpcMessage, StatusCode,
     WorkerHeartbeatRequest, WorkerHeartbeatResponse, global_fory, recv_frame, send_frame,
     send_msg_frame,
 };
-use k3_core::ipc::shm::SharedMemoryArena;
+use jero_core::ipc::shm::SharedMemoryArena;
 use zerocopy::FromBytes;
 
 use std::sync::mpsc::{Sender, channel};

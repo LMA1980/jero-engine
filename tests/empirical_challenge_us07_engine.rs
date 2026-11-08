@@ -1,6 +1,6 @@
 //! Empirical Adversarial Challenge for k3-engine US-07 conversions and re-exports.
 
-use k3_engine::{
+use jero_engine::{
     CONSERVATIVE_DEFAULT_A100_CORES, CONSERVATIVE_DEFAULT_N_CTX, CONSERVATIVE_DEFAULT_X100_CORES,
     CONSERVATIVE_TUNING_ADVISORY, CONSTRAINED_TEST_N_CTX, ClusterPreset, ComputePool,
     IntoClusterPreset, K3Error, ModelEntry, ModelListResponse, ModelLoadAuditEvent, ModelProfile,

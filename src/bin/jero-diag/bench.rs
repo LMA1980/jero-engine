@@ -1,6 +1,6 @@
 //! US-03 matrix-forward benchmark: cross-cluster workload splitting and IME isolation.
 //!
-//! Runs the engine's own integer transformer workload ([`k3_engine::forward`]) under a chosen
+//! Runs the engine's own integer transformer workload ([`jero_engine::forward`]) under a chosen
 //! placement (`--cluster x100|a100`, or `--cluster both --split phase|op|row`) and matrix kernel
 //! (`--ime on|off`), reporting prefill and decode separately against measured hardware ceilings
 //! (ADR-034). No external baseline is used (ADR-033) and no pass/fail speed threshold is applied.
@@ -8,21 +8,21 @@
 use std::collections::HashMap;
 use std::io::Write;
 
-use k3_core::{
+use jero_core::{
     ClusterPlacement, CoreAllocation, CostProfile, ExecutionCost, GgufFile, K3Error,
     MemoryFootprintProfile, ModelIdentity, QuantizationInfo, TuningAdvisory,
 };
-use k3_engine::affinity::{ClusterPreset, ResolvedAffinity, SplitStrategy, WorkerAffinityStatus};
-use k3_engine::forward::{
+use jero_engine::affinity::{ClusterPreset, ResolvedAffinity, SplitStrategy, WorkerAffinityStatus};
+use jero_engine::forward::{
     CalibrationShape, ForwardModel, ForwardSummary, Lane, MatKernel, PhaseLayout, PlacementPlan,
     calibrate_matmul_rate, measure_memory_bandwidth, measure_peak_macs, probe_ime_on_core,
     row_split_share,
 };
-use k3_engine::memory::calculate_footprint;
-use k3_engine::{
+use jero_engine::memory::calculate_footprint;
+use jero_engine::{
     A100_CLUSTER_MASK, LockedModelWeights, SystemMemoryInspector, WorkerPool, X100_CLUSTER_MASK,
 };
-use k3_tokenizer::GgufTokenizer;
+use jero_tokenizer::GgufTokenizer;
 use serde::{Deserialize, Serialize};
 
 use crate::{DiagConfig, MetricStats, RunMetric, StatisticsSummary, is_abort_requested};
@@ -370,11 +370,11 @@ pub(crate) fn run_matrix_benchmark<W: Write>(
         .ok_or_else(|| cap_err("cli", "missing required --model <path>".to_owned()))?;
     let prompt_text = config.prompt.as_deref().unwrap_or("hello world");
     let n_ctx = config.n_ctx.unwrap_or(64);
-    let profile = config.coord.unwrap_or(k3_core::CoordinationProfile::Spin);
+    let profile = config.coord.unwrap_or(jero_core::CoordinationProfile::Spin);
     let repeat = config.repeat.unwrap_or(1);
 
     // 1. Resolve placement; invalid cluster/split/mask combinations fail here.
-    let affinity = k3_engine::affinity::resolve_affinity_split(
+    let affinity = jero_engine::affinity::resolve_affinity_split(
         config.cluster.as_deref(),
         config.split.as_ref().map(SplitStrategy::as_str),
         config.core_mask,

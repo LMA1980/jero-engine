@@ -8,8 +8,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
-use k3_core::QuantType;
-use k3_core::test_helpers::create_synthetic_gguf_v3;
+use jero_core::QuantType;
+use jero_core::test_helpers::create_synthetic_gguf_v3;
 
 fn create_temp_gguf_model(tag: &str, architecture: &str) -> PathBuf {
     let tensor_specs = [
@@ -28,7 +28,7 @@ fn create_temp_gguf_model(tag: &str, architecture: &str) -> PathBuf {
 #[test]
 fn test_cli_us01_scenario_1_direct_model_eval_and_streaming() {
     let model_path = create_temp_gguf_model("scen1", "synthetic");
-    let bin = env!("CARGO_BIN_EXE_k3-diag");
+    let bin = env!("CARGO_BIN_EXE_jero-diag");
 
     let output = Command::new(bin)
         .arg("--model")
@@ -77,7 +77,7 @@ fn test_cli_us01_scenario_1_direct_model_eval_and_streaming() {
 #[test]
 fn test_cli_us01_scenario_2_cluster_and_concurrency_targeting() {
     let model_path = create_temp_gguf_model("scen2", "synthetic");
-    let bin = env!("CARGO_BIN_EXE_k3-diag");
+    let bin = env!("CARGO_BIN_EXE_jero-diag");
 
     // 1. Valid explicit --cluster x100 --cores 0x0001 --threads 1
     let ok_out = Command::new(bin)
@@ -133,7 +133,7 @@ fn test_cli_us01_scenario_2_cluster_and_concurrency_targeting() {
 #[test]
 fn test_cli_us01_scenario_3_upfront_memory_admission_refusal() {
     let model_path = create_temp_gguf_model("scen3", "synthetic");
-    let bin = env!("CARGO_BIN_EXE_k3-diag");
+    let bin = env!("CARGO_BIN_EXE_jero-diag");
 
     // Constrain lockable memory via K3_RLIMIT_MEMLOCK_BYTES=256 so model + KV exceeds lockable RAM
     let out = Command::new(bin)

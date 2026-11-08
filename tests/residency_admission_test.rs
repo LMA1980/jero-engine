@@ -5,9 +5,9 @@ use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 
-use k3_core::test_helpers::create_synthetic_gguf_v3;
-use k3_core::{ExecutionContext, K3Error, QuantType};
-use k3_engine::{
+use jero_core::test_helpers::create_synthetic_gguf_v3;
+use jero_core::{ExecutionContext, K3Error, QuantType};
+use jero_engine::{
     LockedModelWeights, MockMemoryInspector, SingleSlotKvArena, check_memory_admission_with,
     verify_model_capabilities,
 };
@@ -34,7 +34,7 @@ fn test_end_to_end_preflight_admission_and_locked_evaluation() {
 
     // 2. Capability verification (US-01.2)
     let recipe =
-        verify_model_capabilities(&k3_core::GgufFile::parse(locked_weights.as_bytes()).unwrap())
+        verify_model_capabilities(&jero_core::GgufFile::parse(locked_weights.as_bytes()).unwrap())
             .expect("recipe capability verification succeeds");
     assert_eq!(recipe.architecture_id(), "synthetic");
 
@@ -97,7 +97,7 @@ fn test_end_to_end_preflight_admission_and_locked_evaluation() {
 fn test_insufficient_memory_aborts_upfront_scenario_3() {
     let tensor_specs = [("weight", QuantType::F32, &[16][..])];
     let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
-    let model = k3_core::GgufFile::parse(&bytes).expect("parse model");
+    let model = jero_core::GgufFile::parse(&bytes).expect("parse model");
     let meta = model.metadata();
 
     // Available RAM is restricted to 256 bytes

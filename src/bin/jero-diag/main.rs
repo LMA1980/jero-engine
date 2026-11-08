@@ -25,13 +25,13 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use k3_core::{CoordinationProfile, GgufFile, K3Error};
-use k3_engine::affinity::SplitStrategy;
-use k3_engine::{
+use jero_core::{CoordinationProfile, GgufFile, K3Error};
+use jero_engine::affinity::SplitStrategy;
+use jero_engine::{
     LockedModelWeights, SinglePromptEngine, SingleSlotKvArena, StreamAction, SystemMemoryInspector,
     WorkerPool, resolve_affinity,
 };
-use k3_tokenizer::{DetokenizeStep, GgufTokenizer};
+use jero_tokenizer::{DetokenizeStep, GgufTokenizer};
 use serde::{Deserialize, Serialize};
 
 /// Global atomic flag set when `SIGINT` or `SIGTERM` is received so the decode loop
@@ -102,6 +102,10 @@ pub struct DiagConfig {
     pub reference_baseline: Option<String>,
     /// Optional path to export the machine-readable `PublicBenchmarkReport` JSON.
     pub export_eval: Option<String>,
+    /// Optional override for Dory recurrent loop iterations (`1..=4`).
+    pub recurrent_loops: Option<u32>,
+    /// Optional override for Dory recurrent KV cache mode (`"per_loop"` or `"last_loop"`).
+    pub recurrent_kv_mode: Option<String>,
 }
 
 impl Default for DiagConfig {
@@ -125,6 +129,8 @@ impl Default for DiagConfig {
             eval_dataset: None,
             reference_baseline: None,
             export_eval: None,
+            recurrent_loops: None,
+            recurrent_kv_mode: None,
         }
     }
 }
@@ -324,6 +330,29 @@ impl DiagConfig {
                         return Err("--export-eval requires a non-empty file path".to_owned());
                     }
                     config.export_eval = Some(path);
+                }
+                "--recurrent-loops" => {
+                    let val = args.next().ok_or_else(|| {
+                        "--recurrent-loops requires an integer in 1..=4".to_owned()
+                    })?;
+                    let loops = val.parse::<u32>().map_err(|_| {
+                        format!("invalid --recurrent-loops '{val}': expected integer in 1..=4")
+                    })?;
+                    if !(1..=4).contains(&loops) {
+                        return Err(format!("--recurrent-loops must be in 1..=4 (got {loops})"));
+                    }
+                    config.recurrent_loops = Some(loops);
+                }
+                "--recurrent-kv-mode" => {
+                    let mode = args.next().ok_or_else(|| {
+                        "--recurrent-kv-mode requires 'per_loop' or 'last_loop'".to_owned()
+                    })?;
+                    if mode != "per_loop" && mode != "last_loop" {
+                        return Err(format!(
+                            "invalid --recurrent-kv-mode '{mode}': expected 'per_loop' or 'last_loop'"
+                        ));
+                    }
+                    config.recurrent_kv_mode = Some(mode);
                 }
                 unknown => {
                     return Err(format!("unknown option '{unknown}'"));
@@ -862,8 +891,8 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k3_core::QuantType;
-    use k3_core::test_helpers::create_synthetic_gguf_v3;
+    use jero_core::QuantType;
+    use jero_core::test_helpers::create_synthetic_gguf_v3;
     use std::fs::File;
 
     #[test]
@@ -1032,6 +1061,8 @@ mod tests {
             eval_dataset: None,
             reference_baseline: None,
             export_eval: None,
+            recurrent_loops: None,
+            recurrent_kv_mode: None,
         };
 
         let mut output_buf = Vec::new();
@@ -1076,6 +1107,8 @@ mod tests {
             eval_dataset: None,
             reference_baseline: None,
             export_eval: None,
+            recurrent_loops: None,
+            recurrent_kv_mode: None,
         };
 
         let mut output_buf = Vec::new();
@@ -1092,5 +1125,37 @@ mod tests {
         assert!(report.statistics.ttft_ms.mean >= 0.0);
 
         let _ = std::fs::remove_file(&temp_path);
+    }
+
+    #[test]
+    fn test_parse_dory_recurrent_cli_flags() {
+        let args = vec![
+            "k3-diag".to_owned(),
+            "--model".to_owned(),
+            "dory.gguf".to_owned(),
+            "--recurrent-loops".to_owned(),
+            "4".to_owned(),
+            "--recurrent-kv-mode".to_owned(),
+            "last_loop".to_owned(),
+        ];
+        let cfg = DiagConfig::parse_args(args.into_iter())
+            .expect("valid args")
+            .expect("some config");
+        assert_eq!(cfg.recurrent_loops, Some(4));
+        assert_eq!(cfg.recurrent_kv_mode.as_deref(), Some("last_loop"));
+
+        let bad_loops = vec![
+            "k3-diag".to_owned(),
+            "--recurrent-loops".to_owned(),
+            "5".to_owned(),
+        ];
+        assert!(DiagConfig::parse_args(bad_loops.into_iter()).is_err());
+
+        let bad_mode = vec![
+            "k3-diag".to_owned(),
+            "--recurrent-kv-mode".to_owned(),
+            "invalid".to_owned(),
+        ];
+        assert!(DiagConfig::parse_args(bad_mode.into_iter()).is_err());
     }
 }

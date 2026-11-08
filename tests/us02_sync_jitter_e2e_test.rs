@@ -34,8 +34,8 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use k3_core::QuantType;
-use k3_core::test_helpers::create_synthetic_gguf_v3;
+use jero_core::QuantType;
+use jero_core::test_helpers::create_synthetic_gguf_v3;
 
 // ============================================================================
 // Fixtures & Test Helpers
@@ -85,7 +85,7 @@ fn fastrand() -> u64 {
 
 /// Returns a [`Command`] pointing to the compiled `k3-diag` binary.
 fn k3_diag_cmd() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_k3-diag"))
+    Command::new(env!("CARGO_BIN_EXE_jero-diag"))
 }
 
 /// Tests whether a non-blocking shared/exclusive flock can be acquired.

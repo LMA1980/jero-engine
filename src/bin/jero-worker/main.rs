@@ -16,14 +16,14 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use k3_engine::worker::affinity::{
+use jero_engine::worker::affinity::{
     A100_CLUSTER_MASK, DEFAULT_X100_COMPUTE_CAP_MASK, cores_from_mask, parse_affinity_spec,
     pin_worker_core, verify_cluster_capabilities_full,
 };
-use k3_engine::worker::cli::WorkerConfig;
-use k3_engine::worker::error::{EXIT_INVALID_ARGS, EXIT_PROTOCOL_ERROR};
-use k3_engine::worker::weights::LockedWeights;
-use k3_engine::worker::worker::WorkerEngine;
+use jero_engine::worker::cli::WorkerConfig;
+use jero_engine::worker::error::{EXIT_INVALID_ARGS, EXIT_PROTOCOL_ERROR};
+use jero_engine::worker::weights::LockedWeights;
+use jero_engine::worker::worker::WorkerEngine;
 
 #[allow(clippy::too_many_lines)]
 #[tokio::main]

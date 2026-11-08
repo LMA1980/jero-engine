@@ -8,7 +8,7 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const BIN_PATH: &str = env!("CARGO_BIN_EXE_k3-worker");
+const BIN_PATH: &str = env!("CARGO_BIN_EXE_jero-worker");
 
 #[test]
 fn test_cli_help_and_version_exit_0() {
@@ -419,7 +419,7 @@ fn test_worker_engine_multi_thread_affinity_and_no_control_encroachment() {
         f.write_all(b"VALID_GGUF_HEADER").unwrap();
     }
 
-    let config = k3_engine::worker::WorkerConfig {
+    let config = jero_engine::worker::WorkerConfig {
         socket_path: Some(std::path::PathBuf::from("/tmp/fake_engine.sock")),
         socket_fd: None,
         model_path: model_path.clone(),
@@ -429,8 +429,8 @@ fn test_worker_engine_multi_thread_affinity_and_no_control_encroachment() {
         verbose: false,
         listen: false,
     };
-    let weights = k3_engine::worker::LockedWeights::open(&model_path).unwrap();
-    let engine = k3_engine::worker::WorkerEngine::new(config, weights);
+    let weights = jero_engine::worker::LockedWeights::open(&model_path).unwrap();
+    let engine = jero_engine::worker::WorkerEngine::new(config, weights);
 
     assert_eq!(engine.thread_count(), 4);
     assert_eq!(engine.compute_mask(), 0x000F);
@@ -455,7 +455,7 @@ fn test_worker_engine_non_contiguous_affinity_multi_thread() {
         f.write_all(b"VALID_GGUF_HEADER").unwrap();
     }
 
-    let config = k3_engine::worker::WorkerConfig {
+    let config = jero_engine::worker::WorkerConfig {
         socket_path: Some(std::path::PathBuf::from("/tmp/fake_noncontig_engine.sock")),
         socket_fd: None,
         model_path: model_path.clone(),
@@ -465,8 +465,8 @@ fn test_worker_engine_non_contiguous_affinity_multi_thread() {
         verbose: false,
         listen: false,
     };
-    let weights = k3_engine::worker::LockedWeights::open(&model_path).unwrap();
-    let engine = k3_engine::worker::WorkerEngine::new(config, weights);
+    let weights = jero_engine::worker::LockedWeights::open(&model_path).unwrap();
+    let engine = jero_engine::worker::WorkerEngine::new(config, weights);
 
     assert_eq!(engine.thread_count(), 2);
     assert_eq!(engine.compute_mask(), 0x0005);
@@ -605,7 +605,7 @@ fn test_worker_engine_try_new_fail_closed_validation() {
     }
 
     // 1. Encroaching on active control cores 6-7 (0x00C0)
-    let config_encroach = k3_engine::worker::WorkerConfig {
+    let config_encroach = jero_engine::worker::WorkerConfig {
         socket_path: Some(std::path::PathBuf::from("/tmp/fake_try_new.sock")),
         socket_fd: None,
         model_path: model_path.clone(),
@@ -615,8 +615,8 @@ fn test_worker_engine_try_new_fail_closed_validation() {
         verbose: false,
         listen: false,
     };
-    let w1 = k3_engine::worker::LockedWeights::open(&model_path).unwrap();
-    let err_encroach = k3_engine::worker::WorkerEngine::try_new(config_encroach, w1).unwrap_err();
+    let w1 = jero_engine::worker::LockedWeights::open(&model_path).unwrap();
+    let err_encroach = jero_engine::worker::WorkerEngine::try_new(config_encroach, w1).unwrap_err();
     assert_eq!(err_encroach.exit_code(), 10);
     assert!(
         err_encroach
@@ -625,7 +625,7 @@ fn test_worker_engine_try_new_fail_closed_validation() {
     );
 
     // 2. Unparseable affinity spec
-    let config_unparseable = k3_engine::worker::WorkerConfig {
+    let config_unparseable = jero_engine::worker::WorkerConfig {
         socket_path: Some(std::path::PathBuf::from("/tmp/fake_try_new.sock")),
         socket_fd: None,
         model_path: model_path.clone(),
@@ -635,13 +635,13 @@ fn test_worker_engine_try_new_fail_closed_validation() {
         verbose: false,
         listen: false,
     };
-    let w2 = k3_engine::worker::LockedWeights::open(&model_path).unwrap();
+    let w2 = jero_engine::worker::LockedWeights::open(&model_path).unwrap();
     let err_unparseable =
-        k3_engine::worker::WorkerEngine::try_new(config_unparseable, w2).unwrap_err();
+        jero_engine::worker::WorkerEngine::try_new(config_unparseable, w2).unwrap_err();
     assert_eq!(err_unparseable.exit_code(), 2);
 
     // 3. Threads exceeding available cores
-    let config_excess_threads = k3_engine::worker::WorkerConfig {
+    let config_excess_threads = jero_engine::worker::WorkerConfig {
         socket_path: Some(std::path::PathBuf::from("/tmp/fake_try_new.sock")),
         socket_fd: None,
         model_path: model_path.clone(),
@@ -651,14 +651,14 @@ fn test_worker_engine_try_new_fail_closed_validation() {
         verbose: false,
         listen: false,
     };
-    let w3 = k3_engine::worker::LockedWeights::open(&model_path).unwrap();
+    let w3 = jero_engine::worker::LockedWeights::open(&model_path).unwrap();
     let err_excess =
-        k3_engine::worker::WorkerEngine::try_new(config_excess_threads, w3).unwrap_err();
+        jero_engine::worker::WorkerEngine::try_new(config_excess_threads, w3).unwrap_err();
     assert_eq!(err_excess.exit_code(), 10);
     assert!(err_excess.to_string().contains("exceeds 2 available cores"));
 
     // 4. X100 threads exceeding 6-thread cap (no affinity)
-    let config_x100_t7 = k3_engine::worker::WorkerConfig {
+    let config_x100_t7 = jero_engine::worker::WorkerConfig {
         socket_path: Some(std::path::PathBuf::from("/tmp/fake_try_new.sock")),
         socket_fd: None,
         model_path: model_path.clone(),
@@ -668,8 +668,8 @@ fn test_worker_engine_try_new_fail_closed_validation() {
         verbose: false,
         listen: false,
     };
-    let w4 = k3_engine::worker::LockedWeights::open(&model_path).unwrap();
-    let err_x100_t7 = k3_engine::worker::WorkerEngine::try_new(config_x100_t7, w4).unwrap_err();
+    let w4 = jero_engine::worker::LockedWeights::open(&model_path).unwrap();
+    let err_x100_t7 = jero_engine::worker::WorkerEngine::try_new(config_x100_t7, w4).unwrap_err();
     assert_eq!(err_x100_t7.exit_code(), 10);
     assert!(
         err_x100_t7
@@ -681,7 +681,7 @@ fn test_worker_engine_try_new_fail_closed_validation() {
     unsafe {
         std::env::set_var("K3_SIMULATE_A100", "1");
     }
-    let config_a100_sub3 = k3_engine::worker::WorkerConfig {
+    let config_a100_sub3 = jero_engine::worker::WorkerConfig {
         socket_path: Some(std::path::PathBuf::from("/tmp/fake_try_new.sock")),
         socket_fd: None,
         model_path: model_path.clone(),
@@ -691,8 +691,9 @@ fn test_worker_engine_try_new_fail_closed_validation() {
         verbose: false,
         listen: false,
     };
-    let w5 = k3_engine::worker::LockedWeights::open(&model_path).unwrap();
-    let err_a100_sub3 = k3_engine::worker::WorkerEngine::try_new(config_a100_sub3, w5).unwrap_err();
+    let w5 = jero_engine::worker::LockedWeights::open(&model_path).unwrap();
+    let err_a100_sub3 =
+        jero_engine::worker::WorkerEngine::try_new(config_a100_sub3, w5).unwrap_err();
     assert_eq!(err_a100_sub3.exit_code(), 10);
     assert!(
         err_a100_sub3
@@ -701,7 +702,7 @@ fn test_worker_engine_try_new_fail_closed_validation() {
     );
 
     // 6. Valid threads without affinity on X100 (threads = 4)
-    let config_x100_t4 = k3_engine::worker::WorkerConfig {
+    let config_x100_t4 = jero_engine::worker::WorkerConfig {
         socket_path: Some(std::path::PathBuf::from("/tmp/fake_try_new.sock")),
         socket_fd: None,
         model_path: model_path.clone(),
@@ -711,15 +712,15 @@ fn test_worker_engine_try_new_fail_closed_validation() {
         verbose: false,
         listen: false,
     };
-    let w6 = k3_engine::worker::LockedWeights::open(&model_path).unwrap();
+    let w6 = jero_engine::worker::LockedWeights::open(&model_path).unwrap();
     let engine_x100_t4 =
-        k3_engine::worker::WorkerEngine::try_new(config_x100_t4, w6).expect("engine t4");
+        jero_engine::worker::WorkerEngine::try_new(config_x100_t4, w6).expect("engine t4");
     assert_eq!(engine_x100_t4.thread_count(), 4);
     assert_eq!(engine_x100_t4.compute_mask(), 0x003F);
     assert_eq!(engine_x100_t4.assigned_cores(), &[0, 1, 2, 3]);
 
     // 7. Whitespace in affinity spec ("  0 - 3  ")
-    let config_ws = k3_engine::worker::WorkerConfig {
+    let config_ws = jero_engine::worker::WorkerConfig {
         socket_path: Some(std::path::PathBuf::from("/tmp/fake_try_new.sock")),
         socket_fd: None,
         model_path: model_path.clone(),
@@ -729,8 +730,8 @@ fn test_worker_engine_try_new_fail_closed_validation() {
         verbose: false,
         listen: false,
     };
-    let w7 = k3_engine::worker::LockedWeights::open(&model_path).unwrap();
-    let engine_ws = k3_engine::worker::WorkerEngine::try_new(config_ws, w7).expect("engine ws");
+    let w7 = jero_engine::worker::LockedWeights::open(&model_path).unwrap();
+    let engine_ws = jero_engine::worker::WorkerEngine::try_new(config_ws, w7).expect("engine ws");
     assert_eq!(engine_ws.thread_count(), 4);
     assert_eq!(engine_ws.compute_mask(), 0x000F);
     assert_eq!(engine_ws.assigned_cores(), &[0, 1, 2, 3]);

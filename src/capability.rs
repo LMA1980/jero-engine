@@ -3,7 +3,7 @@
 //! Enforces upfront capability verification against compiled `arch-*` recipes and compute kernels
 //! before reserving or locking memory (ADR-017, ADR-023, ADR-024, US-01 Scenario 1).
 
-use k3_core::{ArchRecipe, GgufFile, K3Error, ModelMetadata};
+use jero_core::{ArchRecipe, GgufFile, K3Error, ModelMetadata};
 
 /// In-process compile-time registry mapping GGUF `general.architecture` strings
 /// to compiled [`ArchRecipe`] implementations (ADR-023, ADR-024).
@@ -17,52 +17,61 @@ impl RecipeRegistry {
     /// per ADR-023 and must be registered separately.
     #[must_use]
     pub fn find_recipe(architecture: &str) -> Option<&'static dyn ArchRecipe> {
-        #[cfg(feature = "arch-synthetic")]
+        #[cfg(feature = "jero-arch-synthetic")]
         if architecture == "synthetic" {
-            static SYNTHETIC: arch_synthetic::SyntheticRecipe =
-                arch_synthetic::SyntheticRecipe::new();
+            static SYNTHETIC: jero_arch_synthetic::SyntheticRecipe =
+                jero_arch_synthetic::SyntheticRecipe::new();
             return Some(&SYNTHETIC);
         }
 
-        #[cfg(feature = "arch-llama")]
+        #[cfg(feature = "jero-arch-llama")]
         if architecture == "llama" || architecture == "qwen2" {
-            static LLAMA: k3_arch_llama::LlamaRecipe = k3_arch_llama::LlamaRecipe::new();
+            static LLAMA: jero_arch_llama::LlamaRecipe = jero_arch_llama::LlamaRecipe::new();
             return Some(&LLAMA);
         } else if architecture == "llama4" {
-            static LLAMA4: k3_arch_llama::LlamaRecipe = k3_arch_llama::LlamaRecipe::new_llama4();
+            static LLAMA4: jero_arch_llama::LlamaRecipe =
+                jero_arch_llama::LlamaRecipe::new_llama4();
             return Some(&LLAMA4);
         }
 
-        #[cfg(feature = "arch-mistral")]
+        #[cfg(feature = "jero-arch-mistral")]
         if architecture == "mistral" || architecture == "mistral3" {
-            static MISTRAL: k3_arch_mistral::MistralRecipe = k3_arch_mistral::MistralRecipe::new();
+            static MISTRAL: jero_arch_mistral::MistralRecipe =
+                jero_arch_mistral::MistralRecipe::new();
             return Some(&MISTRAL);
         } else if architecture == "mixtral" {
-            static MIXTRAL: k3_arch_mistral::MistralRecipe =
-                k3_arch_mistral::MistralRecipe::new_mixtral();
+            static MIXTRAL: jero_arch_mistral::MistralRecipe =
+                jero_arch_mistral::MistralRecipe::new_mixtral();
             return Some(&MIXTRAL);
         }
 
-        #[cfg(feature = "arch-phi3")]
+        #[cfg(feature = "jero-arch-phi3")]
         if architecture == "phi3" {
-            static PHI3: k3_arch_phi3::Phi3Recipe = k3_arch_phi3::Phi3Recipe::new();
+            static PHI3: jero_arch_phi3::Phi3Recipe = jero_arch_phi3::Phi3Recipe::new();
             return Some(&PHI3);
         } else if architecture == "phi4" {
-            static PHI4: k3_arch_phi3::Phi3Recipe = k3_arch_phi3::Phi3Recipe::new_phi4();
+            static PHI4: jero_arch_phi3::Phi3Recipe = jero_arch_phi3::Phi3Recipe::new_phi4();
             return Some(&PHI4);
         }
 
-        #[cfg(feature = "arch-bitnet")]
+        #[cfg(feature = "jero-arch-bitnet")]
         if architecture == "bitnet" {
-            static BITNET: k3_arch_bitnet::BitNetRecipe = k3_arch_bitnet::BitNetRecipe::new();
+            static BITNET: jero_arch_bitnet::BitNetRecipe = jero_arch_bitnet::BitNetRecipe::new();
             return Some(&BITNET);
         } else if architecture == "bitnet-b1.58" {
-            static BITNET_B158: k3_arch_bitnet::BitNetRecipe =
-                k3_arch_bitnet::BitNetRecipe::new_b158();
+            static BITNET_B158: jero_arch_bitnet::BitNetRecipe =
+                jero_arch_bitnet::BitNetRecipe::new_b158();
             return Some(&BITNET_B158);
         } else if architecture == "bitnet-25" {
-            static BITNET_25: k3_arch_bitnet::BitNetRecipe = k3_arch_bitnet::BitNetRecipe::new_25();
+            static BITNET_25: jero_arch_bitnet::BitNetRecipe =
+                jero_arch_bitnet::BitNetRecipe::new_25();
             return Some(&BITNET_25);
+        }
+
+        #[cfg(feature = "jero-arch-dory")]
+        if architecture == "dory" {
+            static DORY: jero_arch_dory::DoryRecipe = jero_arch_dory::DoryRecipe::new();
+            return Some(&DORY);
         }
 
         let _ = architecture;
@@ -73,30 +82,32 @@ impl RecipeRegistry {
     #[must_use]
     pub const fn supported_architectures() -> &'static [&'static str] {
         const ARCHS: &[&str] = &[
-            #[cfg(feature = "arch-synthetic")]
+            #[cfg(feature = "jero-arch-synthetic")]
             "synthetic",
-            #[cfg(feature = "arch-llama")]
+            #[cfg(feature = "jero-arch-llama")]
             "llama",
-            #[cfg(feature = "arch-llama")]
+            #[cfg(feature = "jero-arch-llama")]
             "llama4",
-            #[cfg(feature = "arch-llama")]
+            #[cfg(feature = "jero-arch-llama")]
             "qwen2",
-            #[cfg(feature = "arch-mistral")]
+            #[cfg(feature = "jero-arch-mistral")]
             "mistral",
-            #[cfg(feature = "arch-mistral")]
+            #[cfg(feature = "jero-arch-mistral")]
             "mistral3",
-            #[cfg(feature = "arch-mistral")]
+            #[cfg(feature = "jero-arch-mistral")]
             "mixtral",
-            #[cfg(feature = "arch-phi3")]
+            #[cfg(feature = "jero-arch-phi3")]
             "phi3",
-            #[cfg(feature = "arch-phi3")]
+            #[cfg(feature = "jero-arch-phi3")]
             "phi4",
-            #[cfg(feature = "arch-bitnet")]
+            #[cfg(feature = "jero-arch-bitnet")]
             "bitnet",
-            #[cfg(feature = "arch-bitnet")]
+            #[cfg(feature = "jero-arch-bitnet")]
             "bitnet-b1.58",
-            #[cfg(feature = "arch-bitnet")]
+            #[cfg(feature = "jero-arch-bitnet")]
             "bitnet-25",
+            #[cfg(feature = "jero-arch-dory")]
+            "dory",
         ];
         ARCHS
     }
@@ -165,41 +176,43 @@ pub fn verify_metadata_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k3_core::QuantType;
-    use k3_core::test_helpers::create_synthetic_gguf_v3;
+    use jero_core::QuantType;
+    use jero_core::test_helpers::create_synthetic_gguf_v3;
 
     #[test]
     fn test_supported_architectures_list() {
         let archs = RecipeRegistry::supported_architectures();
         let _ = &archs;
-        #[cfg(feature = "arch-synthetic")]
+        #[cfg(feature = "jero-arch-synthetic")]
         assert!(archs.contains(&"synthetic"));
-        #[cfg(feature = "arch-llama")]
+        #[cfg(feature = "jero-arch-llama")]
         {
             assert!(archs.contains(&"llama"));
             assert!(archs.contains(&"llama4"));
             assert!(archs.contains(&"qwen2"));
         }
-        #[cfg(feature = "arch-mistral")]
+        #[cfg(feature = "jero-arch-mistral")]
         {
             assert!(archs.contains(&"mistral"));
             assert!(archs.contains(&"mistral3"));
             assert!(archs.contains(&"mixtral"));
         }
-        #[cfg(feature = "arch-phi3")]
+        #[cfg(feature = "jero-arch-phi3")]
         {
             assert!(archs.contains(&"phi3"));
             assert!(archs.contains(&"phi4"));
         }
-        #[cfg(feature = "arch-bitnet")]
+        #[cfg(feature = "jero-arch-bitnet")]
         {
             assert!(archs.contains(&"bitnet"));
             assert!(archs.contains(&"bitnet-b1.58"));
             assert!(archs.contains(&"bitnet-25"));
         }
+        #[cfg(feature = "jero-arch-dory")]
+        assert!(archs.contains(&"dory"));
     }
 
-    #[cfg(feature = "arch-synthetic")]
+    #[cfg(feature = "jero-arch-synthetic")]
     #[test]
     fn test_verify_valid_synthetic_model_succeeds() {
         let tensor_specs = [
@@ -229,7 +242,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "arch-synthetic")]
+    #[cfg(feature = "jero-arch-synthetic")]
     #[test]
     fn test_verify_unsupported_quantization_rejected() {
         // SyntheticRecipe does not support Q8_0 (only F32, F16, BF16, Q4_K_M)
@@ -247,7 +260,7 @@ mod tests {
 
     #[test]
     fn test_recipe_registry_find_llama_and_mistral() {
-        #[cfg(feature = "arch-llama")]
+        #[cfg(feature = "jero-arch-llama")]
         {
             let llama = RecipeRegistry::find_recipe("llama").expect("llama found");
             assert_eq!(llama.architecture_id(), "llama");
@@ -257,7 +270,7 @@ mod tests {
             assert_eq!(qwen2.architecture_id(), "llama");
         }
 
-        #[cfg(feature = "arch-mistral")]
+        #[cfg(feature = "jero-arch-mistral")]
         {
             let dense_recipe = RecipeRegistry::find_recipe("mistral").expect("mistral found");
             assert_eq!(dense_recipe.architecture_id(), "mistral");
@@ -267,7 +280,7 @@ mod tests {
             assert_eq!(moe_recipe.architecture_id(), "mixtral");
         }
 
-        #[cfg(feature = "arch-phi3")]
+        #[cfg(feature = "jero-arch-phi3")]
         {
             let phi3 = RecipeRegistry::find_recipe("phi3").expect("phi3 found");
             assert_eq!(phi3.architecture_id(), "phi3");
@@ -275,7 +288,7 @@ mod tests {
             assert_eq!(phi4.architecture_id(), "phi4");
         }
 
-        #[cfg(feature = "arch-bitnet")]
+        #[cfg(feature = "jero-arch-bitnet")]
         {
             let bitnet = RecipeRegistry::find_recipe("bitnet").expect("bitnet found");
             assert_eq!(bitnet.architecture_id(), "bitnet");
@@ -285,5 +298,17 @@ mod tests {
             let bitnet_25 = RecipeRegistry::find_recipe("bitnet-25").expect("bitnet-25 found");
             assert_eq!(bitnet_25.architecture_id(), "bitnet-25");
         }
+    }
+
+    #[cfg(feature = "jero-arch-dory")]
+    #[test]
+    fn test_recipe_registry_find_dory() {
+        let dory = RecipeRegistry::find_recipe("dory").expect("dory recipe registered");
+        assert_eq!(dory.architecture_id(), "dory");
+        assert!(dory.supports_quant(QuantType::Q4_K_M));
+        assert!(dory.supports_quant(QuantType::Q5_K));
+        assert!(dory.supports_quant(QuantType::Q6_K));
+        assert!(dory.supports_quant(QuantType::BF16));
+        assert!(RecipeRegistry::supported_architectures().contains(&"dory"));
     }
 }
