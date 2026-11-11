@@ -2047,6 +2047,11 @@ fn pin_current_thread_and_verify(
 }
 
 fn read_proc_task_cpus_allowed_list(tid: i64) -> Option<String> {
+    if std::env::var_os("K3_CPU_ONLINE_MASK").is_some()
+        || std::env::var_os("K3_SIMULATE_A100").is_some()
+    {
+        return None;
+    }
     let status_path = format!("/proc/self/task/{tid}/status");
     let content = fs::read_to_string(status_path).ok()?;
     for line in content.lines() {
