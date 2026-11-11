@@ -509,7 +509,11 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
     let selected_suite = config.eval_suite.unwrap_or(EvalSuite::All);
     let n_ctx = config.n_ctx.unwrap_or(64);
     let max_tokens = config.max_tokens.unwrap_or(16).min(32);
-    let profile = config.coord.unwrap_or(CoordinationProfile::Spin);
+    let profile = config.coord.unwrap_or(if config.phase_policy.is_some() {
+        CoordinationProfile::Rayon
+    } else {
+        CoordinationProfile::Spin
+    });
 
     // 1. Load dataset & reference baselines
     let all_items = load_eval_dataset(config.eval_dataset.as_deref())?;
@@ -528,33 +532,101 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
     }
     let baselines = load_reference_baselines(config.reference_baseline.as_deref())?;
 
-    // 2. Resolve cluster & core affinity and spawn pinned worker pool
-    let resolved_affinity =
-        resolve_affinity(config.cluster.as_deref(), config.core_mask, config.threads)?;
-    let effective_core_mask = format!("0x{:04X}", resolved_affinity.effective_mask);
-    let thread_count = resolved_affinity.threads as u32;
-    let cluster_label = config.cluster.clone().unwrap_or_else(|| {
-        resolved_affinity
-            .cluster
-            .map_or("x100", |c| c.as_str())
-            .to_owned()
-    });
-
-    let ime_requested = config.ime.unwrap_or(false);
-    if ime_requested && cluster_label == "x100" {
-        return Err(K3Error::CapabilityMismatch {
-            architecture: "xsmtvdotii".to_owned(),
-            reason: "SpacemiT IME (--ime on) is not supported on cluster 'x100'".to_owned(),
-        });
-    }
-
-    let worker_pool = WorkerPool::with_coordination(resolved_affinity.clone(), profile)?;
-    worker_pool.verify_live_affinities()?;
-
-    // 3. Open model with flock(LOCK_SH), GGUF parse, capability filter, pre-flight RAM admission, and mlock
     let inspector = SystemMemoryInspector::new();
-    let (locked_weights, recipe, footprint) =
-        LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
+    let ime_requested = config.ime.unwrap_or(false);
+    let (
+        worker_pool,
+        locked_weights,
+        recipe,
+        footprint,
+        effective_core_mask,
+        thread_count,
+        cluster_label,
+        mut engine,
+    ) = if let Some(policy) = config.phase_policy {
+        let (locked_weights, recipe, footprint) =
+            LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
+        let gguf_probe = GgufFile::parse(locked_weights.as_bytes())?;
+        let tok_probe = GgufTokenizer::from_gguf(&gguf_probe)?;
+        let sample_len = tok_probe
+            .tokenize_prompt(&filtered_items[0].prompt, true, n_ctx)
+            .map_or(8, |t| t.len());
+        let worker_pool = WorkerPool::for_phase_policy(
+            policy,
+            locked_weights.metadata(),
+            sample_len,
+            config.core_mask,
+            config.threads,
+            profile,
+        )?;
+        worker_pool.verify_live_affinities()?;
+        let effective_core_mask = format!("0x{:04X}", worker_pool.affinity().effective_mask);
+        let thread_count = worker_pool.thread_count() as u32;
+        let cluster_label = if worker_pool.is_dual() {
+            "both".to_owned()
+        } else {
+            worker_pool
+                .affinity()
+                .cluster
+                .map_or("x100", |c| c.as_str())
+                .to_owned()
+        };
+        if ime_requested && cluster_label == "x100" {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "xsmtvdotii".to_owned(),
+                reason: "SpacemiT IME (--ime on) is not supported on cluster 'x100'".to_owned(),
+            });
+        }
+        let resolved_policy = worker_pool.phase_policy().unwrap_or(policy);
+        let engine = SinglePromptEngine::new().with_phase_policy(resolved_policy);
+        (
+            worker_pool,
+            locked_weights,
+            recipe,
+            footprint,
+            effective_core_mask,
+            thread_count,
+            cluster_label,
+            engine,
+        )
+    } else {
+        // 2. Resolve cluster & core affinity and spawn pinned worker pool
+        let resolved_affinity =
+            resolve_affinity(config.cluster.as_deref(), config.core_mask, config.threads)?;
+        let effective_core_mask = format!("0x{:04X}", resolved_affinity.effective_mask);
+        let thread_count = resolved_affinity.threads as u32;
+        let cluster_label = config.cluster.clone().unwrap_or_else(|| {
+            resolved_affinity
+                .cluster
+                .map_or("x100", |c| c.as_str())
+                .to_owned()
+        });
+
+        if ime_requested && cluster_label == "x100" {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "xsmtvdotii".to_owned(),
+                reason: "SpacemiT IME (--ime on) is not supported on cluster 'x100'".to_owned(),
+            });
+        }
+
+        let worker_pool = WorkerPool::with_coordination(resolved_affinity, profile)?;
+        worker_pool.verify_live_affinities()?;
+
+        // 3. Open model with flock(LOCK_SH), GGUF parse, capability filter, pre-flight RAM admission, and mlock
+        let (locked_weights, recipe, footprint) =
+            LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
+        (
+            worker_pool,
+            locked_weights,
+            recipe,
+            footprint,
+            effective_core_mask,
+            thread_count,
+            cluster_label,
+            SinglePromptEngine::new(),
+        )
+    };
+    let resolved_affinity = worker_pool.affinity().clone();
     let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
     let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
 
@@ -562,7 +634,6 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
     let quant_str = QuantizationInfo::from_descriptors(locked_weights.metadata().tensors()).primary;
 
     // 4. Evaluate items across selected open-source benchmark suites
-    let mut engine = SinglePromptEngine::new();
     let mut suite_order: Vec<String> = Vec::new();
     let mut suite_items_map: BTreeMap<String, Vec<(EvalDatasetItem, bool, f64, f64)>> =
         BTreeMap::new();
@@ -587,11 +658,11 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
         };
 
         // Run pass 1 and pass 2 at temperature 0 to verify deterministic token generation
-        let mut kv_arena_1 = SingleSlotKvArena::new(locked_weights.metadata(), n_ctx)?;
+        let mut kv_arena_1 = SingleSlotKvArena::from_gguf(&gguf_view, n_ctx)?;
         let mut detok = tokenizer.streaming_detokenizer();
         let mut text_out = String::new();
         let summary_1 = engine.evaluate_prompt_with_pool(
-            recipe,
+            recipe.as_ref(),
             &locked_weights,
             &mut kv_arena_1,
             Some(&worker_pool),
@@ -614,9 +685,9 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
             text_out.push_str(&detok.finish());
         }
 
-        let mut kv_arena_2 = SingleSlotKvArena::new(locked_weights.metadata(), n_ctx)?;
+        let mut kv_arena_2 = SingleSlotKvArena::from_gguf(&gguf_view, n_ctx)?;
         let summary_2 = engine.evaluate_prompt_with_pool(
-            recipe,
+            recipe.as_ref(),
             &locked_weights,
             &mut kv_arena_2,
             Some(&worker_pool),

@@ -17,13 +17,16 @@ pub use worker as jero_worker;
 pub use worker as k3_worker;
 
 pub use affinity::{
-    A100_CLUSTER_MASK, A100_DEFAULT_MAX_COMPUTE_THREADS, ClusterPreset, CpuTopologyInspector,
-    FutexBarrier, IntoClusterPreset, MockCpuTopology, ResolvedAffinity, SpinBarrier,
-    SystemCpuTopology, VlenDomain, WorkerAffinityStatus, WorkerPool, WorkerWaitSlot,
-    X100_CLUSTER_MASK, X100_DEFAULT_MAX_COMPUTE_THREADS, parse_cpu_list_mask, resolve_affinity,
-    resolve_affinity_with,
+    A100_CLUSTER_MASK, A100_DEFAULT_MAX_COMPUTE_THREADS, ClusterPhasePolicy, ClusterPreset,
+    CpuTopologyInspector, FutexBarrier, IntoClusterPreset, MockCpuTopology,
+    PHASE_SPLIT_MIN_PROMPT_TOKENS, ResolvedAffinity, SpinBarrier, SystemCpuTopology, VlenDomain,
+    WorkerAffinityStatus, WorkerPool, WorkerWaitSlot, X100_CLUSTER_MASK,
+    X100_DEFAULT_MAX_COMPUTE_THREADS, parse_cpu_list_mask, resolve_affinity, resolve_affinity_with,
+    resolve_phase_policy, select_phase_policy, select_phase_policy_for_arch,
 };
-pub use capability::{RecipeRegistry, verify_metadata_capabilities, verify_model_capabilities};
+pub use capability::{
+    GgufHyperparams, RecipeRegistry, verify_metadata_capabilities, verify_model_capabilities,
+};
 pub use engine::{
     EnginePhase, EvaluationSummary, PassTiming, SinglePromptEngine, StreamAction,
     sample_greedy_argmax,

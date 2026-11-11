@@ -214,7 +214,7 @@ impl LockedModelWeights {
         path: P,
         n_ctx: usize,
         inspector: &I,
-    ) -> Result<(Self, &'static dyn ArchRecipe, MemoryFootprint), K3Error> {
+    ) -> Result<(Self, Box<dyn ArchRecipe>, MemoryFootprint), K3Error> {
         let path_ref = path.as_ref();
         let file = File::open(path_ref).map_err(|err| K3Error::CapabilityMismatch {
             architecture: "unknown".to_owned(),
@@ -303,7 +303,7 @@ impl LockedModelWeights {
         // SAFETY: raw_ptr is valid for reads up to file_len.
         let slice = unsafe { std::slice::from_raw_parts(raw_ptr, file_len) };
         let preflight =
-            (|| -> Result<(ModelMetadata, &'static dyn ArchRecipe, MemoryFootprint), K3Error> {
+            (|| -> Result<(ModelMetadata, Box<dyn ArchRecipe>, MemoryFootprint), K3Error> {
                 let gguf = GgufFile::parse(slice)?;
                 let recipe = verify_model_capabilities(&gguf)?;
                 let footprint = check_memory_admission_with(gguf.metadata(), n_ctx, inspector)?;

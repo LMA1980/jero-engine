@@ -5,8 +5,9 @@
 
 use std::ptr;
 
-use jero_core::{K3Error, ModelMetadata, align_up};
+use jero_core::{GgufFile, K3Error, ModelMetadata, align_up};
 
+use crate::capability::GgufHyperparams;
 use crate::memory::{KV_BLOCK_SIZE, system_page_size};
 
 /// In-process single-slot KV cache arena organized in 16-token blocks and locked in RAM.
@@ -135,14 +136,70 @@ impl SingleSlotKvArena {
             });
         }
 
-        let layer_count = metadata.layer_count().max(1);
-        let head_count_kv = metadata.head_count_kv().max(1);
-        let head_dim = if metadata.head_count() > 0 {
-            metadata.embedding_dim() / metadata.head_count()
-        } else {
-            metadata.embedding_dim()
+        let params = GgufHyperparams::from_metadata(metadata);
+        let layer_count = params.block_count.max(1);
+        let head_count_kv = params.head_count_kv.max(1);
+        let head_dim = params
+            .key_length
+            .max(if metadata.head_count() == 0 {
+                metadata.embedding_dim()
+            } else {
+                0
+            })
+            .max(1);
+
+        Self::with_dimensions(layer_count, head_count_kv, head_dim, n_ctx)
+    }
+
+    /// Allocates and locks an in-process single-slot KV cache arena from a parsed [`GgufFile`],
+    /// honoring explicit `{arch}.attention.key_length` when decoupled from
+    /// `embedding_length / head_count`.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`K3Error::CapabilityMismatch`] if `n_ctx` is zero.
+    /// - Returns [`K3Error::ContextLengthExceeded`] if `n_ctx` exceeds `gguf.metadata().context_length()`.
+    /// - Returns [`K3Error::InsufficientLockableMemory`] if `mmap` or `mlock` allocation fails.
+    pub fn from_gguf(gguf: &GgufFile<'_>, n_ctx: usize) -> Result<Self, K3Error> {
+        let metadata = gguf.metadata();
+        if n_ctx == 0 {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: metadata.architecture().to_owned(),
+                reason: "KV cache context length n_ctx must be greater than zero".to_owned(),
+            });
         }
-        .max(1);
+
+        if metadata.context_length() > 0 && n_ctx > metadata.context_length() {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: n_ctx,
+                max_context_tokens: metadata.context_length(),
+            });
+        }
+
+        let params = GgufHyperparams::from_gguf(gguf);
+        let layer_count = if let Some(dory) = metadata.dory() {
+            let virtual_layers = dory
+                .input_layer_count()
+                .saturating_add(
+                    dory.recurrent_layer_count()
+                        .saturating_mul(dory.num_loops()),
+                )
+                .saturating_add(dory.output_layer_count());
+            usize::try_from(virtual_layers)
+                .unwrap_or(params.block_count)
+                .max(1)
+        } else {
+            params.block_count.max(1)
+        };
+        let head_count_kv = params.head_count_kv.max(1);
+        let head_dim = params
+            .key_length
+            .max(if metadata.head_count() == 0 {
+                metadata.embedding_dim()
+            } else {
+                0
+            })
+            .max(1);
 
         Self::with_dimensions(layer_count, head_count_kv, head_dim, n_ctx)
     }
@@ -242,6 +299,24 @@ impl SingleSlotKvArena {
     #[must_use]
     pub const fn num_blocks(&self) -> usize {
         self.num_blocks
+    }
+
+    /// Returns the layer count configured for this arena.
+    #[must_use]
+    pub const fn layer_count(&self) -> usize {
+        self.layer_count
+    }
+
+    /// Returns the grouped-query K/V head count configured for this arena.
+    #[must_use]
+    pub const fn head_count_kv(&self) -> usize {
+        self.head_count_kv
+    }
+
+    /// Returns the per-head K/V dimension (`head_dim`) configured for this arena.
+    #[must_use]
+    pub const fn head_dim(&self) -> usize {
+        self.head_dim
     }
 
     /// Returns the total token capacity (`num_blocks * 16`).
@@ -506,5 +581,28 @@ mod tests {
                 max_context_tokens: 32,
             }
         );
+    }
+
+    #[test]
+    fn test_kv_arena_from_gguf_honors_explicit_key_length() {
+        use jero_core::GgufValue;
+        use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
+
+        // embedding_length = 256, head_count = 8 (256/8 = 32), but explicit key_length = 64
+        let extra_kvs = [
+            ("llama.block_count", GgufValue::Uint32(2)),
+            ("llama.embedding_length", GgufValue::Uint32(256)),
+            ("llama.attention.head_count", GgufValue::Uint32(8)),
+            ("llama.attention.head_count_kv", GgufValue::Uint32(2)),
+            ("llama.attention.key_length", GgufValue::Uint32(64)),
+        ];
+        let bytes = create_synthetic_gguf_v3_with_kvs("llama", 32, &extra_kvs, &[]);
+        let gguf = GgufFile::parse(&bytes).expect("parse gguf");
+
+        let arena = SingleSlotKvArena::from_gguf(&gguf, 16).expect("allocate kv arena from gguf");
+        assert_eq!(arena.layer_count(), 2);
+        assert_eq!(arena.head_count_kv(), 2);
+        assert_eq!(arena.head_dim(), 64);
+        assert_eq!(arena.elements_per_token(), 2 * 2 * 2 * 64);
     }
 }

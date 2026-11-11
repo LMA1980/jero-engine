@@ -92,7 +92,7 @@ fn test_us02_multicore_pipeline_affinity_stability_and_determinism() {
 
         let summary = engine
             .evaluate_prompt_with_pool(
-                recipe,
+                recipe.as_ref(),
                 &locked_weights,
                 &mut kv_arena,
                 Some(&worker_pool),
@@ -191,7 +191,7 @@ fn test_us02_coordination_profiles_comparative_forward_pass() {
 
         let summary = engine
             .evaluate_prompt_with_pool(
-                recipe,
+                recipe.as_ref(),
                 &locked_weights,
                 &mut kv_arena,
                 Some(&pool),

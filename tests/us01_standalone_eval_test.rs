@@ -81,7 +81,7 @@ fn test_us01_scenario_1_direct_local_evaluation_and_realtime_token_streaming() {
 
     let summary = engine
         .evaluate_prompt(
-            recipe,
+            recipe.as_ref(),
             &locked_weights,
             &mut kv_arena,
             &prompt_tokens,
@@ -112,7 +112,7 @@ fn test_us01_scenario_1_direct_local_evaluation_and_realtime_token_streaming() {
     let mut detok_repeat = tokenizer.streaming_detokenizer();
     let summary_repeat = engine
         .evaluate_prompt(
-            recipe,
+            recipe.as_ref(),
             &locked_weights,
             &mut kv_arena,
             &prompt_tokens,
@@ -208,7 +208,7 @@ fn test_us01_scenario_2_explicit_compute_cluster_and_concurrency_targeting() {
 
     let summary = engine
         .evaluate_prompt_with_pool(
-            recipe,
+            recipe.as_ref(),
             &locked_weights,
             &mut kv_arena,
             Some(&worker_pool),
