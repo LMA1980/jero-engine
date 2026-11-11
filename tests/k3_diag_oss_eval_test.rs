@@ -12,6 +12,7 @@ use std::process::Command;
 
 use jero_core::QuantType;
 use jero_core::test_helpers::create_synthetic_gguf_v3;
+use jero_engine::CpuTopologyInspector;
 use serde_json::Value;
 
 fn k3_diag_bin() -> String {
@@ -132,6 +133,10 @@ fn test_k3_diag_eval_custom_jsonl_dataset_and_human_scorecard() {
     let jsonl_content = r#"{"id":"gsm8k_custom_1","suite":"gsm8k","category":"Mathematical Reasoning","prompt":"2 + 2 = ####","expected_answer":"4","scoring_method":"numerical_extract","source_license":"MIT","contamination_status":"verified_clean"}"#;
     std::fs::write(&dataset_path, format!("{jsonl_content}\n")).expect("write custom jsonl");
 
+    let topo = jero_engine::affinity::SystemCpuTopology::new();
+    let a100_online = topo.online_cpu_mask().is_ok_and(|m| (m & 0xFF00) != 0);
+    let cluster = if a100_online { "a100" } else { "x100" };
+
     let output = Command::new(k3_diag_bin())
         .args([
             "--model",
@@ -141,7 +146,7 @@ fn test_k3_diag_eval_custom_jsonl_dataset_and_human_scorecard() {
             "--eval-dataset",
             dataset_path.to_str().unwrap(),
             "--cluster",
-            "a100",
+            cluster,
             "--ime",
             "on",
             "--threads",
