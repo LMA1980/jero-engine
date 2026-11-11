@@ -1523,6 +1523,9 @@ impl WorkerPool {
     /// Returns cumulative inter-worker barrier wait time across all workers in milliseconds.
     #[must_use]
     pub fn cumulative_barrier_wait_ms(&self) -> f64 {
+        if self.thread_count() <= 1 {
+            return 0.0;
+        }
         match &self.backend {
             PoolBackend::Dual {
                 x100_pool,
@@ -1535,6 +1538,9 @@ impl WorkerPool {
     /// Returns cumulative inter-worker barrier wait time across all workers in nanoseconds.
     #[must_use]
     pub fn cumulative_barrier_wait_nanos(&self) -> u64 {
+        if self.thread_count() <= 1 {
+            return 0;
+        }
         match &self.backend {
             PoolBackend::Dual {
                 x100_pool,
