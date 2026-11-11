@@ -135,7 +135,11 @@ fn test_k3_diag_eval_custom_jsonl_dataset_and_human_scorecard() {
 
     let topo = jero_engine::affinity::SystemCpuTopology::new();
     let a100_online = topo.online_cpu_mask().is_ok_and(|m| (m & 0xFF00) != 0);
-    let cluster = if a100_online { "a100" } else { "x100" };
+    let (cluster, ime) = if a100_online {
+        ("a100", "on")
+    } else {
+        ("x100", "off")
+    };
 
     let output = Command::new(k3_diag_bin())
         .args([
@@ -148,7 +152,7 @@ fn test_k3_diag_eval_custom_jsonl_dataset_and_human_scorecard() {
             "--cluster",
             cluster,
             "--ime",
-            "on",
+            ime,
             "--threads",
             "2",
             "--n-ctx",
