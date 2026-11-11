@@ -28,8 +28,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use jero_core::{CoordinationProfile, GgufFile, K3Error};
 use jero_engine::affinity::SplitStrategy;
 use jero_engine::{
-    LockedModelWeights, SinglePromptEngine, SingleSlotKvArena, StreamAction, SystemMemoryInspector,
-    WorkerPool, resolve_affinity,
+    ClusterPhasePolicy, LockedModelWeights, SinglePromptEngine, SingleSlotKvArena, StreamAction,
+    SystemMemoryInspector, WorkerPool, resolve_affinity,
 };
 use jero_tokenizer::{DetokenizeStep, GgufTokenizer};
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,8 @@ pub struct DiagConfig {
     pub prompt: Option<String>,
     /// Target processor cluster ("both", "x100" or "a100").
     pub cluster: Option<String>,
+    /// Execution-phase cluster scheduling policy (`auto`, `x100-prefill-a100-decode`, `a100-only`, `x100-only`, `row-split`).
+    pub phase_policy: Option<ClusterPhasePolicy>,
     /// Cross-cluster workload split policy, valid only with `--cluster both` (US-03).
     pub split: Option<SplitStrategy>,
     /// SpacemiT IME matrix acceleration toggle (`Some(true)` = `on`, US-03).
@@ -114,6 +116,7 @@ impl Default for DiagConfig {
             model_path: None,
             prompt: None,
             cluster: None,
+            phase_policy: None,
             split: None,
             ime: None,
             threads: None,
@@ -182,6 +185,17 @@ impl DiagConfig {
                         ));
                     }
                     config.cluster = Some(cluster);
+                }
+                "--phase-policy" => {
+                    let val = args.next().ok_or_else(|| {
+                        "--phase-policy requires 'auto', 'x100-prefill-a100-decode', 'a100-only', 'x100-only', or 'row-split'".to_owned()
+                    })?;
+                    let policy = ClusterPhasePolicy::parse(&val).map_err(|_| {
+                        format!(
+                            "invalid --phase-policy '{val}': expected 'auto', 'x100-prefill-a100-decode', 'a100-only', 'x100-only', or 'row-split'"
+                        )
+                    })?;
+                    config.phase_policy = Some(policy);
                 }
                 "--split" => {
                     let val = args
@@ -362,6 +376,11 @@ impl DiagConfig {
 
         // Cluster-boundary rules (US-03): a mixed-cluster mask is allowed only through an
         // explicit split policy, and a split policy only makes sense across both clusters.
+        if config.phase_policy.is_some() && config.cluster.is_some() {
+            return Err(
+                "--phase-policy cannot be combined with --cluster; use one or the other".to_owned(),
+            );
+        }
         if config.split.is_some() && config.cluster.as_deref() != Some("both") {
             return Err("--split requires --cluster both".to_owned());
         }
@@ -501,6 +520,7 @@ fn print_usage() {
            -m, --model <path>     Path to local model file (GGUF)\n  \
            -p, --prompt <text>    Input prompt to tokenize and evaluate\n  \
                --cluster <id>     Target processor cluster ('both', 'x100' or 'a100')\n  \
+               --phase-policy <p> Phase cluster policy ('auto', 'x100-prefill-a100-decode', 'a100-only', 'x100-only', 'row-split')\n  \
                --split <policy>   Cross-cluster split for '--cluster both' ('phase', 'op', 'row')\n  \
                --ime <on|off>     SpacemiT IME matrix acceleration ('on' also measures the 'off' baseline)\n  \
            -t, --threads <n>      Number of execution worker threads\n  \
@@ -530,45 +550,100 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
     let n_ctx = config.n_ctx.unwrap_or(64);
     let max_tokens = config.max_tokens.unwrap_or(128);
     let repeat_count = config.repeat.unwrap_or(3);
-    let profile = config.coord.unwrap_or(CoordinationProfile::Spin);
+    let profile = config.coord.unwrap_or(if config.phase_policy.is_some() {
+        CoordinationProfile::Rayon
+    } else {
+        CoordinationProfile::Spin
+    });
 
-    // 1. Resolve cluster & core affinity and spawn pinned worker pool with selected coordination profile
-    let resolved_affinity =
-        resolve_affinity(config.cluster.as_deref(), config.core_mask, config.threads)?;
-    let effective_core_mask = format!("0x{:04X}", resolved_affinity.effective_mask);
-    let thread_count = resolved_affinity.threads;
-
-    let worker_pool = WorkerPool::with_coordination(resolved_affinity, profile)?;
-    worker_pool.verify_live_affinities()?;
-
-    // 2. Open model with flock(LOCK_SH), GGUF parse, capability filter, pre-flight RAM admission, and mlock
     let inspector = SystemMemoryInspector::new();
-    let (locked_weights, recipe, _footprint) =
-        LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
+    let (
+        worker_pool,
+        locked_weights,
+        recipe,
+        tokenizer_vocab_size,
+        prompt_tokens,
+        effective_core_mask,
+        thread_count,
+        mut engine,
+    ) = if let Some(policy) = config.phase_policy {
+        let (locked_weights, recipe, _footprint) =
+            LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
+        let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
+        let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
+        let prompt_tokens = tokenizer.tokenize_prompt(prompt_text, true, n_ctx)?;
+        let worker_pool = WorkerPool::for_phase_policy(
+            policy,
+            locked_weights.metadata(),
+            prompt_tokens.len(),
+            config.core_mask,
+            config.threads,
+            profile,
+        )?;
+        worker_pool.verify_live_affinities()?;
+        let effective_core_mask = format!("0x{:04X}", worker_pool.affinity().effective_mask);
+        let thread_count = worker_pool.thread_count();
+        let resolved_policy = worker_pool.phase_policy().unwrap_or(policy);
+        let engine = SinglePromptEngine::new().with_phase_policy(resolved_policy);
+        (
+            worker_pool,
+            locked_weights,
+            recipe,
+            tokenizer.vocab_size(),
+            prompt_tokens,
+            effective_core_mask,
+            thread_count,
+            engine,
+        )
+    } else {
+        // 1. Resolve cluster & core affinity and spawn pinned worker pool with selected coordination profile
+        let resolved_affinity =
+            resolve_affinity(config.cluster.as_deref(), config.core_mask, config.threads)?;
+        let effective_core_mask = format!("0x{:04X}", resolved_affinity.effective_mask);
+        let thread_count = resolved_affinity.threads;
 
-    // 3. Extract GGUF vocabulary/template and tokenize prompt in-process
+        let worker_pool = WorkerPool::with_coordination(resolved_affinity, profile)?;
+        worker_pool.verify_live_affinities()?;
+
+        // 2. Open model with flock(LOCK_SH), GGUF parse, capability filter, pre-flight RAM admission, and mlock
+        let (locked_weights, recipe, _footprint) =
+            LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
+
+        // 3. Extract GGUF vocabulary/template and tokenize prompt in-process
+        let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
+        let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
+        let prompt_tokens = tokenizer.tokenize_prompt(prompt_text, true, n_ctx)?;
+        (
+            worker_pool,
+            locked_weights,
+            recipe,
+            tokenizer.vocab_size(),
+            prompt_tokens,
+            effective_core_mask,
+            thread_count,
+            SinglePromptEngine::new(),
+        )
+    };
+
     let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
-    let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
-    let prompt_tokens = tokenizer.tokenize_prompt(prompt_text, true, n_ctx)?;
 
     // 4. Multi-Run Execution Loop
     let mut run_metrics: Vec<RunMetric> = Vec::with_capacity(repeat_count);
     let mut all_tokens: Vec<Vec<u32>> = Vec::with_capacity(repeat_count);
-    let mut engine = SinglePromptEngine::new();
 
     for run_idx in 0..repeat_count {
         if is_abort_requested() {
             break;
         }
 
-        let mut kv_arena = SingleSlotKvArena::new(locked_weights.metadata(), n_ctx)?;
+        let mut kv_arena = SingleSlotKvArena::from_gguf(&gguf_view, n_ctx)?;
         let summary = engine.evaluate_prompt_with_pool(
-            recipe,
+            recipe.as_ref(),
             &locked_weights,
             &mut kv_arena,
             Some(&worker_pool),
             &prompt_tokens,
-            tokenizer.vocab_size(),
+            tokenizer_vocab_size,
             max_tokens,
             |_tok| {
                 if is_abort_requested() {
@@ -769,33 +844,61 @@ pub fn run_single_eval_session<W: Write>(config: &DiagConfig, mut out: W) -> Res
     let prompt_text = config.prompt.as_deref().unwrap_or("hello world");
     let n_ctx = config.n_ctx.unwrap_or(64);
     let max_tokens = config.max_tokens.unwrap_or(128);
-    let profile = config.coord.unwrap_or(CoordinationProfile::Spin);
+    let profile = config.coord.unwrap_or(if config.phase_policy.is_some() {
+        CoordinationProfile::Rayon
+    } else {
+        CoordinationProfile::Spin
+    });
 
-    // 1. Resolve cluster & core affinity and spawn pinned worker pool (US-01.5, Scenario 2)
-    let resolved_affinity =
-        resolve_affinity(config.cluster.as_deref(), config.core_mask, config.threads)?;
-    let worker_pool = WorkerPool::with_coordination(resolved_affinity, profile)?;
-    worker_pool.verify_live_affinities()?;
-
-    // 2. Open model with flock(LOCK_SH), GGUF parse, capability filter, pre-flight RAM admission, and mlock (US-01.2, US-01.3, Scenario 1 & 3)
     let inspector = SystemMemoryInspector::new();
-    let (locked_weights, recipe, _footprint) =
-        LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
+    let (worker_pool, locked_weights, recipe, mut engine) =
+        if let Some(policy) = config.phase_policy {
+            let (locked_weights, recipe, _footprint) =
+                LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
+            let gguf_probe = GgufFile::parse(locked_weights.as_bytes())?;
+            let tokenizer_probe = GgufTokenizer::from_gguf(&gguf_probe)?;
+            let probe_tokens = tokenizer_probe.tokenize_prompt(prompt_text, true, n_ctx)?;
+            let worker_pool = WorkerPool::for_phase_policy(
+                policy,
+                locked_weights.metadata(),
+                probe_tokens.len(),
+                config.core_mask,
+                config.threads,
+                profile,
+            )?;
+            worker_pool.verify_live_affinities()?;
+            let resolved_policy = worker_pool.phase_policy().unwrap_or(policy);
+            let engine = SinglePromptEngine::new().with_phase_policy(resolved_policy);
+            (worker_pool, locked_weights, recipe, engine)
+        } else {
+            // 1. Resolve cluster & core affinity and spawn pinned worker pool (US-01.5, Scenario 2)
+            let resolved_affinity =
+                resolve_affinity(config.cluster.as_deref(), config.core_mask, config.threads)?;
+            let worker_pool = WorkerPool::with_coordination(resolved_affinity, profile)?;
+            worker_pool.verify_live_affinities()?;
 
-    // 3. Allocate and mlock single-slot 16-token paged KV cache arena (US-01.3.3)
-    let mut kv_arena = SingleSlotKvArena::new(locked_weights.metadata(), n_ctx)?;
+            // 2. Open model with flock(LOCK_SH), GGUF parse, capability filter, pre-flight RAM admission, and mlock (US-01.2, US-01.3, Scenario 1 & 3)
+            let (locked_weights, recipe, _footprint) =
+                LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
+            (
+                worker_pool,
+                locked_weights,
+                recipe,
+                SinglePromptEngine::new(),
+            )
+        };
 
-    // 4. Extract GGUF vocabulary/template and tokenize prompt in-process (US-01.4)
+    // 3. Extract GGUF view/vocabulary/template, allocate 16-token paged KV cache arena, and tokenize prompt in-process
     let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
+    let mut kv_arena = SingleSlotKvArena::from_gguf(&gguf_view, n_ctx)?;
     let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
     let prompt_tokens = tokenizer.tokenize_prompt(prompt_text, true, n_ctx)?;
 
     // 5. Execute isolated single-prompt forward pass and stream tokens unbuffered (US-01.6, US-01.7.2)
-    let mut engine = SinglePromptEngine::new();
     let mut detokenizer = tokenizer.streaming_detokenizer();
 
     engine.evaluate_prompt_with_pool(
-        recipe,
+        recipe.as_ref(),
         &locked_weights,
         &mut kv_arena,
         Some(&worker_pool),
@@ -1046,6 +1149,7 @@ mod tests {
             model_path: Some(temp_path.to_string_lossy().into_owned()),
             prompt: Some("hello world".to_owned()),
             cluster: None,
+            phase_policy: None,
             split: None,
             ime: None,
             threads: Some(1),
@@ -1092,6 +1196,7 @@ mod tests {
             model_path: Some(temp_path.to_string_lossy().into_owned()),
             prompt: Some("hello world".to_owned()),
             cluster: None,
+            phase_policy: None,
             split: None,
             ime: None,
             threads: Some(1),

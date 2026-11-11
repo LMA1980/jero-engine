@@ -9,7 +9,9 @@ use std::time::Instant;
 
 use jero_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights};
 
-use crate::affinity::WorkerPool;
+use crate::affinity::{
+    ClusterPhasePolicy, WorkerPool, X100_CLUSTER_MASK, select_phase_policy_for_arch,
+};
 use crate::kv::SingleSlotKvArena;
 
 /// Execution phase of the single-prompt forward pass state machine.
@@ -116,6 +118,7 @@ pub struct EvaluationSummary {
 pub struct SinglePromptEngine {
     active_cycle: AtomicBool,
     phase: EnginePhase,
+    phase_policy: ClusterPhasePolicy,
 }
 
 impl Default for SinglePromptEngine {
@@ -150,13 +153,32 @@ impl Drop for CycleGuard<'_> {
 }
 
 impl SinglePromptEngine {
-    /// Creates a new idle [`SinglePromptEngine`].
+    /// Creates a new idle [`SinglePromptEngine`] with [`ClusterPhasePolicy::Auto`].
     #[must_use]
     pub const fn new() -> Self {
         Self {
             active_cycle: AtomicBool::new(false),
             phase: EnginePhase::Idle,
+            phase_policy: ClusterPhasePolicy::Auto,
         }
+    }
+
+    /// Configures the execution-phase cluster scheduling policy for this engine instance.
+    #[must_use]
+    pub const fn with_phase_policy(mut self, phase_policy: ClusterPhasePolicy) -> Self {
+        self.phase_policy = phase_policy;
+        self
+    }
+
+    /// Updates the execution-phase cluster scheduling policy for subsequent forward passes.
+    pub fn set_phase_policy(&mut self, phase_policy: ClusterPhasePolicy) {
+        self.phase_policy = phase_policy;
+    }
+
+    /// Returns the configured [`ClusterPhasePolicy`] for this engine instance.
+    #[must_use]
+    pub const fn phase_policy(&self) -> ClusterPhasePolicy {
+        self.phase_policy
     }
 
     /// Returns the current phase of the engine state machine.
@@ -249,9 +271,25 @@ impl SinglePromptEngine {
         }
 
         let n_ctx = kv_arena.n_ctx();
-        let mut logits = vec![0.0_f32; vocab_size];
+        let logits_len = infer_logits_buffer_len(weights, vocab_size);
+        let mut logits = vec![0.0_f32; logits_len];
         let mut ctx =
             ExecutionContext::new(prompt_tokens, n_ctx, &mut logits, kv_arena.as_mut_slice())?;
+
+        let effective_policy = match self.phase_policy {
+            ClusterPhasePolicy::Auto => worker_pool
+                .and_then(WorkerPool::phase_policy)
+                .unwrap_or_else(|| {
+                    let online_mask =
+                        worker_pool.map_or(X100_CLUSTER_MASK, |p| p.affinity().effective_mask);
+                    select_phase_policy_for_arch(
+                        recipe.architecture_id(),
+                        prompt_tokens.len(),
+                        online_mask,
+                    )
+                }),
+            explicit => explicit,
+        };
 
         let pass_start = Instant::now();
         if let Some(pool) = worker_pool {
@@ -262,11 +300,12 @@ impl SinglePromptEngine {
         self.phase = EnginePhase::Prefill;
         let prefill_start = Instant::now();
         if let Some(pool) = worker_pool {
-            pool.execute(|_worker_idx, _total_workers| {
-                // Synchronize pinned worker threads on prefill barrier
-            });
+            pool.install_for_phase(EnginePhase::Prefill, effective_policy, || {
+                recipe.prefill_step(&mut ctx, weights)
+            })?;
+        } else {
+            recipe.prefill_step(&mut ctx, weights)?;
         }
-        recipe.prefill_step(&mut ctx, weights)?;
 
         let mut generated_tokens = Vec::with_capacity(max_tokens);
         if max_tokens == 0 {
@@ -292,10 +331,13 @@ impl SinglePromptEngine {
         }
 
         // Sample first token produced by prefill logits (TTFT ends here)
+        let sample_len = vocab_size.min(ctx.logits().len());
         let mut current_token =
-            sample_greedy_argmax(ctx.logits()).ok_or_else(|| K3Error::CapabilityMismatch {
-                architecture: recipe.architecture_id().to_owned(),
-                reason: "empty logits buffer after prefill step".to_owned(),
+            sample_greedy_argmax(&ctx.logits()[..sample_len]).ok_or_else(|| {
+                K3Error::CapabilityMismatch {
+                    architecture: recipe.architecture_id().to_owned(),
+                    reason: "empty logits buffer after prefill step".to_owned(),
+                }
             })?;
         let prefill_elapsed = prefill_start.elapsed();
         let ttft_ms = prefill_elapsed.as_secs_f64() * 1000.0;
@@ -329,16 +371,20 @@ impl SinglePromptEngine {
         while generated_tokens.len() < max_tokens && ctx.position() < n_ctx {
             ctx.prepare_decode(current_token)?;
             if let Some(pool) = worker_pool {
-                pool.execute(|_worker_idx, _total_workers| {
-                    // Synchronize pinned worker threads on decode step
-                });
+                pool.install_for_phase(EnginePhase::Decode, effective_policy, || {
+                    recipe.decode_step(&mut ctx, weights)
+                })?;
+            } else {
+                recipe.decode_step(&mut ctx, weights)?;
             }
-            recipe.decode_step(&mut ctx, weights)?;
 
+            let step_sample_len = vocab_size.min(ctx.logits().len());
             current_token =
-                sample_greedy_argmax(ctx.logits()).ok_or_else(|| K3Error::CapabilityMismatch {
-                    architecture: recipe.architecture_id().to_owned(),
-                    reason: "empty logits buffer after decode step".to_owned(),
+                sample_greedy_argmax(&ctx.logits()[..step_sample_len]).ok_or_else(|| {
+                    K3Error::CapabilityMismatch {
+                        architecture: recipe.architecture_id().to_owned(),
+                        reason: "empty logits buffer after decode step".to_owned(),
+                    }
                 })?;
 
             generated_tokens.push(current_token);
@@ -374,6 +420,19 @@ impl SinglePromptEngine {
             ),
         })
     }
+}
+
+fn infer_logits_buffer_len(weights: &dyn ModelWeights, vocab_size: usize) -> usize {
+    if weights.contains_tensor("output.weight")
+        && let Ok(view) = weights.tensor("output.weight")
+        && view.shape().len() == 2
+    {
+        let rows = view.shape()[1];
+        if rows > vocab_size && rows % 64 == 0 && (rows - vocab_size) <= 1024 {
+            return rows;
+        }
+    }
+    vocab_size
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -532,5 +591,165 @@ mod tests {
             .expect("second concurrent prompt must be rejected");
         assert_eq!(err.diagnostic_code(), "capability_mismatch");
         assert!(err.to_string().contains("cycle exclusivity violation"));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    #[allow(clippy::too_many_lines)]
+    fn test_engine_dispatches_prefill_and_decode_inside_phase_scoped_worker_pool() {
+        use crate::affinity::{MockCpuTopology, WorkerPool, get_current_thread_core};
+        use jero_core::{
+            CoordinationProfile, GgufFile, QuantType, test_helpers::create_synthetic_gguf_v3,
+        };
+        use std::sync::Mutex;
+
+        #[derive(Debug)]
+        struct PhaseProbeRecipe {
+            prefill_cores: Mutex<Vec<Option<usize>>>,
+            decode_cores: Mutex<Vec<Option<usize>>>,
+        }
+
+        impl ArchRecipe for PhaseProbeRecipe {
+            fn architecture_id(&self) -> &'static str {
+                "llama"
+            }
+
+            fn recipe_version(&self) -> &'static str {
+                "1.0.0"
+            }
+
+            fn target_layouts(&self) -> &'static [&'static str] {
+                &["native"]
+            }
+
+            fn supports_quant(&self, _quant: QuantType) -> bool {
+                true
+            }
+
+            fn prefill_step(
+                &self,
+                ctx: &mut ExecutionContext<'_>,
+                _weights: &dyn ModelWeights,
+            ) -> Result<(), K3Error> {
+                self.prefill_cores
+                    .lock()
+                    .expect("lock prefill cores")
+                    .push(get_current_thread_core());
+                let n = ctx.prompt_tokens().len();
+                ctx.advance_position(n)?;
+                ctx.logits_mut().fill(0.0);
+                ctx.logits_mut()[1] = 1.0;
+                Ok(())
+            }
+
+            fn decode_step(
+                &self,
+                ctx: &mut ExecutionContext<'_>,
+                _weights: &dyn ModelWeights,
+            ) -> Result<(), K3Error> {
+                self.decode_cores
+                    .lock()
+                    .expect("lock decode cores")
+                    .push(get_current_thread_core());
+                ctx.advance_position(1)?;
+                ctx.logits_mut().fill(0.0);
+                ctx.logits_mut()[2] = 1.0;
+                Ok(())
+            }
+        }
+
+        let bytes = create_synthetic_gguf_v3(
+            "llama",
+            32,
+            &[("output_norm.weight", QuantType::F32, &[16][..])],
+        );
+        let gguf = GgufFile::parse(&bytes).expect("parse gguf");
+        let mut kv_arena = SingleSlotKvArena::new(gguf.metadata(), 32).expect("kv arena");
+
+        // 1. Always verify single-cluster X100Only execution on core 0
+        let x100_pool = WorkerPool::for_phase_policy(
+            ClusterPhasePolicy::X100Only,
+            gguf.metadata(),
+            4,
+            Some(0x0001),
+            Some(1),
+            CoordinationProfile::Rayon,
+        )
+        .expect("spawn X100Only pool");
+
+        let probe_single = PhaseProbeRecipe {
+            prefill_cores: Mutex::new(Vec::new()),
+            decode_cores: Mutex::new(Vec::new()),
+        };
+        let mut engine = SinglePromptEngine::new().with_phase_policy(ClusterPhasePolicy::X100Only);
+        assert_eq!(engine.phase_policy(), ClusterPhasePolicy::X100Only);
+
+        let summary = engine
+            .evaluate_prompt_with_pool(
+                &probe_single,
+                &gguf,
+                &mut kv_arena,
+                Some(&x100_pool),
+                &[1, 2, 3, 4],
+                8,
+                3,
+                |_| Ok(StreamAction::Continue),
+            )
+            .expect("evaluate prompt with X100Only pool");
+        assert_eq!(summary.generated_tokens, vec![1, 2, 2]);
+        assert_eq!(*probe_single.prefill_cores.lock().unwrap(), vec![Some(0)]);
+        assert_eq!(
+            *probe_single.decode_cores.lock().unwrap(),
+            vec![Some(0), Some(0)]
+        );
+
+        // 2. When dual-cluster pinning succeeds (16-core K3 or non-Linux), verify Prefill runs
+        // on X100 (0..8) and Decode runs on A100 (8..16).
+        let k3_topo = MockCpuTopology::spacemit_k3();
+        if let Ok(dual_pool) = WorkerPool::for_phase_policy_with(
+            ClusterPhasePolicy::X100PrefillA100Decode,
+            gguf.metadata(),
+            4,
+            None,
+            Some(4),
+            CoordinationProfile::Rayon,
+            &k3_topo,
+        ) {
+            let probe_dual = PhaseProbeRecipe {
+                prefill_cores: Mutex::new(Vec::new()),
+                decode_cores: Mutex::new(Vec::new()),
+            };
+            engine.set_phase_policy(ClusterPhasePolicy::Auto);
+            assert_eq!(engine.phase_policy(), ClusterPhasePolicy::Auto);
+
+            let dual_summary = engine
+                .evaluate_prompt_with_pool(
+                    &probe_dual,
+                    &gguf,
+                    &mut kv_arena,
+                    Some(&dual_pool),
+                    &[1, 2, 3, 4],
+                    8,
+                    3,
+                    |_| Ok(StreamAction::Continue),
+                )
+                .expect("evaluate prompt on dual pool");
+            assert_eq!(dual_summary.generated_tokens, vec![1, 2, 2]);
+
+            let prefill_cores = probe_dual.prefill_cores.lock().unwrap().clone();
+            let decode_cores = probe_dual.decode_cores.lock().unwrap().clone();
+            assert_eq!(prefill_cores.len(), 1);
+            assert_eq!(decode_cores.len(), 2);
+            assert!(
+                prefill_cores[0].is_some_and(|c| c < 8),
+                "Prefill must execute on X100 cluster (0..7), got {prefill_cores:?}"
+            );
+            assert!(
+                decode_cores
+                    .iter()
+                    .all(|c| c.is_some_and(|id| (8..16).contains(&id))),
+                "Decode must execute on A100 cluster (8..15), got {decode_cores:?}"
+            );
+        }
     }
 }

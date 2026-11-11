@@ -648,13 +648,13 @@ fn test_challenge_k3_diag_process_exit_10_on_unsupported_architecture() {
 #[test]
 fn test_challenge_k3_diag_process_exit_10_on_unsupported_quantization() {
     // Create synthetic GGUF v3 file with architecture "llama", but with a tensor
-    // of quantization Q4_0 (which LlamaRecipe explicitly does not support).
-    let shape = [32usize, 32usize];
-    let tensor_specs = [("blk.0.attn_q.weight", QuantType::Q4_0, shape.as_slice())];
+    // of quantization TQ1_0 (ternary format which LlamaRecipe explicitly does not support).
+    let shape = [256usize, 4usize];
+    let tensor_specs = [("blk.0.attn_q.weight", QuantType::TQ1_0, shape.as_slice())];
     let model_bytes = create_synthetic_gguf_v3("llama", 32, &tensor_specs);
-    let model_path = std::env::temp_dir().join("k3_adversarial_llama_q4_0.gguf");
-    let mut f = File::create(&model_path).expect("create llama q4_0 gguf");
-    f.write_all(&model_bytes).expect("write llama q4_0 gguf");
+    let model_path = std::env::temp_dir().join("k3_adversarial_llama_tq1_0.gguf");
+    let mut f = File::create(&model_path).expect("create llama tq1_0 gguf");
+    f.write_all(&model_bytes).expect("write llama tq1_0 gguf");
     drop(f);
 
     let output = Command::new(DIAG_BIN)
@@ -676,8 +676,8 @@ fn test_challenge_k3_diag_process_exit_10_on_unsupported_quantization() {
         "stderr must contain [capability_mismatch]: {stderr}"
     );
     assert!(
-        stderr.contains("Q4_0"),
-        "stderr must identify unsupported quantization format Q4_0: {stderr}"
+        stderr.contains("TQ1_0"),
+        "stderr must identify unsupported quantization format TQ1_0: {stderr}"
     );
 }
 
