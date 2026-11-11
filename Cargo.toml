@@ -36,15 +36,15 @@ arrow-array = "59.3.1"
 arrow-buffer = "59.3.1"
 fory = "1.7.7"
 fory-derive = "1.7.7"
-jero-arch-bitnet = { version = "0.1.0", git = "https://github.com/LMA1980/jero-arch-bitnet.git", branch = "feat/m8-naming-alignment", optional = true }
-jero-arch-dory = { version = "0.1.0", git = "https://github.com/LMA1980/jero-arch-dory.git", branch = "feat/m8-naming-alignment", optional = true }
-jero-arch-llama = { version = "0.1.0", git = "https://github.com/LMA1980/jero-arch-llama.git", branch = "feat/m8-naming-alignment", optional = true }
-jero-arch-mistral = { version = "0.1.0", git = "https://github.com/LMA1980/jero-arch-mistral.git", branch = "feat/m8-naming-alignment", optional = true }
-jero-arch-phi3 = { version = "0.1.0", git = "https://github.com/LMA1980/jero-arch-phi3.git", branch = "feat/m8-naming-alignment", optional = true }
-jero-arch-synthetic = { version = "0.1.0", git = "https://github.com/LMA1980/jero-arch-synthetic.git", branch = "feat/m8-naming-alignment", optional = true }
-jero-core = { version = "0.1.0", git = "https://github.com/LMA1980/jero-core.git", branch = "feat/m8-naming-alignment" }
-jero-kernels-rvv = { version = "0.1.0", git = "https://github.com/LMA1980/jero-kernels-rvv.git", branch = "feat/m8-naming-alignment", optional = true }
-jero-tokenizer = { version = "0.1.0", git = "https://github.com/LMA1980/jero-tokenizer.git", branch = "feat/m8-naming-alignment" }
+jero-arch-bitnet = { version = "0.1.0", git = "https://github.com/LMA1980/jero-arch-bitnet.git", branch = "main", optional = true }
+jero-arch-dory = { version = "0.1.0", git = "https://github.com/LMA1980/jero-arch-dory.git", branch = "main", optional = true }
+jero-arch-llama = { version = "0.1.0", git = "https://github.com/LMA1980/jero-arch-llama.git", branch = "main", optional = true }
+jero-arch-mistral = { version = "0.1.0", git = "https://github.com/LMA1980/jero-arch-mistral.git", branch = "main", optional = true }
+jero-arch-phi3 = { version = "0.1.0", git = "https://github.com/LMA1980/jero-arch-phi3.git", branch = "main", optional = true }
+jero-arch-synthetic = { version = "0.1.0", git = "https://github.com/LMA1980/jero-arch-synthetic.git", branch = "main", optional = true }
+jero-core = { version = "0.1.0", git = "https://github.com/LMA1980/jero-core.git", branch = "main" }
+jero-kernels-rvv = { version = "0.1.0", git = "https://github.com/LMA1980/jero-kernels-rvv.git", branch = "main", optional = true }
+jero-tokenizer = { version = "0.1.0", git = "https://github.com/LMA1980/jero-tokenizer.git", branch = "main" }
 libc = "0.2"
 rayon = "1.12"
 sendfd = "0.4.5"
