@@ -2163,6 +2163,21 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn test_worker_pool_on_a100() {
         let topo = SystemCpuTopology::new();
+        let online_mask = match topo.online_cpu_mask() {
+            Ok(mask) => mask,
+            Err(_) => return, // gracefully skip if unable to inspect topology
+        };
+
+        // Guard against non-K3 CI hosts (e.g. 4-core / 8-core x86_64 runners) where cores 8..15 (0xFF00)
+        // are not online. Only execute pool affinity when A100 cluster cores are present.
+        if (online_mask & A100_CLUSTER_MASK) == 0 {
+            eprintln!(
+                "Skipping test_worker_pool_on_a100: no online cores in A100 cluster mask 0x{:04X} (host online mask: 0x{:04X})",
+                A100_CLUSTER_MASK, online_mask
+            );
+            return;
+        }
+
         let a100 = resolve_affinity_with(Some("a100"), None, Some(1), &topo).unwrap();
         let pool = WorkerPool::new(a100).unwrap();
         let counter = Arc::new(AtomicUsize::new(0));
