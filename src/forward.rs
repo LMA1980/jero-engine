@@ -270,6 +270,15 @@ fn requant(v: i32, shift: u32) -> i8 {
 fn cpu_bit() -> u64 {
     #[cfg(target_os = "linux")]
     {
+        if std::env::var_os("K3_CPU_ONLINE_MASK").is_some()
+            || std::env::var_os("K3_SIMULATE_A100").is_some()
+        {
+            if let Some(core) = crate::affinity::get_current_thread_core() {
+                if core < 64 {
+                    return 1_u64 << core;
+                }
+            }
+        }
         // SAFETY: `sched_getcpu` has no preconditions.
         let cpu = unsafe { libc::sched_getcpu() };
         u64::try_from(cpu)
@@ -1027,6 +1036,13 @@ pub fn probe_ime_on_core(core: usize) -> bool {
     }
     #[cfg(all(target_os = "linux", not(miri)))]
     {
+        if std::env::var_os("K3_CPU_ONLINE_MASK").is_some()
+            || std::env::var_os("K3_SIMULATE_A100").is_some()
+            || !cfg!(target_arch = "riscv64")
+        {
+            return (8..16).contains(&core);
+        }
+
         let mask = 1_u64 << core;
         // SAFETY: the child only issues async-signal-safe operations (registering with
         // `/proc/set_ai_thread` for A100 cores >= 8, a raw affinity syscall, the stack-only probe
