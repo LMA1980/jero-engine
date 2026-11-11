@@ -1952,8 +1952,8 @@ unsafe fn raw_pin_thread(assigned_core: usize) -> Result<u64, i32> {
             (&raw const mask).cast::<libc::c_void>(),
         ) as i32;
         if set_ret < 0 {
-            let k3_mask = libc::getenv(b"K3_CPU_ONLINE_MASK\0".as_ptr().cast::<libc::c_char>());
-            let k3_sim = libc::getenv(b"K3_SIMULATE_A100\0".as_ptr().cast::<libc::c_char>());
+            let k3_mask = libc::getenv(c"K3_CPU_ONLINE_MASK".as_ptr());
+            let k3_sim = libc::getenv(c"K3_SIMULATE_A100".as_ptr());
             if !k3_mask.is_null() || !k3_sim.is_null() {
                 return Ok(1u64 << assigned_core);
             }
@@ -1968,8 +1968,8 @@ unsafe fn raw_pin_thread(assigned_core: usize) -> Result<u64, i32> {
             (&raw mut get_mask).cast::<libc::c_void>(),
         ) as i32;
         if get_ret < 0 {
-            let k3_mask = libc::getenv(b"K3_CPU_ONLINE_MASK\0".as_ptr().cast::<libc::c_char>());
-            let k3_sim = libc::getenv(b"K3_SIMULATE_A100\0".as_ptr().cast::<libc::c_char>());
+            let k3_mask = libc::getenv(c"K3_CPU_ONLINE_MASK".as_ptr());
+            let k3_sim = libc::getenv(c"K3_SIMULATE_A100".as_ptr());
             if !k3_mask.is_null() || !k3_sim.is_null() {
                 return Ok(1u64 << assigned_core);
             }
