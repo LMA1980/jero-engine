@@ -17,6 +17,8 @@
 
 mod bench;
 pub mod eval;
+pub mod parity;
+pub mod serve;
 
 use eval::EvalSuite;
 
@@ -108,6 +110,12 @@ pub struct DiagConfig {
     pub recurrent_loops: Option<u32>,
     /// Optional override for Dory recurrent KV cache mode (`"per_loop"` or `"last_loop"`).
     pub recurrent_kv_mode: Option<String>,
+    /// Ephemeral loopback OpenAI-compatible HTTP bind address (`<ip>:<port>`, e.g. `127.0.0.1:0`).
+    pub serve_openai: Option<String>,
+    /// Optional request count ceiling after which `--serve-openai` exits cleanly.
+    pub max_requests: Option<usize>,
+    /// Path to export deterministic differential parity report JSON (`--dump-parity <path>`).
+    pub dump_parity: Option<String>,
 }
 
 impl Default for DiagConfig {
@@ -134,6 +142,9 @@ impl Default for DiagConfig {
             export_eval: None,
             recurrent_loops: None,
             recurrent_kv_mode: None,
+            serve_openai: None,
+            max_requests: None,
+            dump_parity: None,
         }
     }
 }
@@ -368,6 +379,38 @@ impl DiagConfig {
                     }
                     config.recurrent_kv_mode = Some(mode);
                 }
+                "--serve-openai" => {
+                    let addr = args.next().ok_or_else(|| {
+                        "--serve-openai requires a bind address (e.g. 127.0.0.1:0)".to_owned()
+                    })?;
+                    if addr.trim().is_empty() {
+                        return Err("--serve-openai requires a non-empty bind address".to_owned());
+                    }
+                    config.serve_openai = Some(addr);
+                }
+                "--max-requests" => {
+                    let val = args.next().ok_or_else(|| {
+                        "--max-requests requires a positive integer count".to_owned()
+                    })?;
+                    let n = val
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid --max-requests '{val}'"))?;
+                    if n == 0 {
+                        return Err("--max-requests must be at least 1".to_owned());
+                    }
+                    config.max_requests = Some(n);
+                }
+                "--dump-parity" => {
+                    let path = args.next().ok_or_else(|| {
+                        "--dump-parity requires an output JSON file path".to_owned()
+                    })?;
+                    if path.trim().is_empty() {
+                        return Err(
+                            "--dump-parity requires a non-empty output file path".to_owned()
+                        );
+                    }
+                    config.dump_parity = Some(path);
+                }
                 unknown => {
                     return Err(format!("unknown option '{unknown}'"));
                 }
@@ -531,6 +574,9 @@ fn print_usage() {
                --repeat <n>       Repeat benchmark iterations (N >= 3) for jitter measurement\n  \
                --json             Emit structured machine-readable JSON report\n  \
                --export-profile <path> Export structured CostProfile JSON to file\n  \
+               --dump-parity <path> Export top-k prefill logits & greedy token parity JSON\n  \
+               --serve-openai <addr> Serve ephemeral OpenAI-compatible HTTP API (e.g. 127.0.0.1:0)\n  \
+               --max-requests <n> Exit --serve-openai cleanly after handling N HTTP requests\n  \
                --summary          Emit human-readable summary table\n  \
            -h, --help             Show this help message\n  \
            -v, --version          Show version information"
@@ -947,11 +993,17 @@ pub fn run_single_eval_session<W: Write>(config: &DiagConfig, mut out: W) -> Res
     Ok(())
 }
 
-/// Executes diagnostic session dispatcher: routes to open-source capability benchmark if
-/// `--eval-suite` is specified, matrix-forward benchmark, multi-run benchmark if `--repeat` is
-/// specified, or single-eval streaming pipeline.
+/// Executes diagnostic session dispatcher: routes to differential parity exporter if
+/// `--dump-parity` is specified, ephemeral OpenAI HTTP server if `--serve-openai` is specified,
+/// open-source capability benchmark if `--eval-suite` is specified, matrix-forward benchmark,
+/// multi-run benchmark if `--repeat` is specified, or single-eval streaming pipeline.
 pub fn run_diagnostic_session<W: Write>(config: &DiagConfig, out: W) -> Result<(), K3Error> {
-    if config.is_eval_benchmark() {
+    if config.dump_parity.is_some() {
+        let _ = parity::run_parity_dump(config, out)?;
+        Ok(())
+    } else if config.serve_openai.is_some() {
+        serve::run_ephemeral_openai_server(config, out)
+    } else if config.is_eval_benchmark() {
         eval::run_public_eval_benchmark(config, out)
     } else if config.is_matrix_benchmark() {
         bench::run_matrix_benchmark(config, out)
@@ -1167,6 +1219,9 @@ mod tests {
             export_eval: None,
             recurrent_loops: None,
             recurrent_kv_mode: None,
+            serve_openai: None,
+            max_requests: None,
+            dump_parity: None,
         };
 
         let mut output_buf = Vec::new();
@@ -1214,6 +1269,9 @@ mod tests {
             export_eval: None,
             recurrent_loops: None,
             recurrent_kv_mode: None,
+            serve_openai: None,
+            max_requests: None,
+            dump_parity: None,
         };
 
         let mut output_buf = Vec::new();
@@ -1262,5 +1320,40 @@ mod tests {
             "invalid".to_owned(),
         ];
         assert!(DiagConfig::parse_args(bad_mode.into_iter()).is_err());
+    }
+
+    #[test]
+    fn test_parse_certification_cli_flags() {
+        let args = vec![
+            "k3-diag".to_owned(),
+            "--model".to_owned(),
+            "llama.gguf".to_owned(),
+            "--serve-openai".to_owned(),
+            "127.0.0.1:0".to_owned(),
+            "--max-requests".to_owned(),
+            "5".to_owned(),
+            "--dump-parity".to_owned(),
+            "/tmp/parity.json".to_owned(),
+        ];
+        let cfg = DiagConfig::parse_args(args.into_iter())
+            .expect("valid certification flags")
+            .expect("some config");
+        assert_eq!(cfg.serve_openai.as_deref(), Some("127.0.0.1:0"));
+        assert_eq!(cfg.max_requests, Some(5));
+        assert_eq!(cfg.dump_parity.as_deref(), Some("/tmp/parity.json"));
+
+        let zero_req = vec![
+            "k3-diag".to_owned(),
+            "--max-requests".to_owned(),
+            "0".to_owned(),
+        ];
+        assert!(DiagConfig::parse_args(zero_req.into_iter()).is_err());
+
+        let empty_dump = vec![
+            "k3-diag".to_owned(),
+            "--dump-parity".to_owned(),
+            "   ".to_owned(),
+        ];
+        assert!(DiagConfig::parse_args(empty_dump.into_iter()).is_err());
     }
 }

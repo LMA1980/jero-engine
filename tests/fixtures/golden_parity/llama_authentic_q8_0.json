@@ -1,0 +1,85 @@
+{
+  "schema_version": "1.0.0",
+  "architecture": "llama",
+  "quantization_format": "Q8_0",
+  "prompt": "hello world",
+  "prompt_token_ids": [
+    1,
+    9,
+    8,
+    10
+  ],
+  "first_token_top_k": [
+    {
+      "token_id": 14,
+      "logit": 7.0473447
+    },
+    {
+      "token_id": 11,
+      "logit": 6.904398
+    },
+    {
+      "token_id": 9,
+      "logit": 4.5502853
+    },
+    {
+      "token_id": 5,
+      "logit": 2.7465675
+    },
+    {
+      "token_id": 6,
+      "logit": 2.5474648
+    },
+    {
+      "token_id": 10,
+      "logit": 0.23982882
+    },
+    {
+      "token_id": 0,
+      "logit": 0.0
+    },
+    {
+      "token_id": 1,
+      "logit": 0.0
+    },
+    {
+      "token_id": 2,
+      "logit": 0.0
+    },
+    {
+      "token_id": 3,
+      "logit": 0.0
+    },
+    {
+      "token_id": 4,
+      "logit": 0.0
+    },
+    {
+      "token_id": 12,
+      "logit": -1.6649446
+    },
+    {
+      "token_id": 13,
+      "logit": -2.2827811
+    },
+    {
+      "token_id": 8,
+      "logit": -3.3236043
+    },
+    {
+      "token_id": 7,
+      "logit": -3.6769462
+    },
+    {
+      "token_id": 15,
+      "logit": -5.345659
+    }
+  ],
+  "greedy_token_ids": [
+    14,
+    14,
+    14,
+    14
+  ],
+  "generated_text": "SpacemiTSpacemiTSpacemiTSpacemiT"
+}

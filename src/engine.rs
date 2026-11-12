@@ -422,7 +422,10 @@ impl SinglePromptEngine {
     }
 }
 
-fn infer_logits_buffer_len(weights: &dyn ModelWeights, vocab_size: usize) -> usize {
+/// Computes the safe logit scratch buffer length for `weights` and `vocab_size`,
+/// accounting for 64-element GGUF row-alignment padding on `output.weight`.
+#[must_use]
+pub fn infer_logits_buffer_len(weights: &dyn ModelWeights, vocab_size: usize) -> usize {
     if weights.contains_tensor("output.weight")
         && let Ok(view) = weights.tensor("output.weight")
         && view.shape().len() == 2

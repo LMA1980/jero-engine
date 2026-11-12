@@ -6,6 +6,7 @@
 
 pub mod affinity;
 pub mod capability;
+pub mod certification;
 pub mod engine;
 #[cfg(feature = "jero-kernels-rvv")]
 pub mod forward;
@@ -27,9 +28,15 @@ pub use affinity::{
 pub use capability::{
     GgufHyperparams, RecipeRegistry, verify_metadata_capabilities, verify_model_capabilities,
 };
+pub use certification::{
+    DEFAULT_PARITY_TOP_K, ParityDumpReport, TopKLogitEntry, cosine_similarity_f64,
+    encode_text_utf8_safe, evaluate_parity_snapshot, extract_top_k_logits, logit_sample_stddev,
+    tokenize_prompt_utf8_safe, verify_intrinsic_parity, verify_parity_against_golden,
+    verify_prompt_sensitivity,
+};
 pub use engine::{
     EnginePhase, EvaluationSummary, PassTiming, SinglePromptEngine, StreamAction,
-    sample_greedy_argmax,
+    infer_logits_buffer_len, sample_greedy_argmax,
 };
 pub use jero_core as k3_core;
 pub use jero_core::{
