@@ -436,6 +436,13 @@ fn oss_harness_name_for_suite(suite: &str) -> &'static str {
 }
 
 /// Evaluates whether a generated response passes the item's open-source benchmark scoring criterion.
+///
+/// Enforces strict per-pillar answer verification with zero tautological substring fallbacks:
+/// - `exact_choice`: option token boundary match (e.g., `D`, `(D)`, `Answer: D`).
+/// - `numerical_extract`: extracted terminal number (preferring `#### <num>`) matches `expected_answer`.
+/// - `pass_at_1_syntax`: whitespace-normalized code expression contains normalized `expected_answer`.
+/// - `verifiable_constraint`: deterministic format constraint verification.
+/// - `truthful_mc2`: case-insensitive word-bounded match on `expected_answer`.
 #[must_use]
 pub fn score_generated_output(
     item: &EvalDatasetItem,
@@ -450,40 +457,172 @@ pub fn score_generated_output(
     if clean.is_empty() {
         return false;
     }
+    let expected = item.expected_answer.trim();
+    if expected.is_empty() {
+        return false;
+    }
+
     match item.scoring_method.as_str() {
-        "verifiable_constraint" => match item.expected_answer.as_str() {
+        "verifiable_constraint" => match expected {
             "no_punctuation_nonempty" => {
-                !clean.contains('.') && !clean.contains('!') && !clean.contains('?')
+                !clean.contains('.')
+                    && !clean.contains('!')
+                    && !clean.contains('?')
+                    && !clean.contains(',')
+                    && !clean.contains(';')
             }
-            "single_line_min_len_4" => !clean.contains('\n') && clean.len() >= 4,
-            expected => clean.contains(expected),
+            "single_line_min_len_4" => {
+                !clean.contains('\n') && !clean.contains('\r') && clean.len() >= 4
+            }
+            constraint => clean.contains(constraint),
         },
-        "exact_choice" | "numerical_extract" | "pass_at_1_syntax" | "truthful_mc2" => {
-            if clean
-                .to_ascii_lowercase()
-                .contains(&item.expected_answer.to_ascii_lowercase())
-            {
-                true
-            } else {
-                // For synthetic or miniature test vocabularies (`helloworldExplainRVV`),
-                // verify non-empty deterministic token emission and valid vocabulary bounds.
-                clean.contains("RVV") || clean.contains("Explain") || clean.contains("hello")
-            }
+        "exact_choice" => matches_option_choice(clean, expected),
+        "numerical_extract" => matches_extracted_number(clean, expected),
+        "pass_at_1_syntax" => {
+            let norm_out = normalize_code_tokens(clean);
+            let norm_exp = normalize_code_tokens(expected);
+            !norm_exp.is_empty() && norm_out.contains(&norm_exp)
         }
-        _ => !clean.is_empty(),
+        "truthful_mc2" => contains_word_bounded_ci(clean, expected),
+        _ => false,
     }
 }
 
-/// Computes the expected quantization fidelity score for a given architecture, quantization format,
-/// and raw pass rate so real models and synthetic fixtures both report realistic, calibrated deltas.
-fn calibrated_suite_score(
+fn matches_option_choice(output: &str, expected_letter: &str) -> bool {
+    let exp_upper = expected_letter.trim().to_ascii_uppercase();
+    if exp_upper.len() != 1 || !exp_upper.chars().all(|c| c.is_ascii_alphabetic()) {
+        return contains_word_bounded_ci(output, expected_letter);
+    }
+    let target_ch = exp_upper.chars().next().unwrap_or('\0');
+
+    // Explicit parenthesized choice `(D)` or `[D]`
+    if output.contains(&format!("({target_ch})")) || output.contains(&format!("[{target_ch}]")) {
+        return true;
+    }
+
+    // Word-bounded standalone uppercase option token (avoids matching lowercase 'd' inside "world")
+    let bytes = output.as_bytes();
+    for (idx, &b) in bytes.iter().enumerate() {
+        if char::from(b) == target_ch {
+            let prev_alnum = idx > 0 && bytes[idx - 1].is_ascii_alphanumeric();
+            let next_alnum = idx + 1 < bytes.len() && bytes[idx + 1].is_ascii_alphanumeric();
+            if !prev_alnum && !next_alnum {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn matches_extracted_number(output: &str, expected_num: &str) -> bool {
+    let target_region = output.rsplit_once("####").map_or(output, |(_, tail)| tail);
+    let numbers = extract_numeric_literals(target_region);
+    let Some(last_num) = numbers.last() else {
+        return false;
+    };
+    let clean_exp = expected_num.replace(',', "");
+    if last_num == &clean_exp {
+        return true;
+    }
+    if let (Ok(actual_f), Ok(exp_f)) = (last_num.parse::<f64>(), clean_exp.parse::<f64>()) {
+        (actual_f - exp_f).abs() <= 1.0e-6
+    } else {
+        false
+    }
+}
+
+fn extract_numeric_literals(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0_usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        let neg_start = ch == '-'
+            && i + 1 < chars.len()
+            && chars[i + 1].is_ascii_digit()
+            && (i == 0 || !chars[i - 1].is_ascii_alphanumeric());
+        if ch.is_ascii_digit() || neg_start {
+            let mut literal = String::new();
+            if neg_start {
+                literal.push('-');
+                i += 1;
+            }
+            let mut seen_dot = false;
+            while i < chars.len() {
+                let c = chars[i];
+                if c.is_ascii_digit() {
+                    literal.push(c);
+                    i += 1;
+                } else if c == ',' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+                    i += 1;
+                } else if c == '.'
+                    && !seen_dot
+                    && i + 1 < chars.len()
+                    && chars[i + 1].is_ascii_digit()
+                {
+                    seen_dot = true;
+                    literal.push('.');
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            found.push(literal);
+        } else {
+            i += 1;
+        }
+    }
+    found
+}
+
+fn normalize_code_tokens(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    for ch in code.chars() {
+        if !ch.is_whitespace() {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn contains_word_bounded_ci(haystack: &str, needle: &str) -> bool {
+    let h_lower = haystack.to_ascii_lowercase();
+    let n_lower = needle.trim().to_ascii_lowercase();
+    if n_lower.is_empty() || h_lower.len() < n_lower.len() {
+        return false;
+    }
+    let h_bytes = h_lower.as_bytes();
+    let mut search_from = 0_usize;
+    while let Some(rel) = h_lower[search_from..].find(&n_lower) {
+        let start = search_from + rel;
+        let end = start + n_lower.len();
+        let prev_word =
+            start > 0 && (h_bytes[start - 1].is_ascii_alphanumeric() || h_bytes[start - 1] == b'_');
+        let next_word =
+            end < h_bytes.len() && (h_bytes[end].is_ascii_alphanumeric() || h_bytes[end] == b'_');
+        if !prev_word && !next_word {
+            return true;
+        }
+        search_from = start + 1;
+    }
+    false
+}
+
+/// Computes the quantization-calibrated suite score for a given architecture, quantization format,
+/// and raw pass ratio (`0.0..=1.0`) without artificial floor clamping (`0/N` yields `0.0`).
+#[must_use]
+pub fn calibrated_suite_score(
     arch: &str,
     quant_str: &str,
     fp16_baseline: f64,
     raw_pass_ratio: f64,
 ) -> f64 {
+    let clamped_ratio = raw_pass_ratio.clamp(0.0, 1.0);
+    if clamped_ratio <= 0.0 {
+        return 0.0;
+    }
     if arch == "synthetic" {
-        return raw_pass_ratio * 100.0;
+        return clamped_ratio * 100.0;
     }
     let quant_retention = match quant_str {
         "F32" | "F16" | "BF16" => 1.000,
@@ -494,7 +633,7 @@ fn calibrated_suite_score(
         "TQ1_0" => 0.968,
         _ => 0.985,
     };
-    (fp16_baseline * quant_retention * raw_pass_ratio.max(0.95)).min(100.0)
+    (fp16_baseline * quant_retention * clamped_ratio).min(100.0)
 }
 
 /// Executes the in-process public open-source benchmark suite (`--eval-suite`).
@@ -639,6 +778,10 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
         BTreeMap::new();
     let mut all_ttft_ms = Vec::with_capacity(filtered_items.len());
     let mut all_decode_tps = Vec::with_capacity(filtered_items.len());
+    let mut total_eval_prompt_tokens: usize = 0;
+    let mut total_eval_prefill_ms: f64 = 0.0;
+    let mut total_eval_decode_steps: usize = 0;
+    let mut total_eval_decode_ms: f64 = 0.0;
     let mut total_determinism_checks: u32 = 0;
     let mut passed_determinism_checks: u32 = 0;
 
@@ -707,6 +850,10 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
             score_generated_output(item, &text_out, &summary_1.generated_tokens, determinism_ok);
         all_ttft_ms.push(summary_1.timing.ttft_ms);
         all_decode_tps.push(summary_1.timing.decode_tokens_per_sec);
+        total_eval_prompt_tokens += summary_1.prompt_tokens;
+        total_eval_prefill_ms += summary_1.timing.prefill_ms;
+        total_eval_decode_steps += summary_1.timing.decode_steps;
+        total_eval_decode_ms += summary_1.timing.decode_ms;
 
         suite_items_map
             .entry(item.suite.clone())
@@ -721,7 +868,8 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
 
     worker_pool.verify_live_affinities()?;
 
-    // 5. Measure hardware ceilings & RVV vs IME numerical equivalence on ForwardModel
+    // 5. Compute runtime efficiency from actual SinglePromptEngine GGUF timings (#148),
+    // falling back to ForwardModel only for the synthetic test recipe or explicit IME equivalence check.
     let kernel = if ime_requested {
         MatKernel::Ime
     } else {
@@ -736,19 +884,42 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
     };
     let plan = PlacementPlan::single(lane);
 
-    let seed = locked_weights
-        .as_bytes()
-        .iter()
-        .take(1 << 20)
-        .fold(0xCBF2_9CE4_8422_2325_u64, |h, &b| {
-            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
-        });
-    let fwd_model = ForwardModel::new(seed, tokenizer.vocab_size());
+    let peak_macs = measure_peak_macs(&worker_pool, lane, kernel)?.max(1.0);
+    let mem_bw = measure_memory_bandwidth(&worker_pool, lane)?.max(1.0);
 
-    let sample_tokens = [1_u32, 2, 3, 4];
-    let fwd_rvv = fwd_model.evaluate(&worker_pool, MatKernel::Vector, &plan, &sample_tokens, 4)?;
-    let (fwd_active, ime_speedup_prefill_pct, ime_speedup_decode_pct, ime_vs_rvv_identical) =
-        if ime_requested {
+    let mean_ttft_ms = if all_ttft_ms.is_empty() {
+        0.0
+    } else {
+        all_ttft_ms.iter().sum::<f64>() / (all_ttft_ms.len() as f64)
+    };
+    let mean_decode_tps = if total_eval_decode_steps > 0 && total_eval_decode_ms > 0.0 {
+        (total_eval_decode_steps as f64) / (total_eval_decode_ms / 1000.0)
+    } else if all_decode_tps.is_empty() {
+        0.0
+    } else {
+        all_decode_tps.iter().sum::<f64>() / (all_decode_tps.len() as f64)
+    };
+
+    let (
+        prefill_tps,
+        prefill_ceiling_pct,
+        decode_ceiling_pct,
+        ime_speedup_prefill_pct,
+        ime_speedup_decode_pct,
+        ime_vs_rvv_identical,
+    ) = if arch_name == "synthetic" || ime_requested {
+        let seed = locked_weights
+            .as_bytes()
+            .iter()
+            .take(1 << 20)
+            .fold(0xCBF2_9CE4_8422_2325_u64, |h, &b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
+            });
+        let fwd_model = ForwardModel::new(seed, tokenizer.vocab_size());
+        let sample_tokens = [1_u32, 2, 3, 4];
+        let fwd_rvv =
+            fwd_model.evaluate(&worker_pool, MatKernel::Vector, &plan, &sample_tokens, 4)?;
+        let (fwd_active, p_delta, d_delta, identical) = if ime_requested {
             let fwd_ime =
                 fwd_model.evaluate(&worker_pool, MatKernel::Ime, &plan, &sample_tokens, 4)?;
             let rvv_p_tps =
@@ -757,41 +928,77 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
                 (sample_tokens.len() as f64) / (fwd_ime.timing.prefill_ms / 1000.0).max(1e-9);
             let rvv_d_tps = fwd_rvv.timing.decode_tokens_per_sec;
             let ime_d_tps = fwd_ime.timing.decode_tokens_per_sec;
-            let p_delta_pct = if rvv_p_tps > 0.0 {
+            let p_pct = if rvv_p_tps > 0.0 {
                 ((ime_p_tps - rvv_p_tps) / rvv_p_tps) * 100.0
             } else {
                 0.0
             };
-            let d_delta_pct = if rvv_d_tps > 0.0 {
+            let d_pct = if rvv_d_tps > 0.0 {
                 ((ime_d_tps - rvv_d_tps) / rvv_d_tps) * 100.0
             } else {
                 0.0
             };
-            let identical = fwd_ime.generated_tokens == fwd_rvv.generated_tokens;
-            (fwd_ime, p_delta_pct, d_delta_pct, identical)
+            let eq = fwd_ime.generated_tokens == fwd_rvv.generated_tokens;
+            (fwd_ime, p_pct, d_pct, eq)
         } else {
             (fwd_rvv, 0.0, 0.0, true)
         };
 
-    let peak_macs = measure_peak_macs(&worker_pool, lane, kernel)?.max(1.0);
-    let mem_bw = measure_memory_bandwidth(&worker_pool, lane)?.max(1.0);
-    let prefill_sec = (fwd_active.timing.prefill_ms / 1000.0).max(1e-9);
-    let prefill_tps = (sample_tokens.len() as f64) / prefill_sec;
-    let achieved_macs = (fwd_active.prefill_macs as f64) / prefill_sec;
-    let achieved_bw =
-        (fwd_active.decode_weight_bytes_per_token as f64) * fwd_active.timing.decode_tokens_per_sec;
-    let prefill_ceiling_pct = ((achieved_macs / peak_macs) * 100.0).clamp(0.0, 100.0);
-    let decode_ceiling_pct = ((achieved_bw / mem_bw) * 100.0).clamp(0.0, 100.0);
-
-    let mean_ttft_ms = if all_ttft_ms.is_empty() {
-        0.0
+        if arch_name == "synthetic" {
+            let prefill_sec = (fwd_active.timing.prefill_ms / 1000.0).max(1e-9);
+            let p_tps = (sample_tokens.len() as f64) / prefill_sec;
+            let achieved_macs = (fwd_active.prefill_macs as f64) / prefill_sec;
+            let achieved_bw = (fwd_active.decode_weight_bytes_per_token as f64)
+                * fwd_active.timing.decode_tokens_per_sec;
+            (
+                p_tps,
+                ((achieved_macs / peak_macs) * 100.0).clamp(0.0, 100.0),
+                ((achieved_bw / mem_bw) * 100.0).clamp(0.0, 100.0),
+                p_delta,
+                d_delta,
+                identical,
+            )
+        } else {
+            let prefill_sec = (total_eval_prefill_ms / 1000.0).max(1e-9);
+            let real_p_tps = (total_eval_prompt_tokens as f64) / prefill_sec;
+            let total_weight_elems: u64 = locked_weights
+                .metadata()
+                .tensors()
+                .iter()
+                .map(|t| u64::try_from(t.num_elements()).unwrap_or(0))
+                .sum();
+            let est_macs =
+                (total_weight_elems as f64) * (total_eval_prompt_tokens as f64) / prefill_sec;
+            let est_bw = (footprint.weight_bytes as f64) * mean_decode_tps;
+            (
+                real_p_tps,
+                ((est_macs / peak_macs) * 100.0).clamp(0.0, 100.0),
+                ((est_bw / mem_bw) * 100.0).clamp(0.0, 100.0),
+                p_delta,
+                d_delta,
+                identical,
+            )
+        }
     } else {
-        all_ttft_ms.iter().sum::<f64>() / (all_ttft_ms.len() as f64)
-    };
-    let mean_decode_tps = if all_decode_tps.is_empty() {
-        0.0
-    } else {
-        all_decode_tps.iter().sum::<f64>() / (all_decode_tps.len() as f64)
+        let prefill_sec = (total_eval_prefill_ms / 1000.0).max(1e-9);
+        let real_p_tps = (total_eval_prompt_tokens as f64) / prefill_sec;
+        let total_weight_elems: u64 = locked_weights
+            .metadata()
+            .tensors()
+            .iter()
+            .map(|t| u64::try_from(t.num_elements()).unwrap_or(0))
+            .sum();
+        let est_macs =
+            (total_weight_elems as f64) * (total_eval_prompt_tokens as f64) / prefill_sec;
+        let est_bw = (footprint.weight_bytes as f64) * mean_decode_tps;
+        (
+            real_p_tps,
+            ((est_macs / peak_macs) * 100.0).clamp(0.0, 100.0),
+            ((est_bw / mem_bw) * 100.0).clamp(0.0, 100.0),
+            0.0,
+            0.0,
+            true,
+        )
     };
 
     // 6. Build Category Scorecards & MuObserve Records
@@ -1039,4 +1246,79 @@ fn write_human_scorecard<W: Write>(out: &mut W, report: &PublicBenchmarkReport) 
         out,
         "================================================================================"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_item(suite: &str, expected: &str, method: &str) -> EvalDatasetItem {
+        EvalDatasetItem {
+            id: format!("{suite}_test"),
+            suite: suite.to_owned(),
+            category: suite.to_owned(),
+            prompt: "test prompt".to_owned(),
+            expected_answer: expected.to_owned(),
+            scoring_method: method.to_owned(),
+            source_license: "MIT".to_owned(),
+            contamination_status: "verified_clean".to_owned(),
+        }
+    }
+
+    #[test]
+    fn score_generated_output_rejects_gibberish_and_echoed_tokens_across_pillars() {
+        let tokens = [9_u32, 10, 11, 12];
+        let gibberish = "helloworldExplainRVV";
+
+        let mmlu = make_item("mmlu_pro", "D", "exact_choice");
+        assert!(!score_generated_output(&mmlu, gibberish, &tokens, true));
+        assert!(!score_generated_output(&mmlu, "Answer: A", &tokens, true));
+        assert!(score_generated_output(&mmlu, "Answer: (D)", &tokens, true));
+        assert!(score_generated_output(&mmlu, "D", &tokens, true));
+
+        let gsm = make_item("gsm8k", "256", "numerical_extract");
+        assert!(!score_generated_output(&gsm, gibberish, &tokens, true));
+        assert!(!score_generated_output(&gsm, "2560", &tokens, true));
+        assert!(score_generated_output(
+            &gsm,
+            "8 * 16 = 128, 128 * 2 = #### 256",
+            &tokens,
+            true
+        ));
+
+        let heval = make_item("humaneval", "return n % 2 == 0", "pass_at_1_syntax");
+        assert!(!score_generated_output(&heval, gibberish, &tokens, true));
+        assert!(score_generated_output(
+            &heval,
+            "    return n%2==0\n",
+            &tokens,
+            true
+        ));
+
+        let tqa = make_item("truthfulqa", "No", "truthful_mc2");
+        assert!(!score_generated_output(&tqa, gibberish, &tokens, true));
+        assert!(!score_generated_output(
+            &tqa,
+            "notable behavior",
+            &tokens,
+            true
+        ));
+        assert!(score_generated_output(
+            &tqa,
+            "No, unlimited memlock can lock up the kernel.",
+            &tokens,
+            true
+        ));
+    }
+
+    #[test]
+    fn calibrated_suite_score_never_inflates_zero_pass_rate() {
+        assert_eq!(calibrated_suite_score("llama", "Q4_K_M", 84.5, 0.0), 0.0);
+        assert_eq!(calibrated_suite_score("mistral", "Q8_0", 71.2, 0.0), 0.0);
+        assert_eq!(calibrated_suite_score("phi3", "Q4_0", 76.8, 0.0), 0.0);
+        assert_eq!(calibrated_suite_score("bitnet", "TQ2_0", 64.2, 0.0), 0.0);
+
+        let half = calibrated_suite_score("llama", "F16", 80.0, 0.5);
+        assert!((half - 40.0).abs() < 1.0e-9);
+    }
 }

@@ -355,7 +355,7 @@ checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 [[package]]
 name = "jero-arch-bitnet"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-bitnet.git?branch=main#c12cff8ae920feb9e30babeb85eaa8ca124e2acf"
+source = "git+https://github.com/LMA1980/jero-arch-bitnet.git?branch=main#210fa134962c5436ce0573d37a75469366749281"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
@@ -364,7 +364,7 @@ dependencies = [
 [[package]]
 name = "jero-arch-dory"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-dory.git?branch=main#0927251782f2a322040056e7bbba211b521cfdaa"
+source = "git+https://github.com/LMA1980/jero-arch-dory.git?branch=main#5d2c82573642fa23ed3a16a4c0386ae5008688fe"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
@@ -373,16 +373,17 @@ dependencies = [
 [[package]]
 name = "jero-arch-llama"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-llama.git?branch=main#75662219a68c39fc7d03caf0eca380738e1a687b"
+source = "git+https://github.com/LMA1980/jero-arch-llama.git?branch=main#24cad942ac9470cc62cfb95dd165119ba4c493d0"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
+ "rayon",
 ]
 
 [[package]]
 name = "jero-arch-mistral"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-mistral.git?branch=main#a540569640ba69c508641a34ebca7439bad762fa"
+source = "git+https://github.com/LMA1980/jero-arch-mistral.git?branch=main#2b1235765bc1daf3cfa736eb6bd22b3b1562ee9d"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
@@ -391,7 +392,7 @@ dependencies = [
 [[package]]
 name = "jero-arch-phi3"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-phi3.git?branch=main#55e592de31feb62b89aa971ae9c6037f28cc4fd9"
+source = "git+https://github.com/LMA1980/jero-arch-phi3.git?branch=main#581360a1c50c71abdd8e5014754024251cde3f7d"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
@@ -400,7 +401,7 @@ dependencies = [
 [[package]]
 name = "jero-arch-synthetic"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-synthetic.git?branch=main#484cc737699a1d9f2ffc23c50dd6d6211e505a53"
+source = "git+https://github.com/LMA1980/jero-arch-synthetic.git?branch=main#cb2175a11fe9dc118d941ae6401053d2798fa477"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
@@ -409,7 +410,7 @@ dependencies = [
 [[package]]
 name = "jero-core"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-core.git?branch=main#04e5696e0d32e7cf46bbe183353b27bd5ea51ab6"
+source = "git+https://github.com/LMA1980/jero-core.git?branch=main#fc98e1f1c4bcffe6cd4f280febaa79c9213bfddb"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -451,7 +452,7 @@ dependencies = [
 [[package]]
 name = "jero-kernels-rvv"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-kernels-rvv.git?branch=main#902beb640665fe1e9fb985e4b1e26b2bc72b7e98"
+source = "git+https://github.com/LMA1980/jero-kernels-rvv.git?branch=main#095e6170817d2f9f68ad0a89585322509269eb4e"
 dependencies = [
  "jero-core",
 ]
@@ -459,7 +460,7 @@ dependencies = [
 [[package]]
 name = "jero-tokenizer"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-tokenizer.git?branch=main#c3fa40f4d782b9e39eb0427d623861c9ce6e9c18"
+source = "git+https://github.com/LMA1980/jero-tokenizer.git?branch=main#284bf7bceed7ce654725120162a6b0bef772ba8f"
 dependencies = [
  "jero-core",
 ]
