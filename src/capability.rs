@@ -375,6 +375,18 @@ impl RecipeRegistry {
             return Some(&DORY);
         }
 
+        #[cfg(feature = "jero-arch-gemma")]
+        if architecture == "gemma2" {
+            static GEMMA2: crate::gemma::GemmaRecipe = crate::gemma::GemmaRecipe::new_gemma2();
+            return Some(&GEMMA2);
+        } else if architecture == "gemma3" {
+            static GEMMA3: crate::gemma::GemmaRecipe = crate::gemma::GemmaRecipe::new_gemma3();
+            return Some(&GEMMA3);
+        } else if architecture == "gemma4" {
+            static GEMMA4: crate::gemma::Gemma4Recipe = crate::gemma::Gemma4Recipe::new();
+            return Some(&GEMMA4);
+        }
+
         let _ = architecture;
         None
     }
@@ -409,6 +421,12 @@ impl RecipeRegistry {
             "bitnet-25",
             #[cfg(feature = "jero-arch-dory")]
             "dory",
+            #[cfg(feature = "jero-arch-gemma")]
+            "gemma2",
+            #[cfg(feature = "jero-arch-gemma")]
+            "gemma3",
+            #[cfg(feature = "jero-arch-gemma")]
+            "gemma4",
         ];
         ARCHS
     }
@@ -668,6 +686,115 @@ impl RecipeRegistry {
             return Some(Box::new(recipe));
         }
 
+        #[cfg(feature = "jero-arch-gemma")]
+        if arch == "gemma2" || arch == "gemma3" {
+            let mut recipe = if arch == "gemma2" {
+                crate::gemma::GemmaRecipe::new_gemma2()
+            } else {
+                crate::gemma::GemmaRecipe::new_gemma3()
+            };
+            if params.block_count > 0 {
+                recipe.num_layers = params.block_count;
+            }
+            if params.embedding_length > 0 {
+                recipe.hidden_dim = params.embedding_length;
+            }
+            if params.feed_forward_length > 0 {
+                recipe.ffn_dim = params.feed_forward_length;
+            }
+            if params.head_count > 0 {
+                recipe.n_heads_q = params.head_count;
+            }
+            if params.head_count_kv > 0 {
+                recipe.n_heads_kv = params.head_count_kv;
+            }
+            if let Some(kl) = params.explicit_key_length
+                && kl > 0
+            {
+                recipe.head_dim = kl;
+            } else if params.key_length > 0 && params.head_count > 0 {
+                recipe.head_dim = params.key_length;
+            }
+            if params.vocab_size > 0 {
+                recipe.vocab_size = params.vocab_size;
+            }
+            if let Some(eps) = params.rms_norm_eps {
+                recipe.rms_eps = eps;
+            }
+            if let Some(freq) = params.rope_freq_base {
+                recipe.rope_freq_base_global = freq;
+                if arch == "gemma2" {
+                    recipe.rope_freq_base_local = freq;
+                }
+            }
+            if let Some(sw) = params.sliding_window
+                && sw > 0
+            {
+                recipe.sliding_window = sw;
+            }
+            return Some(Box::new(recipe));
+        } else if arch == "gemma4" {
+            let mut recipe = crate::gemma::Gemma4Recipe::new();
+            if params.block_count > 0 {
+                recipe.num_layers = params.block_count;
+            }
+            if params.embedding_length > 0 {
+                recipe.hidden_dim = params.embedding_length;
+            }
+            if params.feed_forward_length > 0 {
+                recipe.ffn_dim = params.feed_forward_length;
+            }
+            if params.head_count > 0 {
+                recipe.n_heads_q = params.head_count;
+            }
+            if params.head_count_kv > 0 {
+                recipe.n_heads_kv = params.head_count_kv;
+            }
+            if let Some(kl) = params.explicit_key_length
+                && kl > 0
+            {
+                recipe.head_dim = kl;
+            } else if params.key_length > 0 && params.head_count > 0 {
+                recipe.head_dim = params.key_length;
+            }
+            if params.vocab_size > 0 {
+                recipe.vocab_size = params.vocab_size;
+            }
+            if let Some(eps) = params.rms_norm_eps {
+                recipe.rms_eps = eps;
+            }
+            if let Some(freq) = params.rope_freq_base {
+                recipe.rope_freq_base_global = freq;
+            }
+            if let Some(sw) = params.sliding_window
+                && sw > 0
+            {
+                recipe.sliding_window = sw;
+            }
+            if let Some(ec) = params.expert_count {
+                recipe.num_experts = Some(ec);
+            }
+            if let Some(euc) = params.expert_used_count {
+                recipe.num_experts_per_tok = Some(euc);
+            }
+            if let Some(meta) = metadata {
+                if let Some(gate) = find_tensor(meta.tensors(), "blk.0.per_layer_inp_gate.weight")
+                    && gate.shape().len() == 2
+                    && recipe.hidden_dim > 0
+                {
+                    let (d0, d1) = (gate.shape()[0], gate.shape()[1]);
+                    if d0 == recipe.hidden_dim && d1 > 0 {
+                        recipe.ple_dim = Some(d1);
+                    } else if d1 == recipe.hidden_dim && d0 > 0 {
+                        recipe.ple_dim = Some(d0);
+                    }
+                } else if find_tensor(meta.tensors(), "per_layer_token_embd.weight").is_some() {
+                    recipe.ple_dim = Some(256);
+                }
+            }
+            return Some(Box::new(recipe));
+        }
+
         let _ = (arch, metadata);
         None
     }
@@ -803,6 +930,12 @@ mod tests {
         }
         #[cfg(feature = "jero-arch-dory")]
         assert!(archs.contains(&"dory"));
+        #[cfg(feature = "jero-arch-gemma")]
+        {
+            assert!(archs.contains(&"gemma2"));
+            assert!(archs.contains(&"gemma3"));
+            assert!(archs.contains(&"gemma4"));
+        }
     }
 
     #[cfg(feature = "jero-arch-synthetic")]

@@ -54,11 +54,12 @@ tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "net", "io-ut
 zerocopy = { version = "0.8.63", features = ["derive"] }
 
 [features]
-default = ["jero-arch-synthetic", "jero-arch-llama", "jero-arch-mistral", "jero-arch-phi3", "jero-arch-bitnet", "jero-arch-dory", "jero-kernels-rvv"]
+default = ["jero-arch-synthetic", "jero-arch-llama", "jero-arch-mistral", "jero-arch-phi3", "jero-arch-bitnet", "jero-arch-dory", "jero-arch-gemma", "jero-kernels-rvv"]
 # In-process architecture recipe and compute kernel feature gates (ADR-024)
 jero-arch-synthetic = ["dep:jero-arch-synthetic"]
 jero-arch-bitnet = ["dep:jero-arch-bitnet"]
 jero-arch-dory = ["dep:jero-arch-dory"]
+jero-arch-gemma = ["jero-kernels-rvv"]
 jero-arch-llama = ["dep:jero-arch-llama"]
 jero-arch-mistral = ["dep:jero-arch-mistral"]
 jero-arch-phi3 = ["dep:jero-arch-phi3"]
@@ -75,6 +76,7 @@ jero-kernels-rvv = [
 arch-synthetic = ["jero-arch-synthetic"]
 arch-bitnet = ["jero-arch-bitnet"]
 arch-dory = ["jero-arch-dory"]
+arch-gemma = ["jero-arch-gemma"]
 arch-llama = ["jero-arch-llama"]
 arch-mistral = ["jero-arch-mistral"]
 arch-phi3 = ["jero-arch-phi3"]

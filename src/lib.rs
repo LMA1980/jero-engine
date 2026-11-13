@@ -10,6 +10,8 @@ pub mod certification;
 pub mod engine;
 #[cfg(feature = "jero-kernels-rvv")]
 pub mod forward;
+#[cfg(feature = "jero-kernels-rvv")]
+pub mod gemma;
 pub mod kv;
 pub mod memory;
 pub mod weights;
@@ -46,12 +48,13 @@ pub use jero_core::{
     ModelListResponse, ModelLoadAuditEvent, ModelMetadata, ModelProfile, ModelWeights,
     PriorityClass, ProfileStatus, QuantType, TensorDescriptor, TensorView, TuningProfile,
 };
-pub use kv::SingleSlotKvArena;
+pub use kv::{SingleSlotKvArena, SlidingWindowKvView, write_and_slice_sliding_kv};
 pub use memory::{
-    DEFAULT_PAGE_SIZE, DORY_DEFAULT_SLIDING_WINDOW, KV_BLOCK_SIZE, MemoryFootprint,
+    DEFAULT_PAGE_SIZE, DORY_DEFAULT_SLIDING_WINDOW, KV_BLOCK_SIZE, LayerKvPolicy, MemoryFootprint,
     MemoryInspector, MockMemoryInspector, SystemMemoryInspector, calculate_footprint,
     calculate_footprint_with_slots, check_memory_admission, check_memory_admission_with,
-    check_memory_admission_with_slots, estimate_dory_kv_cache_bytes, system_page_size,
+    check_memory_admission_with_slots, estimate_dory_kv_cache_bytes,
+    estimate_hybrid_kv_cache_bytes, gemma_layer_kv_policies, system_page_size,
 };
 pub use weights::LockedModelWeights;
 
@@ -80,6 +83,14 @@ pub use jero_arch_dory as arch_dory;
 #[cfg(feature = "jero-arch-dory")]
 pub use jero_arch_dory::DoryRecipe;
 
+#[cfg(feature = "jero-arch-gemma")]
+pub use gemma as arch_gemma;
+#[cfg(feature = "jero-arch-gemma")]
+pub use gemma::{
+    ExpertWeights, Gemma4Recipe, GemmaRecipe, apply_gemma4_ple_residual, dispatch_sparse_moe_layer,
+    gemma_norm_lane, select_top_k_experts,
+};
+
 #[cfg(feature = "jero-arch-synthetic")]
 pub use jero_arch_synthetic;
 #[cfg(feature = "jero-arch-synthetic")]
@@ -95,6 +106,9 @@ pub const HAS_ARCH_BITNET: bool = cfg!(feature = "jero-arch-bitnet");
 
 /// Indicates whether the `jero-arch-dory` architecture recipe feature gate is enabled.
 pub const HAS_ARCH_DORY: bool = cfg!(feature = "jero-arch-dory");
+
+/// Indicates whether the `jero-arch-gemma` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_GEMMA: bool = cfg!(feature = "jero-arch-gemma");
 
 /// Indicates whether the `jero-arch-llama` architecture recipe feature gate is enabled.
 pub const HAS_ARCH_LLAMA: bool = cfg!(feature = "jero-arch-llama");
@@ -114,14 +128,15 @@ pub const HAS_KERNELS_RVV: bool = cfg!(feature = "jero-kernels-rvv");
 #[cfg(test)]
 mod tests {
     use super::{
-        HAS_ARCH_BITNET, HAS_ARCH_DORY, HAS_ARCH_LLAMA, HAS_ARCH_MISTRAL, HAS_ARCH_PHI3,
-        HAS_ARCH_SYNTHETIC, HAS_KERNELS_RVV, QuantType,
+        HAS_ARCH_BITNET, HAS_ARCH_DORY, HAS_ARCH_GEMMA, HAS_ARCH_LLAMA, HAS_ARCH_MISTRAL,
+        HAS_ARCH_PHI3, HAS_ARCH_SYNTHETIC, HAS_KERNELS_RVV, QuantType,
     };
 
     #[test]
     fn feature_gates_match_cfg() {
         assert_eq!(HAS_ARCH_BITNET, cfg!(feature = "jero-arch-bitnet"));
         assert_eq!(HAS_ARCH_DORY, cfg!(feature = "jero-arch-dory"));
+        assert_eq!(HAS_ARCH_GEMMA, cfg!(feature = "jero-arch-gemma"));
         assert_eq!(HAS_ARCH_LLAMA, cfg!(feature = "jero-arch-llama"));
         assert_eq!(HAS_ARCH_MISTRAL, cfg!(feature = "jero-arch-mistral"));
         assert_eq!(HAS_ARCH_PHI3, cfg!(feature = "jero-arch-phi3"));
@@ -138,6 +153,17 @@ mod tests {
 
         let recipe = DoryRecipe::new();
         assert_eq!(recipe.architecture_id(), "dory");
+    }
+
+    #[cfg(feature = "jero-arch-gemma")]
+    #[test]
+    fn arch_gemma_recipe_wired() {
+        use super::ArchRecipe;
+        use super::arch_gemma::{Gemma4Recipe, GemmaRecipe};
+
+        assert_eq!(GemmaRecipe::new_gemma2().architecture_id(), "gemma2");
+        assert_eq!(GemmaRecipe::new_gemma3().architecture_id(), "gemma3");
+        assert_eq!(Gemma4Recipe::new().architecture_id(), "gemma4");
     }
 
     #[cfg(feature = "jero-arch-bitnet")]
