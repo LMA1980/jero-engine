@@ -171,6 +171,125 @@ pub fn estimate_dory_kv_cache_bytes(
         })
 }
 
+/// Per-layer KV cache retention policy for hybrid local sliding-window and global full-context
+/// architectures (such as `gemma2`, `gemma3`, and `gemma4`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerKvPolicy {
+    /// Retains all tokens up to `n_ctx`.
+    GlobalFullContext,
+    /// Retains a bounded cyclic ring buffer of at most `min(n_ctx, window_tokens)` tokens.
+    SlidingWindow {
+        /// Sliding window token capacity for this layer.
+        window_tokens: usize,
+    },
+}
+
+/// Builds the canonical per-layer KV retention policies for Gemma architectures:
+/// - `gemma2`: 1:1 alternating (`layer_idx % 2 == 0` sliding window, odd global)
+/// - `gemma3` / `gemma4`: 5:1 interleaved (`(layer_idx + 1) % 6 == 0` global, all others local)
+#[must_use]
+pub fn gemma_layer_kv_policies(
+    architecture: &str,
+    layer_count: usize,
+    sliding_window: Option<usize>,
+) -> Vec<LayerKvPolicy> {
+    let default_window = match architecture {
+        "gemma2" => 4096,
+        _ => 1024,
+    };
+    let window_tokens = sliding_window.unwrap_or(default_window).max(1);
+
+    (0..layer_count)
+        .map(|layer_idx| {
+            let is_global = if architecture == "gemma2" {
+                layer_idx % 2 == 1
+            } else {
+                (layer_idx + 1) % 6 == 0
+            };
+            if is_global {
+                LayerKvPolicy::GlobalFullContext
+            } else {
+                LayerKvPolicy::SlidingWindow { window_tokens }
+            }
+        })
+        .collect()
+}
+
+/// Estimates exact raw KV cache byte requirements across heterogeneous [`LayerKvPolicy`] layers,
+/// bounding each local sliding-window layer to `min(n_ctx, window_tokens)` tokens.
+///
+/// # Errors
+///
+/// Returns [`K3Error::CapabilityMismatch`] if `n_ctx == 0`, `head_count_kv == 0`, `head_dim == 0`,
+/// `policies` is empty, or any `SlidingWindow { window_tokens }` has zero window capacity.
+/// Returns [`K3Error::TensorBoundsError`] on `usize` overflow.
+pub fn estimate_hybrid_kv_cache_bytes(
+    n_ctx: usize,
+    head_count_kv: usize,
+    head_dim: usize,
+    policies: &[LayerKvPolicy],
+) -> Result<usize, K3Error> {
+    if n_ctx == 0 || head_count_kv == 0 || head_dim == 0 || policies.is_empty() {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "gemma".to_owned(),
+            reason: format!(
+                "invalid hybrid KV geometry: n_ctx={n_ctx}, head_count_kv={head_count_kv}, head_dim={head_dim}, layers={}",
+                policies.len()
+            ),
+        });
+    }
+
+    let kv_bytes_per_token_per_layer = 2usize
+        .checked_mul(head_count_kv)
+        .and_then(|v| v.checked_mul(head_dim))
+        .and_then(|v| v.checked_mul(size_of::<f32>()))
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "hybrid KV per-layer token byte stride overflowed usize".to_owned(),
+        })?;
+
+    let mut total_bytes = 0usize;
+    for policy in policies {
+        let cap_tokens = match *policy {
+            LayerKvPolicy::GlobalFullContext => n_ctx,
+            LayerKvPolicy::SlidingWindow { window_tokens } => {
+                if window_tokens == 0 {
+                    return Err(K3Error::CapabilityMismatch {
+                        architecture: "gemma".to_owned(),
+                        reason: "sliding-window layer policy must specify window_tokens > 0"
+                            .to_owned(),
+                    });
+                }
+                n_ctx.min(window_tokens)
+            }
+        };
+        let layer_bytes = cap_tokens
+            .checked_mul(kv_bytes_per_token_per_layer)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "hybrid KV layer byte capacity overflowed usize".to_owned(),
+            })?;
+        total_bytes =
+            total_bytes
+                .checked_add(layer_bytes)
+                .ok_or_else(|| K3Error::TensorBoundsError {
+                    tensor_name: "kv_cache".to_owned(),
+                    offset: 0,
+                    byte_len: 0,
+                    buffer_len: usize::MAX,
+                    reason: "hybrid KV total byte capacity overflowed usize".to_owned(),
+                })?;
+    }
+
+    Ok(total_bytes)
+}
+
 /// Default system page size fallback in bytes if `sysconf` query fails.
 pub const DEFAULT_PAGE_SIZE: usize = 4096;
 
@@ -300,6 +419,36 @@ pub fn calculate_footprint_with_slots(
                 byte_len: 0,
                 buffer_len: usize::MAX,
                 reason: "dory multi-slot kv bytes calculation overflowed usize".to_owned(),
+            })?
+    } else if matches!(metadata.architecture(), "gemma2" | "gemma3" | "gemma4") {
+        let per_slot_tokens = blocks_per_slot.checked_mul(KV_BLOCK_SIZE).ok_or_else(|| {
+            K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "per-slot kv allocated tokens overflow usize".to_owned(),
+            }
+        })?;
+        let layer_count = metadata.layer_count().max(1);
+        let head_count_kv = metadata.head_count_kv().max(1);
+        let head_dim = if metadata.head_count() > 0 {
+            metadata.embedding_dim() / metadata.head_count()
+        } else {
+            metadata.embedding_dim()
+        }
+        .max(1);
+        let policies = gemma_layer_kv_policies(metadata.architecture(), layer_count, None);
+        let single_slot_gemma_bytes =
+            estimate_hybrid_kv_cache_bytes(per_slot_tokens, head_count_kv, head_dim, &policies)?;
+        single_slot_gemma_bytes
+            .checked_mul(slots)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "gemma multi-slot kv bytes calculation overflowed usize".to_owned(),
             })?
     } else {
         let layer_count = metadata.layer_count().max(1);

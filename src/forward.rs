@@ -35,6 +35,12 @@ pub use jero_arch_bitnet::BitNetRecipe;
 #[cfg(feature = "jero-arch-dory")]
 pub use jero_arch_dory::DoryRecipe;
 
+#[cfg(feature = "jero-arch-gemma")]
+pub use crate::gemma::{
+    ExpertWeights, Gemma4Recipe, GemmaRecipe, apply_gemma4_ple_residual, dispatch_sparse_moe_layer,
+    gemma_norm_lane, select_top_k_experts,
+};
+
 /// Canonical vocabulary size for `Dory1.0-4B` parallel LM head row-split (`131,072`).
 pub const DORY_VOCAB_SIZE: usize = 131_072;
 

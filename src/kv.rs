@@ -522,6 +522,67 @@ impl Drop for SingleSlotKvArena {
     }
 }
 
+/// Borrowed cyclic ring view returned after writing a token KV pair to a local sliding-window layer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SlidingWindowKvView<'a> {
+    /// Active key vectors slice (`active_len * kv_dim`).
+    pub keys: &'a [f32],
+    /// Active value vectors slice (`active_len * kv_dim`).
+    pub values: &'a [f32],
+    /// Number of valid cached causal positions (`min(pos + 1, window_size)`).
+    pub active_len: usize,
+    /// Cyclic ring buffer slot index written for `pos` (`pos % window_size`).
+    pub slot_idx: usize,
+}
+
+/// Writes `(k_in, v_in)` at cyclic ring slot `pos % window_size` into a local sliding-window
+/// layer buffer `[k_ring (window_size * kv_dim), v_ring (window_size * kv_dim)]` and returns
+/// `(k_slice, v_slice, active_len)` bounded to `min(pos + 1, window_size)`.
+///
+/// # Panics
+///
+/// Panics if `window_size == 0`, `kv_dim == 0`, `k_in.len() != kv_dim`, `v_in.len() != kv_dim`,
+/// or `layer_kv.len() < 2 * window_size * kv_dim`.
+pub fn write_and_slice_sliding_kv<'a>(
+    layer_kv: &'a mut [f32],
+    pos: usize,
+    window_size: usize,
+    kv_dim: usize,
+    k_in: &[f32],
+    v_in: &[f32],
+) -> (&'a [f32], &'a [f32], usize) {
+    assert!(window_size > 0, "sliding window_size must be > 0");
+    assert!(kv_dim > 0, "kv_dim must be > 0");
+    assert_eq!(k_in.len(), kv_dim, "k_in length must match kv_dim");
+    assert_eq!(v_in.len(), kv_dim, "v_in length must match kv_dim");
+
+    let ring_elems = window_size
+        .checked_mul(kv_dim)
+        .expect("window_size * kv_dim overflowed");
+    let required_elems = ring_elems
+        .checked_mul(2)
+        .expect("2 * window_size * kv_dim overflowed");
+    assert!(
+        layer_kv.len() >= required_elems,
+        "layer_kv len {} < required {required_elems}",
+        layer_kv.len()
+    );
+
+    let slot = pos % window_size;
+    let active_len = (pos + 1).min(window_size);
+    let slot_start = slot * kv_dim;
+    let slot_end = slot_start + kv_dim;
+
+    let (k_ring, rest) = layer_kv.split_at_mut(ring_elems);
+    let v_ring = &mut rest[..ring_elems];
+
+    k_ring[slot_start..slot_end].copy_from_slice(k_in);
+    v_ring[slot_start..slot_end].copy_from_slice(v_in);
+
+    let active_elems = active_len * kv_dim;
+    (&k_ring[..active_elems], &v_ring[..active_elems], active_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,5 +665,56 @@ mod tests {
         assert_eq!(arena.head_count_kv(), 2);
         assert_eq!(arena.head_dim(), 64);
         assert_eq!(arena.elements_per_token(), 2 * 2 * 2 * 64);
+    }
+
+    #[test]
+    fn test_sliding_window_kv_ring_wraparound() {
+        let window_size = 4;
+        let kv_dim = 3;
+        let mut layer_kv = vec![0.0_f32; 2 * window_size * kv_dim];
+
+        // Positions 0..4 fill slots 0..3 with growing active_len 1..=4
+        for pos in 0..4 {
+            let marker = f32::from(u16::try_from(pos + 1).expect("pos fits u16"));
+            let k = [marker, marker * 2.0, marker * 3.0];
+            let v = [-marker, -marker * 2.0, -marker * 3.0];
+            let (k_slice, v_slice, active_len) =
+                write_and_slice_sliding_kv(&mut layer_kv, pos, window_size, kv_dim, &k, &v);
+            assert_eq!(active_len, pos + 1);
+            assert_eq!(k_slice.len(), active_len * kv_dim);
+            assert_eq!(v_slice.len(), active_len * kv_dim);
+        }
+
+        // Positions 4..10 wrap around mod 4 while clamping active_len to window_size=4
+        for pos in 4..10 {
+            let marker = f32::from(u16::try_from(pos + 1).expect("pos fits u16"));
+            let k = [marker, marker * 2.0, marker * 3.0];
+            let v = [-marker, -marker * 2.0, -marker * 3.0];
+            let (k_slice, v_slice, active_len) =
+                write_and_slice_sliding_kv(&mut layer_kv, pos, window_size, kv_dim, &k, &v);
+            assert_eq!(active_len, window_size);
+            assert_eq!(k_slice.len(), window_size * kv_dim);
+            assert_eq!(v_slice.len(), window_size * kv_dim);
+
+            let slot = pos % window_size;
+            assert!((k_slice[slot * kv_dim] - marker).abs() < f32::EPSILON);
+            assert!((v_slice[slot * kv_dim] + marker).abs() < f32::EPSILON);
+        }
+
+        // After pos=9 (marker=10 -> slot 1), ring slots hold tokens:
+        // slot 0 <- pos=8 (9.0), slot 1 <- pos=9 (10.0), slot 2 <- pos=6 (7.0), slot 3 <- pos=7 (8.0)
+        assert!((layer_kv[0] - 9.0).abs() < f32::EPSILON);
+        assert!((layer_kv[kv_dim] - 10.0).abs() < f32::EPSILON);
+        assert!((layer_kv[2 * kv_dim] - 7.0).abs() < f32::EPSILON);
+        assert!((layer_kv[3 * kv_dim] - 8.0).abs() < f32::EPSILON);
+
+        let view = SlidingWindowKvView {
+            keys: &layer_kv[..window_size * kv_dim],
+            values: &layer_kv[window_size * kv_dim..],
+            active_len: window_size,
+            slot_idx: 9 % window_size,
+        };
+        assert_eq!(view.slot_idx, 1);
+        assert_eq!(view.active_len, 4);
     }
 }
