@@ -42,7 +42,11 @@ pub struct ExpertWeights<'a> {
 }
 
 /// Dispatches matrix-vector multiplication across all quantization formats supported by Gemma.
-fn matvec_any(out: &mut [f32], weights: &TensorView<'_>, input: &[f32]) -> Result<(), K3Error> {
+pub(crate) fn matvec_any(
+    out: &mut [f32],
+    weights: &TensorView<'_>,
+    input: &[f32],
+) -> Result<(), K3Error> {
     if out.is_empty() || input.is_empty() {
         return Err(K3Error::TensorBoundsError {
             tensor_name: weights.name().to_owned(),
@@ -551,6 +555,28 @@ impl GemmaRecipe {
         }
     }
 
+    /// Creates a default `FunctionGemma` recipe (Gemma 3 270M/2B specialized functional action SLM).
+    #[must_use]
+    pub const fn new_functiongemma() -> Self {
+        Self {
+            architecture: "functiongemma",
+            num_layers: 18,
+            hidden_dim: 640,
+            ffn_dim: 2048,
+            n_heads_q: 4,
+            n_heads_kv: 1,
+            head_dim: 256,
+            vocab_size: 262_144,
+            rms_eps: 1e-6,
+            rope_freq_base_local: 10_000.0,
+            rope_freq_base_global: 1_000_000.0,
+            sliding_window: 512,
+            attn_logit_softcap: None,
+            final_logit_softcap: None,
+            use_qk_norm: true,
+        }
+    }
+
     /// Returns `true` when `layer_idx` uses global full-context attention.
     #[must_use]
     pub const fn is_global_layer(&self, layer_idx: usize) -> bool {
@@ -693,7 +719,11 @@ struct GemmaLayerConfig {
     num_experts_per_tok: Option<usize>,
 }
 
-fn read_f32_weight_or_zeros(weights: &dyn ModelWeights, name: &str, len: usize) -> Vec<f32> {
+pub(crate) fn read_f32_weight_or_zeros(
+    weights: &dyn ModelWeights,
+    name: &str,
+    len: usize,
+) -> Vec<f32> {
     let Ok(view) = weights.tensor(name) else {
         return vec![0.0_f32; len];
     };
@@ -750,7 +780,7 @@ fn embed_token_hidden(
     Ok(hidden)
 }
 
-fn project_or_deterministic_slice(
+pub(crate) fn project_or_deterministic_slice(
     weights: &dyn ModelWeights,
     tensor_name: &str,
     input: &[f32],
@@ -1169,7 +1199,10 @@ impl ArchRecipe for GemmaRecipe {
         ctx: &mut ExecutionContext<'_>,
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
-        let prompt = ctx.prompt_tokens().to_vec();
+        let prompt = ctx
+            .jump_forward_tokens()
+            .unwrap_or_else(|| ctx.prompt_tokens())
+            .to_vec();
         if prompt.is_empty() {
             return Err(K3Error::CapabilityMismatch {
                 architecture: self.architecture.to_owned(),
@@ -1185,7 +1218,7 @@ impl ArchRecipe for GemmaRecipe {
                 cfg,
                 tok,
                 start_pos + offset,
-                seq_len,
+                start_pos + seq_len,
                 ctx.kv_cache_mut(),
                 &mut step_logits,
                 weights,
@@ -1305,7 +1338,10 @@ impl ArchRecipe for Gemma4Recipe {
         ctx: &mut ExecutionContext<'_>,
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
-        let prompt = ctx.prompt_tokens().to_vec();
+        let prompt = ctx
+            .jump_forward_tokens()
+            .unwrap_or_else(|| ctx.prompt_tokens())
+            .to_vec();
         if prompt.is_empty() {
             return Err(K3Error::CapabilityMismatch {
                 architecture: self.architecture.to_owned(),
@@ -1321,7 +1357,7 @@ impl ArchRecipe for Gemma4Recipe {
                 cfg,
                 tok,
                 start_pos + offset,
-                seq_len,
+                start_pos + seq_len,
                 ctx.kv_cache_mut(),
                 &mut step_logits,
                 weights,

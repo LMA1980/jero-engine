@@ -41,6 +41,9 @@ pub use crate::gemma::{
     gemma_norm_lane, select_top_k_experts,
 };
 
+#[cfg(feature = "jero-arch-modernbert")]
+pub use crate::modernbert::ModernBertRecipe;
+
 /// Canonical vocabulary size for `Dory1.0-4B` parallel LM head row-split (`131,072`).
 pub const DORY_VOCAB_SIZE: usize = 131_072;
 

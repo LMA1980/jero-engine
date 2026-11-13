@@ -385,6 +385,25 @@ impl RecipeRegistry {
         } else if architecture == "gemma4" {
             static GEMMA4: crate::gemma::Gemma4Recipe = crate::gemma::Gemma4Recipe::new();
             return Some(&GEMMA4);
+        } else if architecture == "functiongemma" {
+            static FUNCTIONGEMMA: crate::gemma::GemmaRecipe =
+                crate::gemma::GemmaRecipe::new_functiongemma();
+            return Some(&FUNCTIONGEMMA);
+        }
+
+        #[cfg(feature = "jero-arch-modernbert")]
+        if architecture == "modernbert" {
+            static MODERNBERT: crate::modernbert::ModernBertRecipe =
+                crate::modernbert::ModernBertRecipe::new_modernbert();
+            return Some(&MODERNBERT);
+        } else if architecture == "bert" {
+            static BERT: crate::modernbert::ModernBertRecipe =
+                crate::modernbert::ModernBertRecipe::new_bert();
+            return Some(&BERT);
+        } else if architecture == "deberta-v3" {
+            static DEBERTA_V3: crate::modernbert::ModernBertRecipe =
+                crate::modernbert::ModernBertRecipe::new_deberta_v3();
+            return Some(&DEBERTA_V3);
         }
 
         let _ = architecture;
@@ -427,6 +446,14 @@ impl RecipeRegistry {
             "gemma3",
             #[cfg(feature = "jero-arch-gemma")]
             "gemma4",
+            #[cfg(feature = "jero-arch-gemma")]
+            "functiongemma",
+            #[cfg(feature = "jero-arch-modernbert")]
+            "modernbert",
+            #[cfg(feature = "jero-arch-modernbert")]
+            "bert",
+            #[cfg(feature = "jero-arch-modernbert")]
+            "deberta-v3",
         ];
         ARCHS
     }
@@ -687,11 +714,11 @@ impl RecipeRegistry {
         }
 
         #[cfg(feature = "jero-arch-gemma")]
-        if arch == "gemma2" || arch == "gemma3" {
-            let mut recipe = if arch == "gemma2" {
-                crate::gemma::GemmaRecipe::new_gemma2()
-            } else {
-                crate::gemma::GemmaRecipe::new_gemma3()
+        if arch == "gemma2" || arch == "gemma3" || arch == "functiongemma" {
+            let mut recipe = match arch {
+                "gemma2" => crate::gemma::GemmaRecipe::new_gemma2(),
+                "functiongemma" => crate::gemma::GemmaRecipe::new_functiongemma(),
+                _ => crate::gemma::GemmaRecipe::new_gemma3(),
             };
             if params.block_count > 0 {
                 recipe.num_layers = params.block_count;
@@ -791,6 +818,29 @@ impl RecipeRegistry {
                 } else if find_tensor(meta.tensors(), "per_layer_token_embd.weight").is_some() {
                     recipe.ple_dim = Some(256);
                 }
+            }
+            return Some(Box::new(recipe));
+        }
+
+        #[cfg(feature = "jero-arch-modernbert")]
+        if let Some(mut recipe) = crate::modernbert::ModernBertRecipe::from_metadata(arch, metadata)
+        {
+            if params.block_count > 0 {
+                recipe.num_layers = params.block_count;
+            }
+            if params.embedding_length > 0 {
+                recipe.hidden_dim = params.embedding_length;
+            }
+            if params.feed_forward_length > 0 {
+                recipe.ffn_dim = params.feed_forward_length;
+            } else if params.embedding_length > 0 {
+                recipe.ffn_dim = params.embedding_length.saturating_mul(2);
+            }
+            if params.head_count > 0 {
+                recipe.n_heads = params.head_count.min(recipe.hidden_dim).max(1);
+            }
+            if recipe.n_heads > 0 && recipe.hidden_dim >= recipe.n_heads {
+                recipe.head_dim = (recipe.hidden_dim / recipe.n_heads).max(1);
             }
             return Some(Box::new(recipe));
         }
@@ -935,6 +985,42 @@ mod tests {
             assert!(archs.contains(&"gemma2"));
             assert!(archs.contains(&"gemma3"));
             assert!(archs.contains(&"gemma4"));
+            assert!(archs.contains(&"functiongemma"));
+        }
+        #[cfg(feature = "jero-arch-modernbert")]
+        {
+            assert!(archs.contains(&"modernbert"));
+            assert!(archs.contains(&"bert"));
+            assert!(archs.contains(&"deberta-v3"));
+        }
+    }
+
+    #[cfg(feature = "jero-arch-modernbert")]
+    #[test]
+    fn test_modernbert_and_bert_classifier_pass() {
+        use jero_core::ExecutionContext;
+
+        for arch in ["modernbert", "bert", "deberta-v3"] {
+            let tensor_specs = [
+                ("token_embd.weight", QuantType::F32, &[8, 16][..]),
+                ("blk.0.attn_q.weight", QuantType::F32, &[8, 8][..]),
+                ("classifier.weight", QuantType::F32, &[8, 3][..]),
+            ];
+            let bytes = create_synthetic_gguf_v3(arch, 64, &tensor_specs);
+            let model = GgufFile::parse(&bytes).expect("parse encoder model");
+            let recipe = verify_model_capabilities(&model).expect("encoder capability check");
+            assert_eq!(recipe.architecture_id(), arch);
+            assert!(!recipe.requires_kv_cache());
+
+            let prompt = [1_u32, 3, 5];
+            let mut logits = [0.0_f32; 3];
+            let mut ctx =
+                ExecutionContext::new(&prompt, 64, &mut logits, &mut []).expect("zero-kv context");
+            recipe
+                .forward_classify(&mut ctx, &model)
+                .expect("forward_classify executes with zero KV cache");
+            assert_eq!(ctx.position(), prompt.len());
+            assert!(logits.iter().all(|v| v.is_finite()));
         }
     }
 

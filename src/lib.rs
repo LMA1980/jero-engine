@@ -14,6 +14,8 @@ pub mod forward;
 pub mod gemma;
 pub mod kv;
 pub mod memory;
+#[cfg(feature = "jero-arch-modernbert")]
+pub mod modernbert;
 pub mod weights;
 pub mod worker;
 pub use worker as jero_worker;
@@ -37,7 +39,8 @@ pub use certification::{
     verify_prompt_sensitivity,
 };
 pub use engine::{
-    EnginePhase, EvaluationSummary, PassTiming, SinglePromptEngine, StreamAction,
+    EnginePhase, EvaluationSummary, FsmDecisionConstraint, PassTiming, SinglePromptEngine,
+    StreamAction, apply_fsm_logit_mask, execute_jump_forward_prefill, harvest_decision_logprobs,
     infer_logits_buffer_len, sample_greedy_argmax,
 };
 pub use jero_core as k3_core;
@@ -51,10 +54,11 @@ pub use jero_core::{
 pub use kv::{SingleSlotKvArena, SlidingWindowKvView, write_and_slice_sliding_kv};
 pub use memory::{
     DEFAULT_PAGE_SIZE, DORY_DEFAULT_SLIDING_WINDOW, KV_BLOCK_SIZE, LayerKvPolicy, MemoryFootprint,
-    MemoryInspector, MockMemoryInspector, SystemMemoryInspector, calculate_footprint,
-    calculate_footprint_with_slots, check_memory_admission, check_memory_admission_with,
-    check_memory_admission_with_slots, estimate_dory_kv_cache_bytes,
-    estimate_hybrid_kv_cache_bytes, gemma_layer_kv_policies, system_page_size,
+    MemoryInspector, MockMemoryInspector, SystemMemoryInspector, architecture_requires_kv_cache,
+    calculate_footprint, calculate_footprint_with_slots, check_memory_admission,
+    check_memory_admission_with, check_memory_admission_with_slots, estimate_dory_kv_cache_bytes,
+    estimate_hybrid_kv_cache_bytes, estimate_kv_cache_bytes, gemma_layer_kv_policies,
+    system_page_size,
 };
 pub use weights::LockedModelWeights;
 
@@ -91,6 +95,11 @@ pub use gemma::{
     gemma_norm_lane, select_top_k_experts,
 };
 
+#[cfg(feature = "jero-arch-modernbert")]
+pub use modernbert as arch_modernbert;
+#[cfg(feature = "jero-arch-modernbert")]
+pub use modernbert::ModernBertRecipe;
+
 #[cfg(feature = "jero-arch-synthetic")]
 pub use jero_arch_synthetic;
 #[cfg(feature = "jero-arch-synthetic")]
@@ -116,6 +125,9 @@ pub const HAS_ARCH_LLAMA: bool = cfg!(feature = "jero-arch-llama");
 /// Indicates whether the `jero-arch-mistral` architecture recipe feature gate is enabled.
 pub const HAS_ARCH_MISTRAL: bool = cfg!(feature = "jero-arch-mistral");
 
+/// Indicates whether the `jero-arch-modernbert` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_MODERNBERT: bool = cfg!(feature = "jero-arch-modernbert");
+
 /// Indicates whether the `jero-arch-phi3` architecture recipe feature gate is enabled.
 pub const HAS_ARCH_PHI3: bool = cfg!(feature = "jero-arch-phi3");
 
@@ -129,7 +141,7 @@ pub const HAS_KERNELS_RVV: bool = cfg!(feature = "jero-kernels-rvv");
 mod tests {
     use super::{
         HAS_ARCH_BITNET, HAS_ARCH_DORY, HAS_ARCH_GEMMA, HAS_ARCH_LLAMA, HAS_ARCH_MISTRAL,
-        HAS_ARCH_PHI3, HAS_ARCH_SYNTHETIC, HAS_KERNELS_RVV, QuantType,
+        HAS_ARCH_MODERNBERT, HAS_ARCH_PHI3, HAS_ARCH_SYNTHETIC, HAS_KERNELS_RVV, QuantType,
     };
 
     #[test]
@@ -139,6 +151,7 @@ mod tests {
         assert_eq!(HAS_ARCH_GEMMA, cfg!(feature = "jero-arch-gemma"));
         assert_eq!(HAS_ARCH_LLAMA, cfg!(feature = "jero-arch-llama"));
         assert_eq!(HAS_ARCH_MISTRAL, cfg!(feature = "jero-arch-mistral"));
+        assert_eq!(HAS_ARCH_MODERNBERT, cfg!(feature = "jero-arch-modernbert"));
         assert_eq!(HAS_ARCH_PHI3, cfg!(feature = "jero-arch-phi3"));
         assert_eq!(HAS_ARCH_SYNTHETIC, cfg!(feature = "jero-arch-synthetic"));
         assert_eq!(HAS_KERNELS_RVV, cfg!(feature = "jero-kernels-rvv"));
@@ -163,7 +176,28 @@ mod tests {
 
         assert_eq!(GemmaRecipe::new_gemma2().architecture_id(), "gemma2");
         assert_eq!(GemmaRecipe::new_gemma3().architecture_id(), "gemma3");
+        assert_eq!(
+            GemmaRecipe::new_functiongemma().architecture_id(),
+            "functiongemma"
+        );
         assert_eq!(Gemma4Recipe::new().architecture_id(), "gemma4");
+    }
+
+    #[cfg(feature = "jero-arch-modernbert")]
+    #[test]
+    fn arch_modernbert_recipe_wired() {
+        use super::ArchRecipe;
+        use super::arch_modernbert::ModernBertRecipe;
+
+        let modernbert = ModernBertRecipe::new_modernbert();
+        assert_eq!(modernbert.architecture_id(), "modernbert");
+        assert!(!modernbert.requires_kv_cache());
+        let bert = ModernBertRecipe::new_bert();
+        assert_eq!(bert.architecture_id(), "bert");
+        assert!(!bert.requires_kv_cache());
+        let deberta = ModernBertRecipe::new_deberta_v3();
+        assert_eq!(deberta.architecture_id(), "deberta-v3");
+        assert!(!deberta.requires_kv_cache());
     }
 
     #[cfg(feature = "jero-arch-bitnet")]
