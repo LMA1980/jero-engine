@@ -482,6 +482,210 @@ impl SinglePromptEngine {
             },
         ))
     }
+
+    /// Executes a single prefill pass (`0` decode steps) and derives a calibrated binary risk score
+    /// (`Yes`/`No` or `unsafe`/`safe`) immediately from the prefill logits via
+    /// [`compute_calibrated_binary_risk`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error`] if prefill execution fails or if candidate token IDs are invalid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_prefill_binary_risk(
+        &mut self,
+        recipe: &dyn ArchRecipe,
+        weights: &dyn ModelWeights,
+        kv_arena: &mut SingleSlotKvArena,
+        prompt_tokens: &[u32],
+        vocab_size: usize,
+        affirmative_token_id: u32,
+        negative_token_id: u32,
+    ) -> Result<(CalibratedGuardrailScore, EvaluationSummary), K3Error> {
+        let _guard = CycleGuard::acquire(&self.active_cycle, recipe.architecture_id())?;
+
+        if prompt_tokens.is_empty() || vocab_size == 0 {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: recipe.architecture_id().to_owned(),
+                reason:
+                    "prompt_tokens and vocab_size must be non-empty for binary guardrail evaluation"
+                        .to_owned(),
+            });
+        }
+
+        let logits_len = infer_logits_buffer_len(weights, vocab_size);
+        let mut logits = vec![0.0_f32; logits_len];
+        let mut ctx = ExecutionContext::new(
+            prompt_tokens,
+            kv_arena.n_ctx(),
+            &mut logits,
+            kv_arena.as_mut_slice(),
+        )?;
+
+        let pass_start = Instant::now();
+        self.phase = EnginePhase::Prefill;
+        if recipe.requires_kv_cache() {
+            recipe.prefill_step(&mut ctx, weights)?;
+        } else {
+            recipe.forward_classify(&mut ctx, weights)?;
+        }
+        let prefill_ms = pass_start.elapsed().as_secs_f64() * 1000.0;
+        let final_position = ctx.position();
+
+        let score = compute_calibrated_binary_risk(
+            &logits[..vocab_size.min(logits.len())],
+            affirmative_token_id,
+            negative_token_id,
+        )?;
+        let winning_token = if score.unsafe_probability >= 0.5 {
+            affirmative_token_id
+        } else {
+            negative_token_id
+        };
+        self.phase = EnginePhase::Completed;
+
+        Ok((
+            score,
+            EvaluationSummary {
+                prompt_tokens: prompt_tokens.len(),
+                generated_tokens: vec![winning_token],
+                final_position,
+                final_phase: self.phase,
+                timing: compute_pass_timing(pass_start, prefill_ms, prefill_ms, 0.0, 0, 0.0, None),
+            },
+        ))
+    }
+}
+
+/// Calibrated binary risk score extracted from single-prefill affirmative vs negative token logits
+/// for `ShieldGemma` (`Yes`/`No`), `Granite-Guardian` (`Yes`/`No`), and `Llama-Guard` (`unsafe`/`safe`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CalibratedGuardrailScore {
+    /// Calibrated probability `P(unsafe) = 1 / (1 + exp(negative_logit - affirmative_logit))`.
+    pub unsafe_probability: f32,
+    /// Raw logit for the affirmative (`Yes` / `unsafe`) risk token.
+    pub affirmative_logit: f32,
+    /// Raw logit for the negative (`No` / `safe`) benign token.
+    pub negative_logit: f32,
+    /// Optional `MLCommons` taxonomy hazard code (`"S1"`..`"S14"`) parsed from `Llama-Guard` output.
+    pub hazard_category: Option<String>,
+}
+
+/// Computes numerically stable calibrated binary risk probability from raw `prefill_step` logits.
+///
+/// Evaluates $P(\text{unsafe}) = 1 / (1 + \exp(\ell_{\text{neg}} - \ell_{\text{pos}}))$ in `f64`
+/// without `softmax` exponent overflow.
+///
+/// # Errors
+///
+/// - Returns [`K3Error::CapabilityMismatch`] if `logits` is empty, `affirmative_token_id == negative_token_id`,
+///   or either selected logit is non-finite (`NaN`/`Inf`).
+/// - Returns [`K3Error::TensorBoundsError`] if either token ID exceeds `logits.len()`.
+pub fn compute_calibrated_binary_risk(
+    logits: &[f32],
+    affirmative_token_id: u32,
+    negative_token_id: u32,
+) -> Result<CalibratedGuardrailScore, K3Error> {
+    if logits.is_empty() {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "calibrated_binary_risk".to_owned(),
+            reason: "logits buffer cannot be empty".to_owned(),
+        });
+    }
+    if affirmative_token_id == negative_token_id {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "calibrated_binary_risk".to_owned(),
+            reason: format!(
+                "affirmative_token_id ({affirmative_token_id}) and negative_token_id must be distinct"
+            ),
+        });
+    }
+
+    let validate_id = |token_id: u32, role: &str| -> Result<f32, K3Error> {
+        let idx = usize::try_from(token_id).map_err(|_| K3Error::TensorBoundsError {
+            tensor_name: "guardrail_logits".to_owned(),
+            offset: usize::MAX,
+            byte_len: size_of::<f32>(),
+            buffer_len: size_of_val(logits),
+            reason: format!("{role} token id {token_id} overflows usize"),
+        })?;
+        if idx >= logits.len() {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "guardrail_logits".to_owned(),
+                offset: idx,
+                byte_len: size_of::<f32>(),
+                buffer_len: size_of_val(logits),
+                reason: format!(
+                    "{role} token id {token_id} out of bounds for logits len {}",
+                    logits.len()
+                ),
+            });
+        }
+        let val = logits[idx];
+        if !val.is_finite() {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "calibrated_binary_risk".to_owned(),
+                reason: format!("non-finite {role} logit ({val}) at token id {token_id}"),
+            });
+        }
+        Ok(val)
+    };
+
+    let affirmative_logit = validate_id(affirmative_token_id, "affirmative")?;
+    let negative_logit = validate_id(negative_token_id, "negative")?;
+
+    let diff = f64::from(negative_logit) - f64::from(affirmative_logit);
+    let prob = if diff >= 0.0 {
+        let e = (-diff).exp();
+        e / (1.0 + e)
+    } else {
+        1.0 / (1.0 + diff.exp())
+    };
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "calibrated probability is strictly within [0.0, 1.0]"
+    )]
+    let unsafe_probability = (prob as f32).clamp(0.0, 1.0);
+
+    Ok(CalibratedGuardrailScore {
+        unsafe_probability,
+        affirmative_logit,
+        negative_logit,
+        hazard_category: None,
+    })
+}
+
+/// Parses `Llama-Guard` structured `safe` / `unsafe\nS1..S14` verdicts into canonical `MLCommons`
+/// hazard codes (`"S1"`..`"S14"`).
+#[must_use]
+pub fn parse_llamaguard_hazard(output: &str) -> Option<String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut lines = trimmed.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first_line = lines.next()?;
+    let verdict_word = first_line
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or("");
+    if verdict_word.eq_ignore_ascii_case("safe") {
+        return None;
+    }
+    if !verdict_word.eq_ignore_ascii_case("unsafe") {
+        return None;
+    }
+
+    for token in trimmed.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if let Some(rest) = token.strip_prefix('S').or_else(|| token.strip_prefix('s'))
+            && let Ok(code) = rest.parse::<u8>()
+            && (1..=14).contains(&code)
+        {
+            return Some(format!("S{code}"));
+        }
+    }
+
+    None
 }
 
 /// Computes log-softmax probabilities over `candidate_token_ids` from raw prefill `logits`.
@@ -1447,5 +1651,114 @@ mod tests {
         assert_eq!(logits[3], f32::NEG_INFINITY);
 
         let _ = QuantType::F32;
+    }
+
+    #[test]
+    fn test_compute_calibrated_binary_risk() {
+        // Equal logits -> 0.5 probability
+        let equal = [0.0_f32, 3.5, 3.5, 0.0];
+        let score_eq = compute_calibrated_binary_risk(&equal, 1, 2).expect("equal risk");
+        assert!((score_eq.unsafe_probability - 0.5).abs() < 1e-6);
+        assert_eq!(score_eq.hazard_category, None);
+
+        // High affirmative logit relative to negative -> probability ~ 1.0 (overflow-safe)
+        let high = [0.0_f32, 1000.0, -1000.0];
+        let score_hi = compute_calibrated_binary_risk(&high, 1, 2).expect("high risk");
+        assert!(score_hi.unsafe_probability.is_finite());
+        assert!((score_hi.unsafe_probability - 1.0).abs() < 1e-6);
+
+        // Low affirmative logit relative to negative -> probability ~ 0.0
+        let low = [0.0_f32, -1000.0, 1000.0];
+        let score_lo = compute_calibrated_binary_risk(&low, 1, 2).expect("low risk");
+        assert!(score_lo.unsafe_probability.is_finite());
+        assert!(score_lo.unsafe_probability < 1e-6);
+
+        // Known log-odds difference (+2.0): sigmoid(2.0) ~= 0.880797
+        let log_odds = [1.5_f32, -0.5];
+        let score_lo2 = compute_calibrated_binary_risk(&log_odds, 0, 1).expect("sigmoid(2)");
+        assert!((score_lo2.unsafe_probability - 0.880_797_1).abs() < 1e-5);
+
+        // Error boundaries: OOB token ID, duplicate IDs, non-finite logit
+        assert!(matches!(
+            compute_calibrated_binary_risk(&equal, 1, 99),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(matches!(
+            compute_calibrated_binary_risk(&equal, 1, 1),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+        assert!(matches!(
+            compute_calibrated_binary_risk(&[f32::NAN, 1.0], 0, 1),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_shieldgemma_granite_guardian_log_odds() {
+        use jero_core::{GgufFile, QuantType, test_helpers::create_synthetic_gguf_v3};
+
+        #[derive(Debug)]
+        struct BinaryRiskStubRecipe;
+        impl ArchRecipe for BinaryRiskStubRecipe {
+            fn architecture_id(&self) -> &'static str {
+                "shieldgemma"
+            }
+
+            fn requires_kv_cache(&self) -> bool {
+                true
+            }
+
+            fn supports_quant(&self, _quant: QuantType) -> bool {
+                true
+            }
+
+            fn prefill_step(
+                &self,
+                ctx: &mut ExecutionContext<'_>,
+                _weights: &dyn ModelWeights,
+            ) -> Result<(), K3Error> {
+                let len = ctx.prompt_tokens().len();
+                let logits = ctx.logits_mut();
+                logits.fill(0.0);
+                logits[4] = 2.0; // affirmative ("Yes")
+                logits[7] = 0.0; // negative ("No")
+                ctx.advance_position(len)?;
+                Ok(())
+            }
+
+            fn decode_step(
+                &self,
+                _ctx: &mut ExecutionContext<'_>,
+                _weights: &dyn ModelWeights,
+            ) -> Result<(), K3Error> {
+                unreachable!("guardrail binary risk scoring must not run decode_step")
+            }
+        }
+
+        // 1. Verify ShieldGemma / Granite-Guardian prefill-only calibrated binary risk path
+        let bytes = create_synthetic_gguf_v3("gemma2", 32, &[]);
+        let gguf = GgufFile::parse(&bytes).expect("parse gemma2 guardrail gguf");
+        let recipe = BinaryRiskStubRecipe;
+        let mut kv_arena = SingleSlotKvArena::new(gguf.metadata(), 32).expect("kv arena");
+        let mut engine = SinglePromptEngine::new();
+        let (score, summary) = engine
+            .evaluate_prefill_binary_risk(&recipe, &gguf, &mut kv_arena, &[10, 20, 30], 16, 4, 7)
+            .expect("prefill binary risk executes");
+        assert_eq!(summary.timing.decode_steps, 0);
+        assert!(score.unsafe_probability.is_finite());
+        assert!((score.unsafe_probability - 0.880_797_1).abs() < 1e-5);
+        assert_eq!(summary.generated_tokens, vec![4]);
+
+        // 2. Verify MLCommons S1..S14 Llama-Guard parser
+        assert_eq!(parse_llamaguard_hazard("safe"), None);
+        assert_eq!(parse_llamaguard_hazard("safe\nS1"), None);
+        assert_eq!(parse_llamaguard_hazard("unsafe\nS1"), Some("S1".to_owned()));
+        assert_eq!(
+            parse_llamaguard_hazard("  UNSAFE\r\n  S14  "),
+            Some("S14".to_owned())
+        );
+        assert_eq!(parse_llamaguard_hazard("unsafe\nS0"), None);
+        assert_eq!(parse_llamaguard_hazard("unsafe\nS15"), None);
+        assert_eq!(parse_llamaguard_hazard(""), None);
     }
 }

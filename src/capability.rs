@@ -401,8 +401,8 @@ impl RecipeRegistry {
                 crate::modernbert::ModernBertRecipe::new_bert();
             return Some(&BERT);
         } else if architecture == "deberta-v3" {
-            static DEBERTA_V3: crate::modernbert::ModernBertRecipe =
-                crate::modernbert::ModernBertRecipe::new_deberta_v3();
+            static DEBERTA_V3: crate::forward::DebertaV3Recipe =
+                crate::forward::DebertaV3Recipe::new();
             return Some(&DEBERTA_V3);
         }
 
@@ -818,6 +818,24 @@ impl RecipeRegistry {
                 } else if find_tensor(meta.tensors(), "per_layer_token_embd.weight").is_some() {
                     recipe.ple_dim = Some(256);
                 }
+            }
+            return Some(Box::new(recipe));
+        }
+
+        #[cfg(feature = "jero-arch-modernbert")]
+        if arch == "deberta-v3" {
+            let mut recipe = crate::forward::DebertaV3Recipe::from_metadata(metadata);
+            if params.block_count > 0 {
+                recipe.num_layers = params.block_count;
+            }
+            if params.embedding_length > 0 {
+                recipe.hidden_dim = params.embedding_length;
+            }
+            if params.head_count > 0 {
+                recipe.n_heads = params.head_count.min(recipe.hidden_dim).max(1);
+            }
+            if recipe.n_heads > 0 && recipe.hidden_dim >= recipe.n_heads {
+                recipe.head_dim = (recipe.hidden_dim / recipe.n_heads).max(1);
             }
             return Some(Box::new(recipe));
         }

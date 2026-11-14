@@ -452,7 +452,7 @@ dependencies = [
 [[package]]
 name = "jero-kernels-rvv"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-kernels-rvv.git?branch=main#2b7eb5d7ad16eeaeae8629111652c742b3f80ae4"
+source = "git+https://github.com/LMA1980/jero-kernels-rvv.git?branch=main#6553766936dc16150b19d0b6b3c72092194c96db"
 dependencies = [
  "jero-core",
 ]
@@ -460,7 +460,7 @@ dependencies = [
 [[package]]
 name = "jero-tokenizer"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-tokenizer.git?branch=main#f0e0125eaf68f196b48ac4ea4939fc8d52ef17f1"
+source = "git+https://github.com/LMA1980/jero-tokenizer.git?branch=main#db757a622ccd48355ad251a09c98a516871e2b1d"
 dependencies = [
  "jero-core",
 ]
