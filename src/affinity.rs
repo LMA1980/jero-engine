@@ -419,6 +419,12 @@ pub fn select_phase_policy_for_arch(
     if !x100_present {
         return ClusterPhasePolicy::A100Only;
     }
+    if matches!(
+        architecture,
+        "deberta-v3" | "shieldgemma" | "granite" | "llama-guard"
+    ) {
+        return ClusterPhasePolicy::X100Only;
+    }
     if architecture.starts_with("bitnet") {
         return ClusterPhasePolicy::A100Only;
     }
@@ -2874,6 +2880,13 @@ mod tests {
             select_phase_policy_for_arch("bitnet", 128, 0xFFFF),
             ClusterPhasePolicy::A100Only
         );
+        for guardrail_arch in ["deberta-v3", "shieldgemma", "granite", "llama-guard"] {
+            assert_eq!(
+                select_phase_policy_for_arch(guardrail_arch, 32, 0xFFFF),
+                ClusterPhasePolicy::X100Only,
+                "guardrail architecture {guardrail_arch} must stay pinned to X100Only on 0xFFFF"
+            );
+        }
 
         // 3. Single-cluster fallbacks (CI hosts with 0x00FF or A100-only mask 0xFF00)
         assert_eq!(

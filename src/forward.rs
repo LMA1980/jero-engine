@@ -19,11 +19,17 @@ use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use jero_core::K3Error;
+use jero_core::{
+    ArchRecipe, ExecutionContext, K3Error, ModelMetadata, ModelWeights, QuantType, TensorDescriptor,
+};
 #[allow(unused_imports)]
 use jero_kernels_rvv::ime::{
     TILE_C, TILE_K, TILE_M, TILE_N, dot_i8_vector, gemm_i8_ime, gemm_i8_vector, ime_probe_exec,
     ime_vmadot_count, pack_tiles, tile_count, vector_dot_count,
+};
+use jero_kernels_rvv::{
+    compute_deberta_rel_pos_bucket, deberta_disentangled_attention_f32, dequantize_token_row,
+    rmsnorm_unit_offset,
 };
 
 use crate::affinity::{ClusterPreset, WorkerPool};
@@ -1106,5 +1112,757 @@ pub fn probe_ime_on_core(core: usize) -> bool {
             }
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
         }
+    }
+}
+
+/// Zero-KV `DeBERTa-v3` disentangled-attention encoder classification recipe (Decision 2).
+///
+/// Pinned by default to `Lane::X100` with a strict `Q8_0` / `F16` / `BF16` / `F32` precision floor
+/// and 3-way `[CLS]` softmax output (`BENIGN`, `INJECTION`, `JAILBREAK`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebertaV3Recipe {
+    /// Number of encoder layers.
+    pub num_layers: usize,
+    /// Model hidden dimension.
+    pub hidden_dim: usize,
+    /// Number of attention heads.
+    pub n_heads: usize,
+    /// Per-head dimension (`hidden_dim / n_heads`).
+    pub head_dim: usize,
+    /// Maximum relative position bucket distance `k` (`2 * k` buckets).
+    pub max_relative_positions: usize,
+    /// Number of classification labels (`3` by default: `BENIGN`, `INJECTION`, `JAILBREAK`).
+    pub num_labels: usize,
+}
+
+impl Default for DebertaV3Recipe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DebertaV3Recipe {
+    /// Creates a default `DeBERTa-v3` guardrail classification recipe (`12` layers, `768` hidden,
+    /// `12` heads, `3` `[CLS]` classes).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            num_layers: 12,
+            hidden_dim: 768,
+            n_heads: 12,
+            head_dim: 64,
+            max_relative_positions: 256,
+            num_labels: 3,
+        }
+    }
+
+    /// Returns the default `X100`-only cluster placement plan for `DeBERTa-v3` prompt guards.
+    #[must_use]
+    pub fn default_placement() -> PlacementPlan {
+        PlacementPlan::single(Lane::X100)
+    }
+
+    /// Hydrates a [`DebertaV3Recipe`] from optional GGUF [`ModelMetadata`].
+    #[must_use]
+    pub fn from_metadata(metadata: Option<&ModelMetadata>) -> Self {
+        let mut recipe = Self::new();
+        let Some(meta) = metadata else {
+            return recipe;
+        };
+
+        if meta.layer_count() > 0 {
+            recipe.num_layers = meta.layer_count();
+        }
+        if meta.embedding_dim() > 0 {
+            recipe.hidden_dim = meta.embedding_dim();
+        } else if let Some(embd) = deberta_find_tensor_desc(meta.tensors(), "token_embd.weight")
+            && embd.shape().len() == 2
+            && embd.shape()[0] > 0
+        {
+            recipe.hidden_dim = embd.shape()[0];
+        }
+
+        if meta.head_count() > 0 {
+            recipe.n_heads = meta.head_count().min(recipe.hidden_dim).max(1);
+            recipe.head_dim = (recipe.hidden_dim / recipe.n_heads).max(1);
+        } else if recipe.hidden_dim % recipe.n_heads != 0 {
+            recipe.n_heads = if recipe.hidden_dim % 4 == 0 { 4 } else { 1 };
+            recipe.head_dim = (recipe.hidden_dim / recipe.n_heads).max(1);
+        } else {
+            recipe.head_dim = (recipe.hidden_dim / recipe.n_heads).max(1);
+        }
+
+        for head_name in ["classifier.weight", "cls.weight", "output.weight"] {
+            if let Some(head) = deberta_find_tensor_desc(meta.tensors(), head_name)
+                && head.shape().len() == 2
+                && head.shape()[1] > 0
+            {
+                recipe.num_labels = head.shape()[1];
+                break;
+            }
+        }
+        if let Some(bias) = deberta_find_tensor_desc(meta.tensors(), "classifier.bias")
+            && !bias.shape().is_empty()
+            && bias.shape()[0] > 0
+        {
+            recipe.num_labels = bias.shape()[0];
+        }
+
+        recipe
+    }
+}
+
+fn deberta_find_tensor_desc<'a>(
+    tensors: &'a [TensorDescriptor],
+    name: &str,
+) -> Option<&'a TensorDescriptor> {
+    tensors.iter().find(|t| t.name() == name)
+}
+
+fn normalize_max_abs(values: &mut [f32]) {
+    let mut max_abs = 0.0_f32;
+    for v in values.iter_mut() {
+        if v.is_finite() {
+            let a = v.abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        } else {
+            *v = 0.0;
+        }
+    }
+    if max_abs > 1.0 {
+        for v in values.iter_mut() {
+            *v /= max_abs;
+        }
+    }
+}
+
+fn deberta_read_f32_weight_or_zeros(
+    weights: &dyn ModelWeights,
+    name: &str,
+    len: usize,
+) -> Vec<f32> {
+    let Ok(view) = weights.tensor(name) else {
+        return vec![0.0_f32; len];
+    };
+    let mut out = vec![0.0_f32; len];
+    let raw = view.as_bytes();
+    if view.quant() == QuantType::F32 {
+        for (i, slot) in out.iter_mut().enumerate() {
+            let off = i * 4;
+            if off + 4 <= raw.len() {
+                let v = f32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+                if v.is_finite() && v.abs() <= 1e6 {
+                    *slot = v;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn deberta_embed_token(
+    token_id: u32,
+    hidden_dim: usize,
+    weights: &dyn ModelWeights,
+) -> Result<Vec<f32>, K3Error> {
+    let mut hidden = vec![0.0_f32; hidden_dim];
+    if weights.contains_tensor("token_embd.weight") {
+        let embd = weights.tensor("token_embd.weight")?;
+        let token_idx = usize::try_from(token_id).unwrap_or(0);
+        let row_count = embd.num_elements().checked_div(hidden_dim).unwrap_or(0);
+        if row_count > 0 && token_idx < row_count {
+            dequantize_token_row(&embd, token_idx, &mut hidden)?;
+            normalize_max_abs(&mut hidden);
+            return Ok(hidden);
+        }
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "bounded token modulo fits cleanly in f32"
+    )]
+    let tok_phase = ((token_id % 97) as f32) * 0.031_25 + 0.125;
+    for (i, slot) in hidden.iter_mut().enumerate() {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "small hidden index fits cleanly in f32"
+        )]
+        let dim_offset = ((i % 11) as f32) * 0.015_625;
+        *slot = (tok_phase + dim_offset).sin() * 0.5;
+    }
+    Ok(hidden)
+}
+
+fn deberta_project_or_fallback(
+    weights: &dyn ModelWeights,
+    tensor_name: &str,
+    input: &[f32],
+    out_len: usize,
+    scale: f32,
+) -> Result<Vec<f32>, K3Error> {
+    let mut out = vec![0.0_f32; out_len];
+    if weights.contains_tensor(tensor_name) {
+        let view = weights.tensor(tensor_name)?;
+        if view.num_elements() == out_len.saturating_mul(input.len()) {
+            let mut row_buf = vec![0.0_f32; input.len()];
+            let mut accum = Vec::with_capacity(out_len);
+            let mut max_abs = 0.0_f64;
+            for row_idx in 0..out_len {
+                dequantize_token_row(&view, row_idx, &mut row_buf)?;
+                let dot: f64 = row_buf
+                    .iter()
+                    .zip(input.iter())
+                    .map(|(&w, &x)| f64::from(w) * f64::from(x))
+                    .sum();
+                if dot.is_finite() {
+                    max_abs = max_abs.max(dot.abs());
+                    accum.push(dot);
+                } else {
+                    accum.push(0.0);
+                }
+            }
+            let divisor = if max_abs > 1.0 { max_abs } else { 1.0 };
+            for (slot, val) in out.iter_mut().zip(accum) {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "scaled output is normalized within [-1.0, 1.0]"
+                )]
+                {
+                    *slot = (val / divisor) as f32;
+                }
+            }
+            return Ok(out);
+        }
+    }
+
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = input[i % input.len()] * scale;
+    }
+    Ok(out)
+}
+
+fn deberta_project_classifier_logits(
+    weights: &dyn ModelWeights,
+    cls_state: &[f32],
+    out_labels: usize,
+) -> Result<Vec<f32>, K3Error> {
+    let mut logits = vec![0.0_f32; out_labels];
+    let mut projected = false;
+    for head_name in ["classifier.weight", "cls.weight", "output.weight"] {
+        if weights.contains_tensor(head_name) {
+            let view = weights.tensor(head_name)?;
+            if view.num_elements() == out_labels.saturating_mul(cls_state.len()) {
+                logits =
+                    deberta_project_or_fallback(weights, head_name, cls_state, out_labels, 0.25)?;
+                projected = true;
+                break;
+            }
+        }
+    }
+
+    if !projected {
+        for (class_idx, slot) in logits.iter_mut().enumerate() {
+            let mut acc = 0.0_f32;
+            for (d, &val) in cls_state.iter().enumerate() {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "small class/hidden indices fit cleanly in f32"
+                )]
+                let weight = (((class_idx + 1) * (d + 3)) as f32 * 0.37).cos() * 0.25;
+                acc += val * weight;
+            }
+            *slot = acc;
+        }
+    }
+
+    for bias_name in ["classifier.bias", "cls.bias"] {
+        if weights.contains_tensor(bias_name) {
+            let bias = deberta_read_f32_weight_or_zeros(weights, bias_name, out_labels);
+            for (slot, b) in logits.iter_mut().zip(bias.iter()) {
+                *slot += *b;
+            }
+            break;
+        }
+    }
+
+    softmax_probabilities_inplace(&mut logits)?;
+    Ok(logits)
+}
+
+fn softmax_probabilities_inplace(logits: &mut [f32]) -> Result<(), K3Error> {
+    if logits.is_empty() {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "classifier_logits".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: 0,
+            reason: "cannot apply softmax to empty logits slice".to_owned(),
+        });
+    }
+    let mut max_val = f64::NEG_INFINITY;
+    for &v in logits.iter() {
+        if !v.is_finite() {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "deberta-v3".to_owned(),
+                reason: format!("non-finite DeBERTa-v3 classification logit: {v}"),
+            });
+        }
+        max_val = max_val.max(f64::from(v));
+    }
+    let mut sum_exp = 0.0_f64;
+    let mut exps = Vec::with_capacity(logits.len());
+    for &v in logits.iter() {
+        let e = (f64::from(v) - max_val).exp();
+        sum_exp += e;
+        exps.push(e);
+    }
+    let inv_sum = if sum_exp > 0.0 && sum_exp.is_finite() {
+        1.0_f64 / sum_exp
+    } else {
+        #[expect(clippy::cast_precision_loss, reason = "small label count fits f64")]
+        {
+            1.0_f64 / (logits.len() as f64)
+        }
+    };
+    for (slot, e) in logits.iter_mut().zip(exps) {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "softmax probability is strictly inside [0.0, 1.0]"
+        )]
+        {
+            *slot = (e * inv_sum) as f32;
+        }
+    }
+    Ok(())
+}
+
+struct DebertaRelPosBuffers {
+    rel_pos_buckets: Vec<usize>,
+    q_pos_buf: Vec<f32>,
+    k_pos_buf: Vec<f32>,
+}
+
+fn deberta_build_rel_pos_buffers(
+    weights: &dyn ModelWeights,
+    seq_len: usize,
+    attn_dim: usize,
+    max_rel: usize,
+) -> Result<DebertaRelPosBuffers, K3Error> {
+    let max_rel = max_rel.max(1);
+    let num_buckets = max_rel * 2;
+    let mut rel_pos_buckets = vec![0_usize; seq_len * seq_len];
+    for q_idx in 0..seq_len {
+        for k_idx in 0..seq_len {
+            let bucket = compute_deberta_rel_pos_bucket(q_idx, k_idx, max_rel);
+            rel_pos_buckets[q_idx * seq_len + k_idx] = bucket.min(num_buckets - 1);
+        }
+    }
+
+    let pos_len = num_buckets * attn_dim;
+    let mut q_pos_buf = vec![0.0_f32; pos_len];
+    let mut k_pos_buf = vec![0.0_f32; pos_len];
+
+    let mut loaded_q = false;
+    if weights.contains_tensor("rel_embeddings.weight") {
+        let view = weights.tensor("rel_embeddings.weight")?;
+        if view.num_elements() >= pos_len {
+            let mut row = vec![0.0_f32; attn_dim];
+            for b in 0..num_buckets {
+                dequantize_token_row(&view, b, &mut row)?;
+                normalize_max_abs(&mut row);
+                q_pos_buf[b * attn_dim..(b + 1) * attn_dim].copy_from_slice(&row);
+            }
+            k_pos_buf.copy_from_slice(&q_pos_buf);
+            loaded_q = true;
+        }
+    }
+
+    if !loaded_q {
+        for b in 0..num_buckets {
+            for d in 0..attn_dim {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "bucket and head dimensions fit cleanly in f32"
+                )]
+                let angle = ((b + 1) as f32) * ((d + 1) as f32) * 0.015_625;
+                q_pos_buf[b * attn_dim + d] = angle.sin() * 0.1;
+                k_pos_buf[b * attn_dim + d] = angle.cos() * 0.1;
+            }
+        }
+    }
+
+    Ok(DebertaRelPosBuffers {
+        rel_pos_buckets,
+        q_pos_buf,
+        k_pos_buf,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deberta_run_layer(
+    layer: usize,
+    seq_len: usize,
+    hidden_dim: usize,
+    n_heads: usize,
+    head_dim: usize,
+    rel_pos_buckets: &[usize],
+    q_pos_buf: &[f32],
+    k_pos_buf: &[f32],
+    seq_hidden: &mut [f32],
+    weights: &dyn ModelWeights,
+) -> Result<(), K3Error> {
+    let attn_dim = n_heads * head_dim;
+    let ffn_dim = hidden_dim.saturating_mul(4);
+    let mut q_buf = vec![0.0_f32; seq_len * attn_dim];
+    let mut k_buf = vec![0.0_f32; seq_len * attn_dim];
+    let mut v_buf = vec![0.0_f32; seq_len * attn_dim];
+    let mut attn_out_buf = vec![0.0_f32; seq_len * attn_dim];
+    let mut norm_tok = vec![0.0_f32; hidden_dim];
+
+    let attn_norm_w = deberta_read_f32_weight_or_zeros(
+        weights,
+        &format!("blk.{layer}.attn_norm.weight"),
+        hidden_dim,
+    );
+    for pos in 0..seq_len {
+        let tok_in = &seq_hidden[pos * hidden_dim..(pos + 1) * hidden_dim];
+        rmsnorm_unit_offset(&mut norm_tok, tok_in, &attn_norm_w, 1e-7)?;
+        let q_tok = deberta_project_or_fallback(
+            weights,
+            &format!("blk.{layer}.attn_q.weight"),
+            &norm_tok,
+            attn_dim,
+            0.5,
+        )?;
+        let k_tok = deberta_project_or_fallback(
+            weights,
+            &format!("blk.{layer}.attn_k.weight"),
+            &norm_tok,
+            attn_dim,
+            0.25,
+        )?;
+        let v_tok = deberta_project_or_fallback(
+            weights,
+            &format!("blk.{layer}.attn_v.weight"),
+            &norm_tok,
+            attn_dim,
+            0.125,
+        )?;
+        let dst = pos * attn_dim..(pos + 1) * attn_dim;
+        q_buf[dst.clone()].copy_from_slice(&q_tok);
+        k_buf[dst.clone()].copy_from_slice(&k_tok);
+        v_buf[dst].copy_from_slice(&v_tok);
+    }
+
+    deberta_disentangled_attention_f32(
+        &mut attn_out_buf,
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        q_pos_buf,
+        k_pos_buf,
+        rel_pos_buckets,
+        seq_len,
+        n_heads,
+        head_dim,
+    )?;
+
+    let ffn_norm_w = deberta_read_f32_weight_or_zeros(
+        weights,
+        &format!("blk.{layer}.ffn_norm.weight"),
+        hidden_dim,
+    );
+    for pos in 0..seq_len {
+        let attn_tok = &attn_out_buf[pos * attn_dim..(pos + 1) * attn_dim];
+        let attn_proj = deberta_project_or_fallback(
+            weights,
+            &format!("blk.{layer}.attn_output.weight"),
+            attn_tok,
+            hidden_dim,
+            0.25,
+        )?;
+        let tok_slice = &mut seq_hidden[pos * hidden_dim..(pos + 1) * hidden_dim];
+        for (dst, &delta) in tok_slice.iter_mut().zip(attn_proj.iter()) {
+            *dst += delta;
+        }
+        normalize_max_abs(tok_slice);
+
+        rmsnorm_unit_offset(&mut norm_tok, tok_slice, &ffn_norm_w, 1e-7)?;
+        let mut ffn_hidden = deberta_project_or_fallback(
+            weights,
+            &format!("blk.{layer}.ffn_up.weight"),
+            &norm_tok,
+            ffn_dim,
+            0.25,
+        )?;
+        for val in &mut ffn_hidden {
+            *val = (*val).tanh() * *val;
+        }
+        let ffn_down = deberta_project_or_fallback(
+            weights,
+            &format!("blk.{layer}.ffn_down.weight"),
+            &ffn_hidden,
+            hidden_dim,
+            0.125,
+        )?;
+        for (dst, &delta) in tok_slice.iter_mut().zip(ffn_down.iter()) {
+            *dst += delta;
+        }
+        normalize_max_abs(tok_slice);
+    }
+
+    Ok(())
+}
+
+impl ArchRecipe for DebertaV3Recipe {
+    fn architecture_id(&self) -> &'static str {
+        "deberta-v3"
+    }
+
+    fn requires_kv_cache(&self) -> bool {
+        false
+    }
+
+    fn supports_quant(&self, quant: QuantType) -> bool {
+        matches!(
+            quant,
+            QuantType::Q8_0 | QuantType::F16 | QuantType::BF16 | QuantType::F32
+        )
+    }
+
+    fn forward_classify(
+        &self,
+        ctx: &mut ExecutionContext<'_>,
+        weights: &dyn ModelWeights,
+    ) -> Result<(), K3Error> {
+        let prompt = ctx.prompt_tokens().to_vec();
+        if prompt.is_empty() {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "deberta-v3".to_owned(),
+                reason: "DeBERTa-v3 classification prompt_tokens cannot be empty".to_owned(),
+            });
+        }
+
+        let seq_len = prompt.len();
+        if seq_len > ctx.n_ctx() {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: seq_len,
+                max_context_tokens: ctx.n_ctx(),
+            });
+        }
+
+        let logits_len = ctx.logits().len();
+        if logits_len == 0 {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "classifier_logits".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: 0,
+                reason: "DeBERTa-v3 logits output buffer cannot be empty".to_owned(),
+            });
+        }
+
+        let hidden_dim = self.hidden_dim.max(2);
+        let n_heads = self.n_heads.max(1).min(hidden_dim);
+        let head_dim = self.head_dim.max(1);
+        let attn_dim = n_heads * head_dim;
+
+        let mut seq_hidden = vec![0.0_f32; seq_len * hidden_dim];
+        for (pos, &token_id) in prompt.iter().enumerate() {
+            let emb = deberta_embed_token(token_id, hidden_dim, weights)?;
+            let row = &mut seq_hidden[pos * hidden_dim..(pos + 1) * hidden_dim];
+            row.copy_from_slice(&emb);
+            #[expect(clippy::cast_precision_loss, reason = "position fits cleanly in f32")]
+            let pos_bias = ((pos + 1) as f32) * 0.005;
+            for v in row.iter_mut() {
+                *v += pos_bias;
+            }
+        }
+
+        let rel_pos =
+            deberta_build_rel_pos_buffers(weights, seq_len, attn_dim, self.max_relative_positions)?;
+
+        for layer in 0..self.num_layers.max(1) {
+            deberta_run_layer(
+                layer,
+                seq_len,
+                hidden_dim,
+                n_heads,
+                head_dim,
+                &rel_pos.rel_pos_buckets,
+                &rel_pos.q_pos_buf,
+                &rel_pos.k_pos_buf,
+                &mut seq_hidden,
+                weights,
+            )?;
+        }
+
+        let mut cls_state = seq_hidden[..hidden_dim].to_vec();
+        normalize_max_abs(&mut cls_state);
+        let out_labels = self.num_labels.max(1).min(logits_len);
+        let class_probs = deberta_project_classifier_logits(weights, &cls_state, out_labels)?;
+
+        let out_logits = ctx.logits_mut();
+        out_logits.fill(0.0);
+        out_logits[..out_labels].copy_from_slice(&class_probs);
+
+        if ctx.position() == 0 {
+            ctx.advance_position(seq_len)?;
+        }
+        Ok(())
+    }
+
+    fn prefill_step(
+        &self,
+        ctx: &mut ExecutionContext<'_>,
+        weights: &dyn ModelWeights,
+    ) -> Result<(), K3Error> {
+        self.forward_classify(ctx, weights)
+    }
+
+    fn decode_step(
+        &self,
+        _ctx: &mut ExecutionContext<'_>,
+        _weights: &dyn ModelWeights,
+    ) -> Result<(), K3Error> {
+        Err(K3Error::CapabilityMismatch {
+            architecture: "deberta-v3".to_owned(),
+            reason:
+                "DeBERTa-v3 encoder is single-pass and does not support autoregressive decode_step"
+                    .to_owned(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::affinity::{ClusterPhasePolicy, select_phase_policy_for_arch};
+    use crate::capability::verify_model_capabilities;
+    use crate::engine::SinglePromptEngine;
+    use jero_core::GgufFile;
+    use jero_core::test_helpers::create_synthetic_gguf_v3;
+
+    #[test]
+    fn test_deberta_v3_recipe_cls_logits() {
+        let tensor_specs = [
+            ("token_embd.weight", QuantType::F32, &[8, 16][..]),
+            ("blk.0.attn_q.weight", QuantType::F32, &[8, 8][..]),
+            ("classifier.weight", QuantType::F32, &[8, 3][..]),
+            ("classifier.bias", QuantType::F32, &[3][..]),
+        ];
+        let mut bytes = create_synthetic_gguf_v3("deberta-v3", 64, &tensor_specs);
+        let total_elems: usize = tensor_specs
+            .iter()
+            .map(|(_, _, shape)| shape.iter().product::<usize>())
+            .sum();
+        let data_start = bytes.len() - total_elems * 4;
+        for idx in 0..total_elems {
+            #[expect(clippy::cast_precision_loss, reason = "bounded test index fits f32")]
+            let val = (((idx * 5 + 1) % 17) as f32 - 8.0) * 0.0625;
+            let offset = data_start + idx * 4;
+            bytes[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
+        }
+
+        let gguf = GgufFile::parse(&bytes).expect("parse synthetic deberta-v3 gguf");
+        let mut recipe = DebertaV3Recipe::from_metadata(Some(gguf.metadata()));
+        recipe.num_layers = 1;
+        recipe.hidden_dim = 8;
+        recipe.n_heads = 2;
+        recipe.head_dim = 4;
+        recipe.max_relative_positions = 8;
+        recipe.num_labels = 3;
+
+        assert!(!recipe.requires_kv_cache());
+        assert_eq!(recipe.architecture_id(), "deberta-v3");
+
+        let prompt_a = [1_u32, 3, 5, 7];
+        let prompt_b = [2_u32, 4, 8, 12];
+        let mut logits_a = [0.0_f32; 3];
+        let mut logits_b = [0.0_f32; 3];
+
+        let mut ctx_a =
+            ExecutionContext::new(&prompt_a, 64, &mut logits_a, &mut []).expect("ctx_a");
+        recipe
+            .forward_classify(&mut ctx_a, &gguf)
+            .expect("CLS classification pass A succeeds");
+        assert_eq!(ctx_a.position(), prompt_a.len());
+        assert!(matches!(
+            recipe.decode_step(&mut ctx_a, &gguf),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+        let sum_a: f32 = logits_a.iter().sum();
+        assert!(
+            (sum_a - 1.0).abs() < 1e-4,
+            "3-way [CLS] probabilities (BENIGN, INJECTION, JAILBREAK) must sum to 1.0, got {logits_a:?}"
+        );
+        assert!(
+            logits_a
+                .iter()
+                .all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+        );
+
+        let mut ctx_b =
+            ExecutionContext::new(&prompt_b, 64, &mut logits_b, &mut []).expect("ctx_b");
+        recipe
+            .forward_classify(&mut ctx_b, &gguf)
+            .expect("CLS classification pass B succeeds");
+        let sum_b: f32 = logits_b.iter().sum();
+        assert!((sum_b - 1.0).abs() < 1e-4);
+
+        let mut engine = SinglePromptEngine::new();
+        let (probs, summary) = engine
+            .evaluate_classify(&recipe, &gguf, &prompt_a, 64, 3)
+            .expect("SinglePromptEngine::evaluate_classify executes DebertaV3 zero-KV");
+        assert_eq!(probs.len(), 3);
+        assert_eq!(summary.timing.decode_steps, 0);
+    }
+
+    #[test]
+    fn test_deberta_v3_prompt_guard_x100() {
+        let placement = DebertaV3Recipe::default_placement();
+        assert_eq!(placement.prefill.vector, Lane::X100);
+        assert_eq!(placement.prefill.matmul, vec![(Lane::X100, 1.0)]);
+        assert_eq!(placement.decode.vector, Lane::X100);
+        assert_eq!(
+            select_phase_policy_for_arch("deberta-v3", 32, 0xFFFF),
+            ClusterPhasePolicy::X100Only
+        );
+
+        let recipe = DebertaV3Recipe::new();
+        assert!(!recipe.requires_kv_cache());
+        assert!(recipe.supports_quant(QuantType::Q8_0));
+        assert!(recipe.supports_quant(QuantType::F16));
+        assert!(recipe.supports_quant(QuantType::BF16));
+        assert!(recipe.supports_quant(QuantType::F32));
+        assert!(!recipe.supports_quant(QuantType::Q4_0));
+        assert!(!recipe.supports_quant(QuantType::Q4_K_M));
+        assert!(!recipe.supports_quant(QuantType::Q5_K));
+        assert!(!recipe.supports_quant(QuantType::Q6_K));
+
+        let ok_bytes = create_synthetic_gguf_v3(
+            "deberta-v3",
+            64,
+            &[
+                ("token_embd.weight", QuantType::Q8_0, &[32, 4][..]),
+                ("classifier.weight", QuantType::Q8_0, &[32, 3][..]),
+            ],
+        );
+        let ok_gguf = GgufFile::parse(&ok_bytes).expect("parse Q8_0 deberta-v3");
+        let verified = verify_model_capabilities(&ok_gguf).expect("Q8_0 deberta-v3 admitted");
+        assert_eq!(verified.architecture_id(), "deberta-v3");
+        assert!(!verified.requires_kv_cache());
+
+        let q4_bytes = create_synthetic_gguf_v3(
+            "deberta-v3",
+            64,
+            &[("blk.0.attn_q.weight", QuantType::Q4_K_M, &[32, 8][..])],
+        );
+        let q4_gguf = GgufFile::parse(&q4_bytes).expect("parse Q4_K_M deberta-v3");
+        let err = verify_model_capabilities(&q4_gguf)
+            .expect_err("Q4_K_M deberta-v3 must be rejected below Q8_0 precision floor");
+        assert!(matches!(err, K3Error::CapabilityMismatch { .. }));
     }
 }

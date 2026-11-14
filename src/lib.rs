@@ -39,9 +39,10 @@ pub use certification::{
     verify_prompt_sensitivity,
 };
 pub use engine::{
-    EnginePhase, EvaluationSummary, FsmDecisionConstraint, PassTiming, SinglePromptEngine,
-    StreamAction, apply_fsm_logit_mask, execute_jump_forward_prefill, harvest_decision_logprobs,
-    infer_logits_buffer_len, sample_greedy_argmax,
+    CalibratedGuardrailScore, EnginePhase, EvaluationSummary, FsmDecisionConstraint, PassTiming,
+    SinglePromptEngine, StreamAction, apply_fsm_logit_mask, compute_calibrated_binary_risk,
+    execute_jump_forward_prefill, harvest_decision_logprobs, infer_logits_buffer_len,
+    parse_llamaguard_hazard, sample_greedy_argmax,
 };
 pub use jero_core as k3_core;
 pub use jero_core::{
@@ -95,6 +96,7 @@ pub use gemma::{
     gemma_norm_lane, select_top_k_experts,
 };
 
+pub use forward::DebertaV3Recipe;
 #[cfg(feature = "jero-arch-modernbert")]
 pub use modernbert as arch_modernbert;
 #[cfg(feature = "jero-arch-modernbert")]
