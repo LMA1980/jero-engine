@@ -16,6 +16,8 @@ pub mod kv;
 pub mod memory;
 #[cfg(feature = "jero-arch-modernbert")]
 pub mod modernbert;
+#[cfg(feature = "jero-kernels-rvv")]
+pub mod qwen_deepseek;
 pub mod weights;
 pub mod worker;
 pub use worker as jero_worker;
@@ -57,9 +59,10 @@ pub use memory::{
     DEFAULT_PAGE_SIZE, DORY_DEFAULT_SLIDING_WINDOW, KV_BLOCK_SIZE, LayerKvPolicy, MemoryFootprint,
     MemoryInspector, MockMemoryInspector, SystemMemoryInspector, architecture_requires_kv_cache,
     calculate_footprint, calculate_footprint_with_slots, check_memory_admission,
-    check_memory_admission_with, check_memory_admission_with_slots, estimate_dory_kv_cache_bytes,
-    estimate_hybrid_kv_cache_bytes, estimate_kv_cache_bytes, gemma_layer_kv_policies,
-    system_page_size,
+    check_memory_admission_for_weight_bytes, check_memory_admission_with,
+    check_memory_admission_with_slots, estimate_dory_kv_cache_bytes,
+    estimate_hybrid_kv_cache_bytes, estimate_kv_cache_bytes, estimate_mla_kv_cache_bytes,
+    gemma_layer_kv_policies, system_page_size,
 };
 pub use weights::LockedModelWeights;
 
@@ -101,6 +104,11 @@ pub use forward::DebertaV3Recipe;
 pub use modernbert as arch_modernbert;
 #[cfg(feature = "jero-arch-modernbert")]
 pub use modernbert::ModernBertRecipe;
+#[cfg(feature = "jero-kernels-rvv")]
+pub use qwen_deepseek::{
+    DeepSeek2MlaConfig, DeepSeek2Recipe, Qwen2Recipe, Qwen3MoeRecipe, Qwen3Recipe, Qwen35MoeRecipe,
+    Qwen35Recipe,
+};
 
 #[cfg(feature = "jero-arch-synthetic")]
 pub use jero_arch_synthetic;

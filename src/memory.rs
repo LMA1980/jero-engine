@@ -352,6 +352,97 @@ pub const fn architecture_requires_kv_cache(arch: &str) -> bool {
 }
 
 /// Computes the raw unaligned KV cache size in bytes across `slots` concurrency slots.
+fn estimate_gemma_raw_kv_bytes(
+    metadata: &ModelMetadata,
+    blocks_per_slot: usize,
+    slots: usize,
+) -> Result<usize, K3Error> {
+    let per_slot_tokens =
+        blocks_per_slot
+            .checked_mul(KV_BLOCK_SIZE)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "per-slot kv allocated tokens overflow usize".to_owned(),
+            })?;
+    let layer_count = metadata.layer_count().max(1);
+    let head_count_kv = metadata.head_count_kv().max(1);
+    let head_dim = if metadata.head_count() > 0 {
+        metadata.embedding_dim() / metadata.head_count()
+    } else {
+        metadata.embedding_dim()
+    }
+    .max(1);
+    let policy_arch = if metadata.architecture() == "functiongemma" {
+        "gemma3"
+    } else {
+        metadata.architecture()
+    };
+    let policies = gemma_layer_kv_policies(policy_arch, layer_count, None);
+    let single_slot_gemma_bytes =
+        estimate_hybrid_kv_cache_bytes(per_slot_tokens, head_count_kv, head_dim, &policies)?;
+    single_slot_gemma_bytes
+        .checked_mul(slots)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "gemma multi-slot kv bytes calculation overflowed usize".to_owned(),
+        })
+}
+
+fn estimate_mla_raw_kv_bytes(
+    metadata: &ModelMetadata,
+    blocks_per_slot: usize,
+    slots: usize,
+) -> Result<usize, K3Error> {
+    let kv_allocated_tokens = blocks_per_slot
+        .checked_mul(slots)
+        .and_then(|blocks| blocks.checked_mul(KV_BLOCK_SIZE))
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "mla kv allocated tokens calculation overflowed usize".to_owned(),
+        })?;
+    let layer_count = metadata.layer_count().max(1);
+    let kv_lora_rank = metadata.kv_lora_rank().unwrap_or(512).max(1);
+    let qk_rope_head_dim = metadata.qk_rope_head_dim().unwrap_or(64).max(1);
+    let kv_latent_dim =
+        kv_lora_rank
+            .checked_add(qk_rope_head_dim)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "mla kv_latent_dim calculation overflowed usize".to_owned(),
+            })?;
+    let total_elements = kv_allocated_tokens
+        .checked_mul(layer_count)
+        .and_then(|v| v.checked_mul(kv_latent_dim))
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "mla total kv elements calculation overflowed usize".to_owned(),
+        })?;
+    total_elements
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "mla raw kv bytes calculation overflowed usize".to_owned(),
+        })
+}
+
 fn estimate_raw_kv_bytes_for_slots(
     metadata: &ModelMetadata,
     n_ctx: usize,
@@ -375,40 +466,11 @@ fn estimate_raw_kv_bytes_for_slots(
         metadata.architecture(),
         "gemma2" | "gemma3" | "gemma4" | "functiongemma"
     ) {
-        let per_slot_tokens = blocks_per_slot.checked_mul(KV_BLOCK_SIZE).ok_or_else(|| {
-            K3Error::TensorBoundsError {
-                tensor_name: "kv_cache".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: usize::MAX,
-                reason: "per-slot kv allocated tokens overflow usize".to_owned(),
-            }
-        })?;
-        let layer_count = metadata.layer_count().max(1);
-        let head_count_kv = metadata.head_count_kv().max(1);
-        let head_dim = if metadata.head_count() > 0 {
-            metadata.embedding_dim() / metadata.head_count()
-        } else {
-            metadata.embedding_dim()
-        }
-        .max(1);
-        let policy_arch = if metadata.architecture() == "functiongemma" {
-            "gemma3"
-        } else {
-            metadata.architecture()
-        };
-        let policies = gemma_layer_kv_policies(policy_arch, layer_count, None);
-        let single_slot_gemma_bytes =
-            estimate_hybrid_kv_cache_bytes(per_slot_tokens, head_count_kv, head_dim, &policies)?;
-        return single_slot_gemma_bytes.checked_mul(slots).ok_or_else(|| {
-            K3Error::TensorBoundsError {
-                tensor_name: "kv_cache".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: usize::MAX,
-                reason: "gemma multi-slot kv bytes calculation overflowed usize".to_owned(),
-            }
-        });
+        return estimate_gemma_raw_kv_bytes(metadata, blocks_per_slot, slots);
+    }
+
+    if metadata.architecture() == "deepseek2" || metadata.kv_lora_rank().is_some() {
+        return estimate_mla_raw_kv_bytes(metadata, blocks_per_slot, slots);
     }
 
     let kv_allocated_tokens = blocks_per_slot
@@ -463,6 +525,62 @@ fn estimate_raw_kv_bytes_for_slots(
         })
 }
 
+/// Estimates page-aligned single-slot `Multi-Head Latent Attention` (`MLA`) KV cache bytes
+/// for `deepseek2` checkpoints caching compressed latent vectors (`kv_lora_rank + qk_rope_head_dim`)
+/// per token per layer (Decision 1).
+///
+/// # Errors
+///
+/// Returns [`K3Error::CapabilityMismatch`] if any dimension argument is zero, or
+/// [`K3Error::TensorBoundsError`] if the byte calculation overflows `usize`.
+pub fn estimate_mla_kv_cache_bytes(
+    n_ctx: usize,
+    num_layers: usize,
+    kv_lora_rank: usize,
+    qk_rope_head_dim: usize,
+) -> Result<usize, K3Error> {
+    if n_ctx == 0 || num_layers == 0 || kv_lora_rank == 0 || qk_rope_head_dim == 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "deepseek2".to_owned(),
+            reason: format!(
+                "MLA KV cache dimensions must all be > 0 (got n_ctx={n_ctx}, num_layers={num_layers}, kv_lora_rank={kv_lora_rank}, qk_rope_head_dim={qk_rope_head_dim})"
+            ),
+        });
+    }
+    let allocated_tokens = n_ctx
+        .div_ceil(KV_BLOCK_SIZE)
+        .checked_mul(KV_BLOCK_SIZE)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "mla kv allocated tokens overflowed usize".to_owned(),
+        })?;
+    let kv_latent_dim =
+        kv_lora_rank
+            .checked_add(qk_rope_head_dim)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "mla kv_latent_dim overflowed usize".to_owned(),
+            })?;
+    let raw_bytes = allocated_tokens
+        .checked_mul(num_layers)
+        .and_then(|v| v.checked_mul(kv_latent_dim))
+        .and_then(|v| v.checked_mul(size_of::<f32>()))
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "mla raw kv bytes overflowed usize".to_owned(),
+        })?;
+    Ok(align_up(raw_bytes, system_page_size()))
+}
+
 /// Estimates page-aligned single-slot KV cache bytes for `metadata` and `n_ctx`.
 ///
 /// Returns `Ok(0)` without reserving KV cache pages when `requires_kv_cache` is `false`
@@ -508,6 +626,15 @@ pub fn calculate_footprint_with_slots(
     n_ctx: usize,
     active_slots: usize,
 ) -> Result<MemoryFootprint, K3Error> {
+    calculate_footprint_inner(metadata, metadata.total_weight_bytes(), n_ctx, active_slots)
+}
+
+fn calculate_footprint_inner(
+    metadata: &ModelMetadata,
+    weight_bytes_raw: usize,
+    n_ctx: usize,
+    active_slots: usize,
+) -> Result<MemoryFootprint, K3Error> {
     if n_ctx == 0 {
         return Err(K3Error::CapabilityMismatch {
             architecture: metadata.architecture().to_owned(),
@@ -525,7 +652,6 @@ pub fn calculate_footprint_with_slots(
     let page_size = system_page_size();
 
     // 1. Model weights footprint (page-aligned)
-    let weight_bytes_raw = metadata.total_weight_bytes();
     let weight_bytes_aligned = align_up(weight_bytes_raw, page_size);
     let weight_bytes =
         u64::try_from(weight_bytes_aligned).map_err(|_| K3Error::TensorBoundsError {
@@ -774,18 +900,10 @@ pub fn check_memory_admission_with<I: MemoryInspector>(
     check_memory_admission_with_slots(metadata, n_ctx, 1, inspector)
 }
 
-/// Verifies pre-flight memory admission accounting for active concurrency slots using a customized inspector.
-///
-/// # Errors
-///
-/// Returns [`K3Error::InsufficientLockableMemory`] if required footprint exceeds lockable limits.
-pub fn check_memory_admission_with_slots<I: MemoryInspector>(
-    metadata: &ModelMetadata,
-    n_ctx: usize,
-    active_slots: usize,
+fn check_footprint_against_inspector<I: MemoryInspector>(
+    footprint: MemoryFootprint,
     inspector: &I,
 ) -> Result<MemoryFootprint, K3Error> {
-    let footprint = calculate_footprint_with_slots(metadata, n_ctx, active_slots)?;
     let available_bytes = inspector.available_memory_bytes()?;
     let rlimit_memlock_bytes = inspector.rlimit_memlock_bytes()?;
 
@@ -802,6 +920,39 @@ pub fn check_memory_admission_with_slots<I: MemoryInspector>(
     }
 
     Ok(footprint)
+}
+
+/// Verifies pre-flight memory admission accounting for active concurrency slots using a customized inspector.
+///
+/// # Errors
+///
+/// Returns [`K3Error::InsufficientLockableMemory`] if required footprint exceeds lockable limits.
+pub fn check_memory_admission_with_slots<I: MemoryInspector>(
+    metadata: &ModelMetadata,
+    n_ctx: usize,
+    active_slots: usize,
+    inspector: &I,
+) -> Result<MemoryFootprint, K3Error> {
+    let footprint = calculate_footprint_with_slots(metadata, n_ctx, active_slots)?;
+    check_footprint_against_inspector(footprint, inspector)
+}
+
+/// Verifies pre-flight single-slot memory admission using an explicit raw weight size override
+/// (for checking large production profiles such as `Qwen3-30B-A3B` without materializing multi-GiB
+/// files in constrained test environments).
+///
+/// # Errors
+///
+/// Returns [`K3Error::InsufficientLockableMemory`] if the footprint exceeds lockable limits, or
+/// [`K3Error::ContextLengthExceeded`] / [`K3Error::CapabilityMismatch`] on invalid context bounds.
+pub fn check_memory_admission_for_weight_bytes<I: MemoryInspector>(
+    metadata: &ModelMetadata,
+    weight_bytes_raw: usize,
+    n_ctx: usize,
+    inspector: &I,
+) -> Result<MemoryFootprint, K3Error> {
+    let footprint = calculate_footprint_inner(metadata, weight_bytes_raw, n_ctx, 1)?;
+    check_footprint_against_inspector(footprint, inspector)
 }
 
 #[cfg(test)]
@@ -1022,6 +1173,97 @@ mod tests {
         assert_eq!(
             estimate_dory_kv_cache_bytes(mlp_model.metadata(), 512, None, None).unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn test_tied_embedding_footprint_admission() {
+        use jero_core::GgufValue;
+        use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
+
+        let qwen3_kvs = [
+            ("qwen3.block_count", GgufValue::Uint32(4)),
+            ("qwen3.embedding_length", GgufValue::Uint32(64)),
+            ("qwen3.attention.head_count", GgufValue::Uint32(4)),
+            ("qwen3.attention.head_count_kv", GgufValue::Uint32(2)),
+        ];
+        // Tied checkpoint omits output.weight and carries only token_embd.weight.
+        let tied_specs = [("token_embd.weight", QuantType::F32, &[64, 16][..])];
+        let tied_bytes = create_synthetic_gguf_v3_with_kvs("qwen3", 64, &qwen3_kvs, &tied_specs);
+        let tied_model = GgufFile::parse(&tied_bytes).expect("parse tied qwen3 gguf");
+        assert!(tied_model.metadata().has_tied_embeddings());
+
+        // Untied checkpoint duplicates output.weight with the same shape.
+        let untied_specs = [
+            ("token_embd.weight", QuantType::F32, &[64, 16][..]),
+            ("output.weight", QuantType::F32, &[64, 16][..]),
+        ];
+        let untied_bytes =
+            create_synthetic_gguf_v3_with_kvs("qwen3", 64, &qwen3_kvs, &untied_specs);
+        let untied_model = GgufFile::parse(&untied_bytes).expect("parse untied qwen3 gguf");
+        assert!(!untied_model.metadata().has_tied_embeddings());
+
+        let page_size = system_page_size();
+        let expected_tied_weights = u64::try_from(align_up(64 * 16 * 4, page_size)).unwrap();
+        let tied_fp = calculate_footprint(tied_model.metadata(), 32).expect("tied footprint");
+        let untied_fp = calculate_footprint(untied_model.metadata(), 32).expect("untied footprint");
+
+        assert_eq!(tied_fp.weight_bytes, expected_tied_weights);
+        assert_eq!(
+            tied_model.metadata().total_weight_bytes(),
+            64 * 16 * size_of::<f32>()
+        );
+        assert_eq!(
+            untied_model.metadata().total_weight_bytes(),
+            2 * 64 * 16 * size_of::<f32>()
+        );
+        assert_eq!(tied_fp.kv_bytes, untied_fp.kv_bytes);
+        assert!(tied_fp.total_required_bytes <= untied_fp.total_required_bytes);
+    }
+
+    #[test]
+    fn test_deepseek2_mla_kv_admission_reduction() {
+        use jero_core::GgufValue;
+        use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
+
+        // DeepSeek-V2-Lite profile: 27 layers, 16 heads, head_dim=128 uncompressed vs
+        // MLA latent dim = kv_lora_rank(512) + qk_rope_head_dim(64) = 576 floats/token/layer.
+        let mla_bytes = estimate_mla_kv_cache_bytes(4096, 27, 512, 64).expect("mla kv bytes");
+
+        let ds_kvs = [
+            ("deepseek2.block_count", GgufValue::Uint32(27)),
+            ("deepseek2.embedding_length", GgufValue::Uint32(2048)),
+            ("deepseek2.attention.head_count", GgufValue::Uint32(16)),
+            ("deepseek2.attention.head_count_kv", GgufValue::Uint32(16)),
+            ("deepseek2.attention.kv_lora_rank", GgufValue::Uint32(512)),
+            ("deepseek2.rope.dimension_count", GgufValue::Uint32(64)),
+            ("deepseek2.context_length", GgufValue::Uint32(4096)),
+        ];
+        let ds_bytes = create_synthetic_gguf_v3_with_kvs("deepseek2", 4096, &ds_kvs, &[]);
+        let ds_model = GgufFile::parse(&ds_bytes).expect("parse deepseek2 gguf");
+
+        let meta_kv_bytes =
+            estimate_kv_cache_bytes(ds_model.metadata(), 4096, true).expect("meta mla kv bytes");
+        assert_eq!(meta_kv_bytes, mla_bytes);
+
+        let gqa_kvs = [
+            ("llama.block_count", GgufValue::Uint32(27)),
+            ("llama.embedding_length", GgufValue::Uint32(2048)),
+            ("llama.attention.head_count", GgufValue::Uint32(16)),
+            ("llama.attention.head_count_kv", GgufValue::Uint32(16)),
+            ("llama.attention.key_length", GgufValue::Uint32(128)),
+            ("llama.context_length", GgufValue::Uint32(4096)),
+        ];
+        let gqa_bytes = create_synthetic_gguf_v3_with_kvs("llama", 4096, &gqa_kvs, &[]);
+        let gqa_model = GgufFile::parse(&gqa_bytes).expect("parse uncompressed baseline");
+        let uncompressed_bytes =
+            estimate_kv_cache_bytes(gqa_model.metadata(), 4096, true).expect("gqa kv bytes");
+
+        // 576 / (2 * 16 * 128 = 4096) = 14.0625%, i.e., ~85.9% reduction (>85% saved).
+        assert!(mla_bytes * 100 <= uncompressed_bytes * 15);
+        assert!(
+            estimate_mla_kv_cache_bytes(0, 27, 512, 64).is_err(),
+            "zero n_ctx must fail closed"
         );
     }
 }

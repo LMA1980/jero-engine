@@ -50,6 +50,11 @@ pub use crate::gemma::{
 #[cfg(feature = "jero-arch-modernbert")]
 pub use crate::modernbert::ModernBertRecipe;
 
+pub use crate::qwen_deepseek::{
+    DeepSeek2MlaConfig, DeepSeek2Recipe, Qwen2Recipe, Qwen3MoeRecipe, Qwen3Recipe, Qwen35MoeRecipe,
+    Qwen35Recipe,
+};
+
 /// Canonical vocabulary size for `Dory1.0-4B` parallel LM head row-split (`131,072`).
 pub const DORY_VOCAB_SIZE: usize = 131_072;
 

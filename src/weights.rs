@@ -402,25 +402,42 @@ impl LockedModelWeights {
 
 impl ModelWeights for LockedModelWeights {
     fn tensor(&self, name: &str) -> Result<TensorView<'_>, K3Error> {
-        let &idx = self
-            .tensor_index
-            .get(name)
-            .ok_or_else(|| K3Error::TensorBoundsError {
-                tensor_name: name.to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: self.len,
-                reason: format!("tensor '{name}' not found in locked model weights"),
-            })?;
+        if let Some(&idx) = self.tensor_index.get(name) {
+            let desc: &TensorDescriptor = &self.metadata.tensors()[idx];
+            return TensorView::from_bytes(
+                desc.name(),
+                desc.quant(),
+                desc.shape(),
+                desc.absolute_offset(),
+                self.as_bytes(),
+            );
+        }
 
-        let desc: &TensorDescriptor = &self.metadata.tensors()[idx];
-        TensorView::from_bytes(
-            desc.name(),
-            desc.quant(),
-            desc.shape(),
-            desc.absolute_offset(),
-            self.as_bytes(),
-        )
+        // Tied-embedding fallback (ADR-023 / Qwen2 / Qwen3 / Qwen3.5): when `output.weight`
+        // is absent from an autoregressive (non-BitNet) GGUF, alias `token_embd.weight`
+        // zero-copy over the already-locked byte range without doubling mlock residency.
+        if name == "output.weight"
+            && crate::memory::architecture_requires_kv_cache(self.metadata.architecture())
+            && !self.metadata.architecture().starts_with("bitnet")
+            && let Some(&emb_idx) = self.tensor_index.get("token_embd.weight")
+        {
+            let desc: &TensorDescriptor = &self.metadata.tensors()[emb_idx];
+            return TensorView::from_bytes(
+                "output.weight",
+                desc.quant(),
+                desc.shape(),
+                desc.absolute_offset(),
+                self.as_bytes(),
+            );
+        }
+
+        Err(K3Error::TensorBoundsError {
+            tensor_name: name.to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: self.len,
+            reason: format!("tensor '{name}' not found in locked model weights"),
+        })
     }
 
     fn tensor_count(&self) -> usize {
@@ -533,5 +550,90 @@ mod tests {
 
         drop(locked);
         let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_weights_tied_embedding_lookup() {
+        let tensor_specs = [("token_embd.weight", QuantType::F32, &[4, 8][..])];
+        let qwen2_bytes = create_synthetic_gguf_v3("qwen2", 32, &tensor_specs);
+        let bitnet_bytes = create_synthetic_gguf_v3("bitnet", 32, &tensor_specs);
+
+        let temp_dir = std::env::temp_dir();
+        let qwen2_path = temp_dir.join(format!("test_tied_qwen2_{}.gguf", std::process::id()));
+        let bitnet_path = temp_dir.join(format!("test_tied_bitnet_{}.gguf", std::process::id()));
+        std::fs::write(&qwen2_path, &qwen2_bytes).expect("write qwen2 temp model");
+        std::fs::write(&bitnet_path, &bitnet_bytes).expect("write bitnet temp model");
+
+        let locked_qwen2 = LockedModelWeights::open(&qwen2_path).expect("open tied qwen2 model");
+        let emb = locked_qwen2
+            .tensor("token_embd.weight")
+            .expect("token_embd.weight");
+        let out = locked_qwen2
+            .tensor("output.weight")
+            .expect("tied output.weight should alias token_embd.weight");
+        assert!(locked_qwen2.contains_tensor("output.weight"));
+        assert_eq!(out.name(), "output.weight");
+        assert_eq!(out.quant(), emb.quant());
+        assert_eq!(out.shape(), emb.shape());
+        assert_eq!(out.offset(), emb.offset());
+        assert_eq!(out.byte_len(), emb.byte_len());
+        assert_eq!(locked_qwen2.total_weight_bytes(), emb.byte_len());
+
+        let locked_bitnet = LockedModelWeights::open(&bitnet_path).expect("open bitnet model");
+        assert!(
+            locked_bitnet.tensor("output.weight").is_err(),
+            "bitnet must not alias output.weight to token_embd.weight"
+        );
+
+        drop(locked_qwen2);
+        drop(locked_bitnet);
+        let _ = std::fs::remove_file(&qwen2_path);
+        let _ = std::fs::remove_file(&bitnet_path);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_tied_output_weight_zero_copy_alias() {
+        let tied_specs = [("token_embd.weight", QuantType::F32, &[16, 4][..])];
+        let tied_bytes = create_synthetic_gguf_v3("qwen3", 32, &tied_specs);
+
+        let untied_specs = [
+            ("token_embd.weight", QuantType::F32, &[16, 4][..]),
+            ("output.weight", QuantType::F32, &[16, 4][..]),
+        ];
+        let untied_bytes = create_synthetic_gguf_v3("qwen3", 32, &untied_specs);
+
+        let temp_dir = std::env::temp_dir();
+        let tied_path = temp_dir.join(format!("test_tied_alias_{}.gguf", std::process::id()));
+        let untied_path = temp_dir.join(format!("test_untied_alias_{}.gguf", std::process::id()));
+        std::fs::write(&tied_path, &tied_bytes).expect("write tied model");
+        std::fs::write(&untied_path, &untied_bytes).expect("write untied model");
+
+        let tied = LockedModelWeights::open(&tied_path).expect("open tied model");
+        let tied_emb = tied.tensor("token_embd.weight").expect("token_embd.weight");
+        let tied_out = tied.tensor("output.weight").expect("aliased output.weight");
+        assert_eq!(tied_out.as_bytes().as_ptr(), tied_emb.as_bytes().as_ptr());
+        assert_eq!(tied_out.as_bytes(), tied_emb.as_bytes());
+        assert!(tied.metadata().has_tied_embeddings());
+
+        let untied = LockedModelWeights::open(&untied_path).expect("open untied model");
+        let untied_emb = untied
+            .tensor("token_embd.weight")
+            .expect("token_embd.weight");
+        let untied_out = untied
+            .tensor("output.weight")
+            .expect("explicit output.weight");
+        assert_ne!(
+            untied_out.as_bytes().as_ptr(),
+            untied_emb.as_bytes().as_ptr()
+        );
+        assert_ne!(untied_out.offset(), untied_emb.offset());
+        assert!(!untied.metadata().has_tied_embeddings());
+
+        drop(tied);
+        drop(untied);
+        let _ = std::fs::remove_file(&tied_path);
+        let _ = std::fs::remove_file(&untied_path);
     }
 }
