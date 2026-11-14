@@ -160,7 +160,12 @@ fn test_challenge_arena_header_backward_and_forward_compatibility() {
         num_experts: 8,
         num_experts_per_tok: 2,
         derived_weights_offset: 131_072,
-        _reserved: [0xAA; 24],
+        _reserved: {
+            // Byte 0 encodes KvDtype (`0 = F32`); bytes 1..24 remain reserved padding.
+            let mut reserved = [0xAA; 24];
+            reserved[0] = 0;
+            reserved
+        },
     };
 
     let bytes = hdr.as_bytes();

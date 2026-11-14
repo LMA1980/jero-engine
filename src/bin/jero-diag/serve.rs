@@ -970,7 +970,7 @@ fn format_chat_messages(
     if tmpl.contains("<|im_start|>")
         || matches!(
             arch_name,
-            "qwen2" | "qwen3" | "qwen3moe" | "qwen35" | "qwen35moe" | "dory"
+            "qwen2" | "qwen3" | "qwen3moe" | "qwen35" | "qwen35moe" | "dory" | "lfm2" | "lfm2moe"
         )
     {
         let mut buf = String::new();

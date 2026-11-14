@@ -35,7 +35,7 @@ const QUANT_SUPPORTED: &[QuantType] = &[
     QuantType::IQ4_NL,
 ];
 
-const fn is_supported_quant(quant: QuantType) -> bool {
+pub(crate) const fn is_supported_quant(quant: QuantType) -> bool {
     matches!(
         quant,
         QuantType::F32
@@ -55,7 +55,7 @@ const fn is_supported_quant(quant: QuantType) -> bool {
     )
 }
 
-const fn even_head_dim(raw: usize) -> usize {
+pub(crate) const fn even_head_dim(raw: usize) -> usize {
     let clamped = if raw < 2 { 2 } else { raw };
     if clamped % 2 == 0 {
         clamped
@@ -65,10 +65,10 @@ const fn even_head_dim(raw: usize) -> usize {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct GqaHeadDims {
-    n_heads_q: usize,
-    n_heads_kv: usize,
-    head_dim: usize,
+pub(crate) struct GqaHeadDims {
+    pub(crate) n_heads_q: usize,
+    pub(crate) n_heads_kv: usize,
+    pub(crate) head_dim: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -488,7 +488,7 @@ impl Qwen35MoeRecipe {
     }
 }
 
-fn read_f32_weight_or_default(
+pub(crate) fn read_f32_weight_or_default(
     weights: &dyn ModelWeights,
     name: &str,
     len: usize,
@@ -518,7 +518,7 @@ fn read_f32_weight_or_default(
     out
 }
 
-fn rmsnorm_standard(
+pub(crate) fn rmsnorm_standard(
     output: &mut [f32],
     input: &[f32],
     weight: &[f32],
@@ -555,7 +555,7 @@ fn apply_per_head_standard_rmsnorm(
     Ok(())
 }
 
-fn embed_token(
+pub(crate) fn embed_token(
     token_id: u32,
     hidden_dim: usize,
     weights: &dyn ModelWeights,
@@ -581,7 +581,7 @@ fn embed_token(
     Ok(hidden)
 }
 
-fn project_lm_head(
+pub(crate) fn project_lm_head(
     weights: &dyn ModelWeights,
     normed_final: &[f32],
     logits: &mut [f32],
@@ -631,7 +631,7 @@ fn project_lm_head(
     Ok(())
 }
 
-fn add_bias_if_present(target: &mut [f32], weights: &dyn ModelWeights, bias_name: &str) {
+pub(crate) fn add_bias_if_present(target: &mut [f32], weights: &dyn ModelWeights, bias_name: &str) {
     if weights.contains_tensor(bias_name) {
         let bias = read_f32_weight_or_default(weights, bias_name, target.len(), 0.0);
         for (dst, &b) in target.iter_mut().zip(bias.iter()) {
@@ -640,13 +640,14 @@ fn add_bias_if_present(target: &mut [f32], weights: &dyn ModelWeights, bias_name
     }
 }
 
-fn run_gqa_causal_with_cache(
+pub(crate) fn run_gqa_causal_with_cache_scaled(
     q: &[f32],
     k: &[f32],
     v: &[f32],
     layer_kv: &mut [f32],
     pos: usize,
     dims: GqaHeadDims,
+    attn_scale_override: Option<f32>,
 ) -> Result<Vec<f32>, K3Error> {
     let q_dim = q.len();
     let kv_dim = k.len();
@@ -654,7 +655,7 @@ fn run_gqa_causal_with_cache(
         clippy::cast_precision_loss,
         reason = "head_dim fits comfortably in f32"
     )]
-    let scale = 1.0_f32 / (dims.head_dim as f32).sqrt();
+    let scale = attn_scale_override.unwrap_or_else(|| 1.0_f32 / (dims.head_dim as f32).sqrt());
     let mut attn_out = vec![0.0_f32; q_dim];
 
     let capacity_slots = layer_kv.len().checked_div(2 * kv_dim.max(1)).unwrap_or(0);
@@ -692,7 +693,7 @@ fn run_gqa_causal_with_cache(
     Ok(attn_out)
 }
 
-fn run_dense_swiglu_ffn(
+pub(crate) fn run_dense_swiglu_ffn(
     layer: usize,
     hidden_dim: usize,
     ffn_dim: usize,
@@ -950,16 +951,16 @@ pub fn dispatch_qwen3_moe_ffn(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct DenseAttnLayerSpec {
-    hidden_dim: usize,
-    ffn_dim: usize,
-    n_heads_q: usize,
-    n_heads_kv: usize,
-    head_dim: usize,
-    rms_eps: f32,
-    rope_theta: f32,
-    use_qkv_bias: bool,
-    use_qk_norm: bool,
+pub(crate) struct DenseAttnLayerSpec {
+    pub(crate) hidden_dim: usize,
+    pub(crate) ffn_dim: usize,
+    pub(crate) n_heads_q: usize,
+    pub(crate) n_heads_kv: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) rms_eps: f32,
+    pub(crate) rope_theta: f32,
+    pub(crate) use_qkv_bias: bool,
+    pub(crate) use_qk_norm: bool,
 }
 
 fn run_dense_attention_sublayer(
@@ -970,6 +971,26 @@ fn run_dense_attention_sublayer(
     hidden: &mut [f32],
     layer_kv: &mut [f32],
     weights: &dyn ModelWeights,
+) -> Result<(), K3Error> {
+    run_dense_attention_sublayer_scaled(
+        spec, layer, pos, seq_len, hidden, layer_kv, weights, None, 1.0,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared GQA attention helper supports Granite explicit attention_scale and residual_scale multipliers"
+)]
+pub(crate) fn run_dense_attention_sublayer_scaled(
+    spec: DenseAttnLayerSpec,
+    layer: usize,
+    pos: usize,
+    seq_len: usize,
+    hidden: &mut [f32],
+    layer_kv: &mut [f32],
+    weights: &dyn ModelWeights,
+    attn_scale_override: Option<f32>,
+    residual_scale: f32,
 ) -> Result<(), K3Error> {
     let hidden_dim = hidden.len();
     let attn_norm_w = read_f32_weight_or_default(
@@ -1049,7 +1070,7 @@ fn run_dense_attention_sublayer(
         None,
     )?;
 
-    let attn_out = run_gqa_causal_with_cache(
+    let attn_out = run_gqa_causal_with_cache_scaled(
         &q,
         &k,
         &v,
@@ -1060,6 +1081,7 @@ fn run_dense_attention_sublayer(
             n_heads_kv: n_kv,
             head_dim: head_d_even,
         },
+        attn_scale_override,
     )?;
     let proj_attn = project_or_deterministic_slice(
         weights,
@@ -1069,7 +1091,7 @@ fn run_dense_attention_sublayer(
         0.25,
     )?;
     for (h, &r) in hidden.iter_mut().zip(proj_attn.iter()) {
-        *h += r;
+        *h += r * residual_scale;
     }
     Ok(())
 }
@@ -2109,7 +2131,7 @@ impl ArchRecipe for Qwen35MoeRecipe {
     }
 }
 
-fn run_prefill_with<F>(
+pub(crate) fn run_prefill_with<F>(
     ctx: &mut ExecutionContext<'_>,
     architecture: &str,
     mut step_fn: F,
@@ -2146,7 +2168,7 @@ where
     Ok(())
 }
 
-fn run_decode_with<F>(
+pub(crate) fn run_decode_with<F>(
     ctx: &mut ExecutionContext<'_>,
     architecture: &str,
     mut step_fn: F,
@@ -2442,6 +2464,7 @@ mod tests {
         expert_ffn: usize,
         num_experts: usize,
         vocab: usize,
+        winners: &[usize],
     ) -> OwnedWeights {
         let mut w = OwnedWeights::new(true);
         w.insert_filled("token_embd.weight", &[hidden, vocab], 0.2);
@@ -2455,11 +2478,10 @@ mod tests {
         w.insert_filled("blk.0.attn_output.weight", &[hidden, hidden], 0.05);
         w.insert_filled("blk.0.ffn_norm.weight", &[hidden], 1.0);
 
-        // Make experts 5, 19, 31, 47, 63, 79, 95, 111 win routing cleanly.
         let mut router = vec![-1.0_f32; num_experts * hidden];
-        for (idx, exp) in [5_usize, 19, 31, 47, 63, 79, 95, 111].iter().enumerate() {
+        for (idx, exp) in winners.iter().enumerate() {
             #[expect(clippy::cast_precision_loss, reason = "small expert rank fits in f32")]
-            let score = 3.0 + (8 - idx) as f32 * 0.25;
+            let score = 3.0 + (winners.len() - idx) as f32 * 0.25;
             for c in 0..hidden {
                 router[exp * hidden + c] = score;
             }
@@ -2495,16 +2517,22 @@ mod tests {
 
     #[test]
     fn test_qwen3moe_128_top8_dispatch() {
-        let w = build_qwen3_moe_weights(8, 12, 128, 16);
+        let (num_experts, expert_ffn, winners): (usize, usize, &[usize]) = if cfg!(miri) {
+            (16, 4, &[1, 3, 5, 7, 9, 11, 13, 15])
+        } else {
+            (128, 12, &[5, 19, 31, 47, 63, 79, 95, 111])
+        };
+        let w = build_qwen3_moe_weights(8, expert_ffn, num_experts, 16, winners);
         let norm_in = vec![0.4_f32; 8];
         let mut out = vec![0.0_f32; 8];
-        let selected = dispatch_qwen3_moe_ffn(&mut out, &norm_in, 0, 128, 8, 12, false, &w)
-            .expect("top-8 of 128 dispatch succeeds");
+        let selected =
+            dispatch_qwen3_moe_ffn(&mut out, &norm_in, 0, num_experts, 8, expert_ffn, false, &w)
+                .expect("top-8 MoE dispatch succeeds");
         assert_eq!(selected.len(), 8);
         let weight_sum: f32 = selected.iter().map(|&(_, weight)| weight).sum();
         assert!((weight_sum - 1.0).abs() < 1e-4);
-        assert_eq!(selected[0].0, 5);
-        assert_eq!(selected[7].0, 111);
+        assert_eq!(selected[0].0, winners[0]);
+        assert_eq!(selected[7].0, winners[7]);
         assert!(out.iter().all(|v| v.is_finite()) && out.iter().any(|v| v.abs() > 1e-6));
     }
 
@@ -2524,17 +2552,23 @@ mod tests {
 
     #[test]
     fn test_qwen3moe_recipe_forward_pass() {
+        let (num_experts, expert_ffn, winners): (usize, usize, &[usize]) = if cfg!(miri) {
+            (16, 4, &[1, 3, 5, 7, 9, 11, 13, 15])
+        } else {
+            (128, 12, &[5, 19, 31, 47, 63, 79, 95, 111])
+        };
         let mut recipe = Qwen3MoeRecipe::new_30b_a3b();
         recipe.base.num_layers = 1;
         recipe.base.hidden_dim = 8;
-        recipe.base.ffn_dim = 12;
+        recipe.base.ffn_dim = expert_ffn;
         recipe.base.n_heads_q = 2;
         recipe.base.n_heads_kv = 2;
         recipe.base.head_dim = 4;
         recipe.base.vocab_size = 16;
-        recipe.expert_ffn_dim = 12;
+        recipe.num_experts = num_experts;
+        recipe.expert_ffn_dim = expert_ffn;
 
-        let w = build_qwen3_moe_weights(8, 12, 128, 16);
+        let w = build_qwen3_moe_weights(8, expert_ffn, num_experts, 16, winners);
         let mut kv = vec![0.0_f32; 32 * 2 * 8];
         let mut logits = vec![0.0_f32; 16];
         let mut ctx = ExecutionContext::new(&[1, 2], 16, &mut logits, &mut kv).unwrap();

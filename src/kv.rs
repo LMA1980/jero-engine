@@ -148,6 +148,9 @@ impl SingleSlotKvArena {
         if !crate::memory::architecture_requires_kv_cache(metadata.architecture()) {
             return Ok(Self::empty(n_ctx));
         }
+        if let Some(res) = Self::try_allocate_recurrent_or_hybrid(metadata, n_ctx) {
+            return res;
+        }
 
         let params = GgufHyperparams::from_metadata(metadata);
         let layer_count = params.block_count.max(1);
@@ -197,6 +200,9 @@ impl SingleSlotKvArena {
         if !crate::memory::architecture_requires_kv_cache(metadata.architecture()) {
             return Ok(Self::empty(n_ctx));
         }
+        if let Some(res) = Self::try_allocate_recurrent_or_hybrid(metadata, n_ctx) {
+            return res;
+        }
 
         let params = GgufHyperparams::from_gguf(gguf);
         let layer_count = if let Some(dory) = metadata.dory() {
@@ -229,6 +235,76 @@ impl SingleSlotKvArena {
             .max(1);
 
         Self::with_dimensions(layer_count, head_count_kv, head_dim, n_ctx)
+    }
+
+    fn try_allocate_recurrent_or_hybrid(
+        metadata: &ModelMetadata,
+        n_ctx: usize,
+    ) -> Option<Result<Self, K3Error>> {
+        let arch = metadata.architecture();
+        let page_size = system_page_size();
+        if crate::memory::is_pure_recurrent_arch(arch) {
+            let res = (|| {
+                let raw_bytes =
+                    crate::memory::estimate_pure_recurrent_raw_bytes_per_slot(metadata)?;
+                let total_elements = raw_bytes.div_ceil(size_of::<f32>()).max(1);
+                let aligned_bytes = align_up(total_elements * size_of::<f32>(), page_size);
+                let layout = ArenaLayout {
+                    num_blocks: 0,
+                    elements_per_token: 0,
+                    elements_per_block: 0,
+                    total_elements,
+                    aligned_bytes,
+                };
+                Self::allocate_locked_arena(
+                    layout,
+                    n_ctx,
+                    metadata.layer_count().max(1),
+                    0,
+                    0,
+                    None,
+                )
+            })();
+            return Some(res);
+        }
+
+        if crate::memory::is_hybrid_ssm_arch(arch) {
+            let res = (|| {
+                let blocks_per_slot = n_ctx.div_ceil(KV_BLOCK_SIZE);
+                let raw_bytes = crate::memory::estimate_hybrid_raw_bytes_per_slot(
+                    metadata,
+                    n_ctx,
+                    blocks_per_slot,
+                )?;
+                let total_elements = raw_bytes.div_ceil(size_of::<f32>()).max(1);
+                let aligned_bytes = align_up(total_elements * size_of::<f32>(), page_size);
+                let (attn_layers, _) = crate::memory::count_hybrid_schedule_layers(metadata);
+                let (head_count_kv, head_dim) = crate::memory::infer_kv_head_geom(metadata);
+                let elements_per_token = 2_usize
+                    .saturating_mul(attn_layers)
+                    .saturating_mul(head_count_kv)
+                    .saturating_mul(head_dim);
+                let elements_per_block = KV_BLOCK_SIZE.saturating_mul(elements_per_token);
+                let layout = ArenaLayout {
+                    num_blocks: if attn_layers > 0 { blocks_per_slot } else { 0 },
+                    elements_per_token,
+                    elements_per_block,
+                    total_elements,
+                    aligned_bytes,
+                };
+                Self::allocate_locked_arena(
+                    layout,
+                    n_ctx,
+                    attn_layers.max(1),
+                    head_count_kv,
+                    head_dim,
+                    None,
+                )
+            })();
+            return Some(res);
+        }
+
+        None
     }
 
     fn allocate_locked_arena(

@@ -19,6 +19,8 @@ pub mod memory;
 pub mod modernbert;
 #[cfg(feature = "jero-kernels-rvv")]
 pub mod qwen_deepseek;
+#[cfg(feature = "jero-kernels-rvv")]
+pub mod ssm;
 pub mod weights;
 pub mod worker;
 pub use worker as jero_worker;
@@ -62,13 +64,19 @@ pub use jero_core::{
 };
 pub use kv::{SingleSlotKvArena, SlidingWindowKvView, write_and_slice_sliding_kv};
 pub use memory::{
-    DEFAULT_PAGE_SIZE, DORY_DEFAULT_SLIDING_WINDOW, KV_BLOCK_SIZE, LayerKvPolicy, MemoryFootprint,
-    MemoryInspector, MockMemoryInspector, SystemMemoryInspector, architecture_requires_kv_cache,
-    calculate_footprint, calculate_footprint_with_slots, check_memory_admission,
-    check_memory_admission_for_weight_bytes, check_memory_admission_with,
+    DEFAULT_PAGE_SIZE, DORY_DEFAULT_SLIDING_WINDOW, HybridLayerKind, KV_BLOCK_SIZE, LayerKvPolicy,
+    MemoryFootprint, MemoryInspector, MockMemoryInspector, SystemMemoryInspector,
+    architecture_requires_kv_cache, calculate_footprint, calculate_footprint_with_slots,
+    check_memory_admission, check_memory_admission_for_weight_bytes, check_memory_admission_with,
     check_memory_admission_with_slots, estimate_dory_kv_cache_bytes,
-    estimate_hybrid_kv_cache_bytes, estimate_kv_cache_bytes, estimate_mla_kv_cache_bytes,
-    gemma_layer_kv_policies, system_page_size,
+    estimate_hybrid_kv_cache_bytes, estimate_hybrid_ssm_arena_bytes, estimate_kv_cache_bytes,
+    estimate_mla_kv_cache_bytes, gemma_layer_kv_policies, system_page_size,
+};
+#[cfg(feature = "jero-kernels-rvv")]
+pub use ssm::{
+    GraniteRecipe, HybridSsmTransformerRecipe, Lfm2MoeRecipe, Mamba2Recipe, Rwkv7Recipe,
+    lfm2_shortconv_step, resolve_hybrid_layer_schedule,
+    resolve_hybrid_layer_schedule_with_metadata,
 };
 pub use weights::LockedModelWeights;
 
