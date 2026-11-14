@@ -33,9 +33,9 @@ use jero_engine::affinity::{SplitStrategy, resolve_affinity_split, resolve_phase
 use jero_engine::forward::MatKernel;
 use jero_engine::memory::calculate_footprint;
 use jero_engine::{
-    A100_CLUSTER_MASK, ClusterPhasePolicy, LockedModelWeights, SinglePromptEngine,
-    SingleSlotKvArena, StreamAction, SystemMemoryInspector, WorkerPool, X100_CLUSTER_MASK,
-    tokenize_prompt_utf8_safe,
+    A100_CLUSTER_MASK, ClusterPhasePolicy, GenerationConfig, LockedModelWeights,
+    SinglePromptEngine, SingleSlotKvArena, StreamAction, SystemMemoryInspector, WorkerPool,
+    X100_CLUSTER_MASK, tokenize_prompt_utf8_safe,
 };
 use jero_kernels_rvv::ime::ime_vmadot_count;
 use jero_tokenizer::{DetokenizeStep, GgufTokenizer};
@@ -71,7 +71,7 @@ pub fn is_abort_requested() -> bool {
 }
 
 /// Command line arguments parsed for a diagnostic session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DiagConfig {
     /// Path to the local model file (e.g., GGUF format).
     pub model_path: Option<String>,
@@ -123,38 +123,10 @@ pub struct DiagConfig {
     pub synthetic_matrix: bool,
     /// Path to export deterministic differential parity report JSON (`--dump-parity <path>`).
     pub dump_parity: Option<String>,
-}
-
-impl Default for DiagConfig {
-    fn default() -> Self {
-        Self {
-            model_path: None,
-            prompt: None,
-            cluster: None,
-            phase_policy: None,
-            split: None,
-            ime: None,
-            threads: None,
-            core_mask: None,
-            n_ctx: Some(64),
-            max_tokens: Some(128),
-            coord: None,
-            repeat: None,
-            json: false,
-            export_profile: None,
-            summary: false,
-            eval_suite: None,
-            eval_dataset: None,
-            reference_baseline: None,
-            export_eval: None,
-            recurrent_loops: None,
-            recurrent_kv_mode: None,
-            serve_openai: None,
-            max_requests: None,
-            synthetic_matrix: false,
-            dump_parity: None,
-        }
-    }
+    /// Skip family chat-template framing and tokenize the raw prompt verbatim (`--raw-prompt`).
+    pub raw_prompt: bool,
+    /// Continue decoding past EOS/EOT stop tokens until `max_tokens` (`--ignore-eos`).
+    pub ignore_eos: bool,
 }
 
 impl DiagConfig {
@@ -422,6 +394,12 @@ impl DiagConfig {
                     }
                     config.dump_parity = Some(path);
                 }
+                "--raw-prompt" => {
+                    config.raw_prompt = true;
+                }
+                "--ignore-eos" => {
+                    config.ignore_eos = true;
+                }
                 unknown => {
                     return Err(format!("unknown option '{unknown}'"));
                 }
@@ -528,6 +506,10 @@ impl MetricStats {
     }
 }
 
+fn default_stop_reason_str() -> String {
+    "max_tokens".to_owned()
+}
+
 /// Recorded execution metrics for an individual evaluation pass.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunMetric {
@@ -542,6 +524,10 @@ pub struct RunMetric {
     pub compute_utilization_ratio: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<Vec<u32>>,
+    #[serde(default = "default_stop_reason_str")]
+    pub stop_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_token_id: Option<u32>,
 }
 
 /// Aggregated statistical summary for multi-run evaluations.
@@ -574,6 +560,10 @@ pub struct MultiRunReport {
     pub prompt: String,
     pub runs: Vec<RunMetric>,
     pub statistics: StatisticsSummary,
+    #[serde(default = "default_stop_reason_str")]
+    pub stop_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_token_id: Option<u32>,
     /// Flattened shared placement, ceiling, cost-profile, and determinism fields.
     #[serde(flatten)]
     pub telemetry: bench::BenchmarkTelemetry,
@@ -606,15 +596,23 @@ fn print_usage() {
                --ime <on|off>     SpacemiT IME matrix acceleration ('on' also measures the 'off' baseline)\n  \
            -t, --threads <n>      Number of execution worker threads\n  \
                --cores <mask>     Pinned core affinity mask (e.g. 0x00FF)\n  \
-               --n-ctx <tokens>   Configured context sequence length (default: 2048)\n  \
-               --max-tokens <n>   Maximum generation tokens (default: 128)\n  \
+               --n-ctx <tokens>   Configured context sequence length (default: 64 for diag/eval, 512 for --serve-openai)\n  \
+               --max-tokens <n>   Maximum generation tokens (default: 128 for diag, 16 for eval, 512 for --serve-openai)\n  \
+               --raw-prompt       Bypass chat-template framing and tokenize prompt verbatim\n  \
+               --ignore-eos       Continue generation until --max-tokens even when EOS/EOT tokens are emitted\n  \
                --coord <strategy> Multi-core coordination profile ('spin', 'futex', 'rayon')\n  \
                --repeat <n>       Repeat benchmark iterations (N >= 3) for jitter measurement\n  \
                --json             Emit structured machine-readable JSON report\n  \
                --export-profile <path> Export structured CostProfile JSON to file\n  \
                --dump-parity <path> Export top-k prefill logits & greedy token parity JSON\n  \
+               --eval-suite       Run built-in 5-pillar open-source evaluation benchmark suite\n  \
+               --eval-dataset <path> Override 5-pillar suite dataset with custom JSON\n  \
+               --reference-baseline <path> Compare 5-pillar accuracy/perplexity against baseline JSON\n  \
+               --export-eval <path> Export 5-pillar evaluation report JSON to file\n  \
                --serve-openai <addr> Serve ephemeral OpenAI-compatible HTTP API (e.g. 127.0.0.1:0)\n  \
                --max-requests <n> Exit --serve-openai cleanly after handling N HTTP requests\n  \
+               --recurrent-loops <n> Override looped-reasoning iteration count for recurrent architectures\n  \
+               --recurrent-kv-mode <mode> Recurrent KV strategy ('last_iteration' or 'shared_per_step')\n  \
                --summary          Emit human-readable summary table\n  \
                --synthetic-matrix Run in-memory synthetic hardware matrix calibration (no --model)\n  \
            -h, --help             Show this help message\n  \
@@ -680,7 +678,8 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
             LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
         let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
         let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
-        let prompt_tokens = tokenize_prompt_utf8_safe(&tokenizer, prompt_text, true, n_ctx)?;
+        let prompt_tokens =
+            tokenize_prompt_utf8_safe(&tokenizer, prompt_text, !config.raw_prompt, n_ctx)?;
         let worker_pool = WorkerPool::for_phase_policy(
             policy,
             locked_weights.metadata(),
@@ -695,7 +694,11 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
         let effective_core_mask = format!("0x{:04X}", affinity.effective_mask);
         let thread_count = worker_pool.thread_count();
         let resolved_policy = worker_pool.phase_policy().unwrap_or(policy);
-        let engine = SinglePromptEngine::new().with_phase_policy(resolved_policy);
+        let gen_config =
+            GenerationConfig::from_tokenizer(&tokenizer).with_ignore_eos(config.ignore_eos);
+        let engine = SinglePromptEngine::new()
+            .with_phase_policy(resolved_policy)
+            .with_generation_config(gen_config);
         (
             worker_pool,
             affinity,
@@ -732,13 +735,16 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
         // 3. Extract GGUF vocabulary/template and tokenize prompt in-process
         let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
         let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
-        let prompt_tokens = tokenize_prompt_utf8_safe(&tokenizer, prompt_text, true, n_ctx)?;
+        let prompt_tokens =
+            tokenize_prompt_utf8_safe(&tokenizer, prompt_text, !config.raw_prompt, n_ctx)?;
         let resolved_policy = resolve_engine_policy(
             config.split,
             recipe.architecture_id(),
             prompt_tokens.len(),
             resolved_affinity.effective_mask,
         );
+        let gen_config =
+            GenerationConfig::from_tokenizer(&tokenizer).with_ignore_eos(config.ignore_eos);
         (
             worker_pool,
             resolved_affinity,
@@ -750,7 +756,9 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
             prompt_tokens,
             effective_core_mask,
             thread_count,
-            SinglePromptEngine::new().with_phase_policy(resolved_policy),
+            SinglePromptEngine::new()
+                .with_phase_policy(resolved_policy)
+                .with_generation_config(gen_config),
         )
     };
 
@@ -975,6 +983,11 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
 
     let determinism_verified = telemetry.determinism.verified;
     let first_divergent = telemetry.determinism.first_divergent_run;
+    let report_stop_reason = run_metrics
+        .first()
+        .map(|r| r.stop_reason.clone())
+        .unwrap_or_else(default_stop_reason_str);
+    let report_stop_token_id = run_metrics.first().and_then(|r| r.stop_token_id);
 
     let report = MultiRunReport {
         execution_mode: "real_gguf".to_owned(),
@@ -989,6 +1002,8 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
         prompt: prompt_text.to_owned(),
         runs: run_metrics,
         statistics,
+        stop_reason: report_stop_reason,
+        stop_token_id: report_stop_token_id,
         telemetry,
     };
 
@@ -1061,7 +1076,8 @@ pub fn run_single_eval_session<W: Write>(config: &DiagConfig, mut out: W) -> Res
             LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
         let gguf_probe = GgufFile::parse(locked_weights.as_bytes())?;
         let tokenizer_probe = GgufTokenizer::from_gguf(&gguf_probe)?;
-        let probe_tokens = tokenize_prompt_utf8_safe(&tokenizer_probe, prompt_text, true, n_ctx)?;
+        let probe_tokens =
+            tokenize_prompt_utf8_safe(&tokenizer_probe, prompt_text, !config.raw_prompt, n_ctx)?;
         let worker_pool = WorkerPool::for_phase_policy(
             policy,
             locked_weights.metadata(),
@@ -1107,7 +1123,8 @@ pub fn run_single_eval_session<W: Write>(config: &DiagConfig, mut out: W) -> Res
     let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
     let mut kv_arena = SingleSlotKvArena::from_gguf(&gguf_view, n_ctx)?;
     let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
-    let prompt_tokens = tokenize_prompt_utf8_safe(&tokenizer, prompt_text, true, n_ctx)?;
+    let prompt_tokens =
+        tokenize_prompt_utf8_safe(&tokenizer, prompt_text, !config.raw_prompt, n_ctx)?;
     if config.phase_policy.is_none() {
         engine.set_phase_policy(resolve_engine_policy(
             config.split,
@@ -1116,6 +1133,10 @@ pub fn run_single_eval_session<W: Write>(config: &DiagConfig, mut out: W) -> Res
             worker_pool.affinity().effective_mask,
         ));
     }
+    let gen_config =
+        GenerationConfig::from_tokenizer(&tokenizer).with_ignore_eos(config.ignore_eos);
+    let stop_ids = gen_config.stop_token_ids.clone();
+    engine.set_generation_config(gen_config);
 
     // 5. Execute isolated single-prompt forward pass and stream tokens unbuffered (US-01.6, US-01.7.2)
     let mut detokenizer = tokenizer.streaming_detokenizer();
@@ -1132,6 +1153,9 @@ pub fn run_single_eval_session<W: Write>(config: &DiagConfig, mut out: W) -> Res
             if is_abort_requested() {
                 return Ok(StreamAction::Stop);
             }
+            if !config.ignore_eos && stop_ids.contains(&token_id) {
+                return Ok(StreamAction::Stop);
+            }
 
             match detokenizer.push_token(token_id)? {
                 DetokenizeStep::Emit(piece) => {
@@ -1145,7 +1169,12 @@ pub fn run_single_eval_session<W: Write>(config: &DiagConfig, mut out: W) -> Res
                         let _ = out.write_all(prefix.as_bytes());
                         let _ = out.flush();
                     }
-                    Ok(StreamAction::Stop)
+                    if config.ignore_eos {
+                        detokenizer = tokenizer.streaming_detokenizer();
+                        Ok(StreamAction::Continue)
+                    } else {
+                        Ok(StreamAction::Stop)
+                    }
                 }
             }
         },
@@ -1400,6 +1429,8 @@ mod tests {
             max_requests: None,
             synthetic_matrix: false,
             dump_parity: None,
+            raw_prompt: false,
+            ignore_eos: false,
         };
 
         let mut output_buf = Vec::new();
@@ -1451,6 +1482,8 @@ mod tests {
             max_requests: None,
             synthetic_matrix: false,
             dump_parity: None,
+            raw_prompt: false,
+            ignore_eos: false,
         };
 
         let mut output_buf = Vec::new();
@@ -1725,5 +1758,45 @@ mod tests {
             "   ".to_owned(),
         ];
         assert!(DiagConfig::parse_args(empty_dump.into_iter()).is_err());
+    }
+
+    #[test]
+    fn test_parse_wave2_raw_prompt_ignore_eos_and_stop_reason_serde() {
+        let def = DiagConfig::default();
+        assert_eq!(def.n_ctx, None);
+        assert_eq!(def.max_tokens, None);
+        assert!(!def.raw_prompt);
+        assert!(!def.ignore_eos);
+
+        let args = vec![
+            "jero-diag".to_owned(),
+            "--model".to_owned(),
+            "m.gguf".to_owned(),
+            "--raw-prompt".to_owned(),
+            "--ignore-eos".to_owned(),
+        ];
+        let cfg = DiagConfig::parse_args(args.into_iter())
+            .expect("valid")
+            .expect("some");
+        assert!(cfg.raw_prompt);
+        assert!(cfg.ignore_eos);
+
+        let metric = RunMetric {
+            run_index: 0,
+            ttft_ms: 1.0,
+            prefill_ms: 0.5,
+            decode_ms: 0.5,
+            decode_tokens_per_sec: 100.0,
+            total_wall_time_ms: 1.0,
+            cumulative_barrier_wait_ms: 0.0,
+            barrier_wait_ratio: 0.0,
+            compute_utilization_ratio: 1.0,
+            tokens: Some(vec![7, 8]),
+            stop_reason: "eos_token".to_owned(),
+            stop_token_id: Some(128_009),
+        };
+        let v = serde_json::to_value(&metric).expect("json");
+        assert_eq!(v["stop_reason"], "eos_token");
+        assert_eq!(v["stop_token_id"], 128_009);
     }
 }

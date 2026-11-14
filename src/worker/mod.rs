@@ -33,4 +33,4 @@ pub use error::{
     EXIT_RESOURCE_EXHAUSTED, EXIT_SUCCESS, WorkerError,
 };
 pub use weights::LockedWeights;
-pub use worker::WorkerEngine;
+pub use worker::{WorkerEngine, decode_slab_stop_reason, encode_slab_stop_reason};

@@ -17,8 +17,9 @@ use jero_core::{
     QuantizationInfo,
 };
 use jero_engine::{
-    ClusterPhasePolicy, EnginePhase, LockedModelWeights, SinglePromptEngine, SingleSlotKvArena,
-    StreamAction, SystemMemoryInspector, WorkerPool, encode_text_utf8_safe,
+    ClusterPhasePolicy, EnginePhase, GenerationConfig, LockedModelWeights, SinglePromptEngine,
+    SingleSlotKvArena, StopReason, StreamAction, SystemMemoryInspector, WorkerPool,
+    discover_stop_token_ids, encode_formatted_prompt_utf8_safe, format_single_turn_prompt,
     infer_logits_buffer_len, resolve_affinity, sample_greedy_argmax, select_phase_policy_for_arch,
 };
 use jero_tokenizer::{DetokenizeStep, GgufTokenizer, Tokenizer};
@@ -114,6 +115,9 @@ pub fn run_ephemeral_openai_server<W: Write>(
 
     let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
     let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
+    engine.set_generation_config(
+        GenerationConfig::from_tokenizer(&tokenizer).with_ignore_eos(config.ignore_eos),
+    );
     let arch_name = locked_weights.metadata().architecture().to_owned();
     let quant_str = QuantizationInfo::from_descriptors(locked_weights.metadata().tensors()).primary;
     let model_id = Path::new(model_path)
@@ -365,7 +369,7 @@ fn process_chat_completions(
     let stop_strings = extract_stop_sequences(&payload);
 
     let formatted_prompt = format_chat_messages(tokenizer, arch_name, &messages);
-    let mut prompt_tokens = encode_text_utf8_safe(tokenizer, &formatted_prompt)
+    let mut prompt_tokens = encode_formatted_prompt_utf8_safe(tokenizer, &formatted_prompt, true)
         .map_err(|e| (400_u16, format!("prompt tokenization failed: {e}")))?;
     if prompt_tokens.is_empty() {
         prompt_tokens.push(tokenizer.special_tokens().bos_token_id.unwrap_or(0));
@@ -386,6 +390,7 @@ fn process_chat_completions(
     let mut kv_arena = SingleSlotKvArena::from_gguf(gguf_view, n_ctx)
         .map_err(|e| (500_u16, format!("KV arena allocation failed: {e}")))?;
     let mut detok = tokenizer.streaming_detokenizer();
+    let ignore_eos = engine.generation_config().ignore_eos;
     let mut generated_text = String::new();
     let mut stopped_by_eos_or_stop = false;
 
@@ -414,9 +419,17 @@ fn process_chat_completions(
                     DetokenizeStep::Hold => Ok(StreamAction::Continue),
                     DetokenizeStep::Stop(prefix) => {
                         generated_text.push_str(&prefix);
-                        let _ = trim_matched_stop_sequence(&mut generated_text, &stop_strings);
-                        stopped_by_eos_or_stop = true;
-                        Ok(StreamAction::Stop)
+                        if trim_matched_stop_sequence(&mut generated_text, &stop_strings) {
+                            stopped_by_eos_or_stop = true;
+                            return Ok(StreamAction::Stop);
+                        }
+                        if ignore_eos {
+                            detok = tokenizer.streaming_detokenizer();
+                            Ok(StreamAction::Continue)
+                        } else {
+                            stopped_by_eos_or_stop = true;
+                            Ok(StreamAction::Stop)
+                        }
                     }
                 }
             },
@@ -430,7 +443,9 @@ fn process_chat_completions(
         }
     }
 
-    let finish_reason = if stopped_by_eos_or_stop {
+    let finish_reason = if stopped_by_eos_or_stop
+        || matches!(summary.timing.stop_reason, StopReason::EosToken { .. })
+    {
         "stop"
     } else {
         "length"
@@ -510,7 +525,7 @@ fn process_text_completions(
     for (choice_idx, input) in inputs.iter().enumerate() {
         let (raw_prompt_str, mut prompt_tokens) = match input {
             PromptInput::Text(s) => {
-                let toks = encode_text_utf8_safe(tokenizer, s)
+                let toks = encode_formatted_prompt_utf8_safe(tokenizer, s, true)
                     .map_err(|e| (400_u16, format!("prompt tokenization failed: {e}")))?;
                 (s.clone(), toks)
             }
@@ -564,6 +579,7 @@ fn process_text_completions(
             let mut kv_arena = SingleSlotKvArena::from_gguf(gguf_view, n_ctx)
                 .map_err(|e| (500_u16, format!("KV arena allocation failed: {e}")))?;
             let mut detok = tokenizer.streaming_detokenizer();
+            let ignore_eos = engine.generation_config().ignore_eos;
             let mut generated_text = String::new();
             let mut stopped_by_eos = false;
 
@@ -592,10 +608,17 @@ fn process_text_completions(
                             DetokenizeStep::Hold => Ok(StreamAction::Continue),
                             DetokenizeStep::Stop(prefix) => {
                                 generated_text.push_str(&prefix);
-                                let _ =
-                                    trim_matched_stop_sequence(&mut generated_text, &stop_strings);
-                                stopped_by_eos = true;
-                                Ok(StreamAction::Stop)
+                                if trim_matched_stop_sequence(&mut generated_text, &stop_strings) {
+                                    stopped_by_eos = true;
+                                    return Ok(StreamAction::Stop);
+                                }
+                                if ignore_eos {
+                                    detok = tokenizer.streaming_detokenizer();
+                                    Ok(StreamAction::Continue)
+                                } else {
+                                    stopped_by_eos = true;
+                                    Ok(StreamAction::Stop)
+                                }
                             }
                         }
                     },
@@ -614,7 +637,13 @@ fn process_text_completions(
             } else {
                 generated_text
             };
-            let finish_reason = if stopped_by_eos { "stop" } else { "length" };
+            let finish_reason = if stopped_by_eos
+                || matches!(summary.timing.stop_reason, StopReason::EosToken { .. })
+            {
+                "stop"
+            } else {
+                "length"
+            };
             total_prompt_tokens += prompt_tokens.len();
             total_completion_tokens += summary.generated_tokens.len();
 
@@ -821,6 +850,7 @@ fn generate_from_ready_context(
     let mut generated_text = String::new();
     let mut gen_count = 0_usize;
     let mut stopped = false;
+    let stop_ids = discover_stop_token_ids(tokenizer);
 
     let sample_len = vocab_size.min(ctx.logits().len());
     let mut current_token = sample_greedy_argmax(&ctx.logits()[..sample_len])
@@ -832,7 +862,7 @@ fn generate_from_ready_context(
             compute_step_logprobs(&ctx.logits()[..step_len], current_token, top_k, tokenizer);
         gen_count += 1;
 
-        if tokenizer.special_tokens().is_stop(current_token) {
+        if stop_ids.contains(&current_token) || tokenizer.special_tokens().is_stop(current_token) {
             stopped = true;
             break;
         }
@@ -925,7 +955,13 @@ fn format_chat_messages(
     // Avoid double-wrapping when a caller (e.g. `lm_eval --apply_chat_template`) already formatted markers
     if extracted.len() == 1 {
         let (_, ref single_text) = extracted[0];
-        if single_text.contains("<|im_start|>") || single_text.contains("[INST]") {
+        if single_text.contains("<|im_start|>")
+            || single_text.contains("[INST]")
+            || single_text.contains("<|start_header_id|>")
+            || single_text.contains("<start_of_turn>")
+            || single_text.contains("<|user|>")
+            || single_text.contains("<｜User｜>")
+        {
             return single_text.clone();
         }
     }
@@ -967,7 +1003,7 @@ fn format_chat_messages(
             combined.push_str(text);
         }
     }
-    tokenizer.chat_template().format_prompt(combined.trim())
+    format_single_turn_prompt(tokenizer, combined.trim())
 }
 
 fn extract_message_text(content: &Value) -> String {

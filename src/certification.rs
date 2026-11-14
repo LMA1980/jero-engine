@@ -462,7 +462,7 @@ where
     Ok((report, generated_text))
 }
 
-fn encode_chunk_without_bos(
+pub(crate) fn encode_chunk_without_bos(
     tokenizer: &GgufTokenizer,
     chunk: &str,
     out: &mut Vec<u32>,
@@ -660,12 +660,12 @@ pub fn tokenize_prompt_utf8_safe(
     apply_chat_template: bool,
     n_ctx: usize,
 ) -> Result<Vec<u32>, K3Error> {
-    let formatted = if apply_chat_template {
-        tokenizer.chat_template().format_prompt(prompt)
+    let tokens = if apply_chat_template {
+        let formatted = crate::chat_template::format_single_turn_prompt(tokenizer, prompt);
+        crate::chat_template::encode_formatted_prompt_utf8_safe(tokenizer, &formatted, true)?
     } else {
-        prompt.to_owned()
+        encode_text_utf8_safe(tokenizer, prompt)?
     };
-    let tokens = encode_text_utf8_safe(tokenizer, &formatted)?;
     if n_ctx == 0 || tokens.len() >= n_ctx {
         return Err(K3Error::ContextLengthExceeded {
             requested_tokens: tokens.len(),
