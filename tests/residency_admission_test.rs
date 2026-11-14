@@ -179,3 +179,56 @@ fn test_hybrid_kv_admission() {
         .expect_err("must reject when hybrid KV exceeds RLIMIT_MEMLOCK");
     assert!(matches!(err, K3Error::InsufficientLockableMemory { .. }));
 }
+
+#[test]
+fn test_qwen3_30b_a3b_admission() {
+    use jero_engine::forward::{Lane, PlacementPlan};
+    use jero_engine::{Qwen3MoeRecipe, check_memory_admission_for_weight_bytes};
+
+    // Qwen3-30B-A3B Q4_K_M profile (~17.5 GiB = 18,790,481,920 bytes, 128 experts, top-8 routed).
+    let extra_kvs = [
+        ("qwen3moe.block_count", GgufValue::Uint32(48)),
+        ("qwen3moe.embedding_length", GgufValue::Uint32(2048)),
+        ("qwen3moe.feed_forward_length", GgufValue::Uint32(6144)),
+        ("qwen3moe.attention.head_count", GgufValue::Uint32(32)),
+        ("qwen3moe.attention.head_count_kv", GgufValue::Uint32(4)),
+        ("qwen3moe.attention.key_length", GgufValue::Uint32(128)),
+        ("qwen3moe.context_length", GgufValue::Uint32(32_768)),
+        ("qwen3moe.expert_count", GgufValue::Uint32(128)),
+        ("qwen3moe.expert_used_count", GgufValue::Uint32(8)),
+    ];
+    let bytes = create_synthetic_gguf_v3_with_kvs("qwen3moe", 32, &extra_kvs, &[]);
+    let model = jero_core::GgufFile::parse(&bytes).expect("parse qwen3moe gguf");
+    let recipe = verify_model_capabilities(&model).expect("verify qwen3moe recipe");
+    assert_eq!(recipe.architecture_id(), "qwen3moe");
+
+    let moe = Qwen3MoeRecipe::new_30b_a3b();
+    assert_eq!(
+        moe.placement_plan(),
+        PlacementPlan::op(Lane::A100, Lane::X100)
+    );
+
+    // Bounded 28 GiB RLIMIT_MEMLOCK ceiling (29,360,128 KB = 30,064,771,072 bytes) admits
+    // 17.5 GiB Q4_K_M weights + 4096-token KV cache without touching host physical RAM/tmpfs.
+    let q4km_30b_bytes: usize = 18_790_481_920;
+    let target_ceiling_28gib: u64 = 30_064_771_072;
+    let inspector_28g = MockMemoryInspector::new(target_ceiling_28gib, target_ceiling_28gib);
+    let fp = check_memory_admission_for_weight_bytes(
+        model.metadata(),
+        q4km_30b_bytes,
+        4096,
+        &inspector_28g,
+    )
+    .expect("Qwen3-30B-A3B Q4_K_M @ n_ctx=4096 must pass 28 GiB memlock admission");
+    assert!(fp.total_required_bytes <= target_ceiling_28gib);
+
+    let inspector_16g = MockMemoryInspector::new(16 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024);
+    let err = check_memory_admission_for_weight_bytes(
+        model.metadata(),
+        q4km_30b_bytes,
+        4096,
+        &inspector_16g,
+    )
+    .expect_err("Qwen3-30B-A3B Q4_K_M must be rejected under 16 GiB memlock ceiling");
+    assert!(matches!(err, K3Error::InsufficientLockableMemory { .. }));
+}

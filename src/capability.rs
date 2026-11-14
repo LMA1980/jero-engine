@@ -312,6 +312,43 @@ impl GgufHyperparams {
 pub struct RecipeRegistry;
 
 impl RecipeRegistry {
+    #[cfg(feature = "jero-kernels-rvv")]
+    fn find_qwen_deepseek_recipe(architecture: &str) -> Option<&'static dyn ArchRecipe> {
+        match architecture {
+            "qwen2" => {
+                static QWEN2: crate::qwen_deepseek::Qwen2Recipe =
+                    crate::qwen_deepseek::Qwen2Recipe::new();
+                Some(&QWEN2)
+            }
+            "qwen3" => {
+                static QWEN3: crate::qwen_deepseek::Qwen3Recipe =
+                    crate::qwen_deepseek::Qwen3Recipe::new();
+                Some(&QWEN3)
+            }
+            "qwen3moe" => {
+                static QWEN3MOE: crate::qwen_deepseek::Qwen3MoeRecipe =
+                    crate::qwen_deepseek::Qwen3MoeRecipe::new_30b_a3b();
+                Some(&QWEN3MOE)
+            }
+            "deepseek2" => {
+                static DEEPSEEK2: crate::qwen_deepseek::DeepSeek2Recipe =
+                    crate::qwen_deepseek::DeepSeek2Recipe::new();
+                Some(&DEEPSEEK2)
+            }
+            "qwen35" => {
+                static QWEN35: crate::qwen_deepseek::Qwen35Recipe =
+                    crate::qwen_deepseek::Qwen35Recipe::new();
+                Some(&QWEN35)
+            }
+            "qwen35moe" => {
+                static QWEN35MOE: crate::qwen_deepseek::Qwen35MoeRecipe =
+                    crate::qwen_deepseek::Qwen35MoeRecipe::new();
+                Some(&QWEN35MOE)
+            }
+            _ => None,
+        }
+    }
+
     /// Returns the compiled [`ArchRecipe`] matching `architecture`, if enabled.
     ///
     /// Minor versions (such as `"qwen3"` vs `"qwen3.8"`) are treated as distinct algorithms
@@ -323,6 +360,11 @@ impl RecipeRegistry {
             static SYNTHETIC: jero_arch_synthetic::SyntheticRecipe =
                 jero_arch_synthetic::SyntheticRecipe::new();
             return Some(&SYNTHETIC);
+        }
+
+        #[cfg(feature = "jero-kernels-rvv")]
+        if let Some(recipe) = Self::find_qwen_deepseek_recipe(architecture) {
+            return Some(recipe);
         }
 
         #[cfg(feature = "jero-arch-llama")]
@@ -420,8 +462,18 @@ impl RecipeRegistry {
             "llama",
             #[cfg(feature = "jero-arch-llama")]
             "llama4",
-            #[cfg(feature = "jero-arch-llama")]
+            #[cfg(any(feature = "jero-kernels-rvv", feature = "jero-arch-llama"))]
             "qwen2",
+            #[cfg(feature = "jero-kernels-rvv")]
+            "qwen3",
+            #[cfg(feature = "jero-kernels-rvv")]
+            "qwen3moe",
+            #[cfg(feature = "jero-kernels-rvv")]
+            "deepseek2",
+            #[cfg(feature = "jero-kernels-rvv")]
+            "qwen35",
+            #[cfg(feature = "jero-kernels-rvv")]
+            "qwen35moe",
             #[cfg(feature = "jero-arch-mistral")]
             "mistral",
             #[cfg(feature = "jero-arch-mistral")]
@@ -521,6 +573,11 @@ impl RecipeRegistry {
         #[cfg(feature = "jero-arch-synthetic")]
         if arch == "synthetic" {
             return Some(Box::new(jero_arch_synthetic::SyntheticRecipe::new()));
+        }
+
+        #[cfg(feature = "jero-kernels-rvv")]
+        if let Some(recipe) = Self::hydrate_qwen_deepseek_recipe(params, metadata) {
+            return Some(recipe);
         }
 
         #[cfg(feature = "jero-arch-llama")]
@@ -867,6 +924,190 @@ impl RecipeRegistry {
         None
     }
 
+    #[cfg(feature = "jero-kernels-rvv")]
+    fn infer_qwen_head_dim(params: &GgufHyperparams, default: usize) -> usize {
+        if params.key_length > 0 {
+            params.key_length
+        } else if params.head_count > 0 && params.embedding_length >= params.head_count {
+            (params.embedding_length / params.head_count).max(1)
+        } else {
+            default
+        }
+    }
+
+    #[cfg(feature = "jero-kernels-rvv")]
+    fn hydrate_deepseek2_recipe(
+        params: &GgufHyperparams,
+        metadata: Option<&ModelMetadata>,
+    ) -> Box<dyn ArchRecipe> {
+        let mut recipe = crate::qwen_deepseek::DeepSeek2Recipe::new();
+        if params.block_count > 0 {
+            recipe.num_layers = params.block_count;
+        }
+        if params.embedding_length > 0 {
+            recipe.hidden_dim = params.embedding_length;
+        }
+        if params.feed_forward_length > 0 {
+            recipe.ffn_dim = params.feed_forward_length;
+        }
+        if params.head_count > 0 {
+            recipe.n_heads = params.head_count;
+        }
+        if params.vocab_size > 0 {
+            recipe.vocab_size = params.vocab_size;
+        }
+        if let Some(eps) = params.rms_norm_eps {
+            recipe.rms_eps = eps;
+        }
+        if let Some(freq) = params.rope_freq_base {
+            recipe.rope_theta = freq;
+        }
+        if let Some(meta) = metadata {
+            if let Some(rank) = meta.kv_lora_rank() {
+                recipe.mla.kv_lora_rank = rank;
+            }
+            if meta.q_lora_rank().is_some() {
+                recipe.mla.q_lora_rank = meta.q_lora_rank();
+            }
+            if let Some(nope) = meta.qk_nope_head_dim() {
+                recipe.mla.qk_nope_head_dim = nope;
+            }
+            if let Some(rope) = meta.qk_rope_head_dim() {
+                recipe.mla.qk_rope_head_dim = rope;
+            }
+            if let Some(v_dim) = meta.v_head_dim() {
+                recipe.mla.v_head_dim = v_dim;
+            }
+            if let Some(ec) = meta.expert_count() {
+                recipe.num_experts = ec;
+            }
+            if let Some(euc) = meta.expert_used_count() {
+                recipe.num_experts_per_tok = euc;
+            }
+            if let Some(esc) = meta.expert_shared_count() {
+                recipe.num_shared_experts = esc;
+            }
+        }
+        Box::new(recipe)
+    }
+
+    #[cfg(feature = "jero-kernels-rvv")]
+    fn hydrate_qwen35_recipe(
+        params: &GgufHyperparams,
+        metadata: Option<&ModelMetadata>,
+        is_moe: bool,
+    ) -> Box<dyn ArchRecipe> {
+        let mut base = crate::qwen_deepseek::Qwen35Recipe::new();
+        if params.block_count > 0 {
+            base.num_layers = params.block_count;
+        }
+        if params.embedding_length > 0 {
+            base.hidden_dim = params.embedding_length;
+        }
+        if params.feed_forward_length > 0 {
+            base.ffn_dim = params.feed_forward_length;
+        }
+        if params.head_count > 0 {
+            base.n_heads_q = params.head_count;
+        }
+        if params.head_count_kv > 0 {
+            base.n_heads_kv = params.head_count_kv;
+        }
+        base.head_dim = Self::infer_qwen_head_dim(params, base.head_dim);
+        if params.vocab_size > 0 {
+            base.vocab_size = params.vocab_size;
+        }
+        if let Some(eps) = params.rms_norm_eps {
+            base.rms_eps = eps;
+        }
+        if let Some(freq) = params.rope_freq_base {
+            base.rope_theta = freq;
+        }
+        if !is_moe {
+            return Box::new(base);
+        }
+        let mut moe = crate::qwen_deepseek::Qwen35MoeRecipe::new();
+        moe.base = base;
+        if let Some(meta) = metadata {
+            if let Some(ec) = meta.expert_count() {
+                moe.num_experts = ec;
+            }
+            if let Some(euc) = meta.expert_used_count() {
+                moe.num_experts_per_tok = euc;
+            }
+            if let Some(esc) = meta.expert_shared_count() {
+                moe.num_shared_experts = esc;
+            }
+        }
+        Box::new(moe)
+    }
+
+    #[cfg(feature = "jero-kernels-rvv")]
+    fn hydrate_qwen_deepseek_recipe(
+        params: &GgufHyperparams,
+        metadata: Option<&ModelMetadata>,
+    ) -> Option<Box<dyn ArchRecipe>> {
+        macro_rules! apply_qwen_dense_fields {
+            ($recipe:expr) => {{
+                if params.block_count > 0 {
+                    $recipe.num_layers = params.block_count;
+                }
+                if params.embedding_length > 0 {
+                    $recipe.hidden_dim = params.embedding_length;
+                }
+                if params.feed_forward_length > 0 {
+                    $recipe.ffn_dim = params.feed_forward_length;
+                }
+                if params.head_count > 0 {
+                    $recipe.n_heads_q = params.head_count;
+                }
+                if params.head_count_kv > 0 {
+                    $recipe.n_heads_kv = params.head_count_kv;
+                }
+                $recipe.head_dim = Self::infer_qwen_head_dim(params, $recipe.head_dim);
+                if params.vocab_size > 0 {
+                    $recipe.vocab_size = params.vocab_size;
+                }
+                if let Some(eps) = params.rms_norm_eps {
+                    $recipe.rms_eps = eps;
+                }
+                if let Some(freq) = params.rope_freq_base {
+                    $recipe.rope_theta = freq;
+                }
+            }};
+        }
+
+        match params.architecture.as_str() {
+            "qwen2" => {
+                let mut r = crate::qwen_deepseek::Qwen2Recipe::new();
+                apply_qwen_dense_fields!(r);
+                Some(Box::new(r))
+            }
+            "qwen3" => {
+                let mut r = crate::qwen_deepseek::Qwen3Recipe::new();
+                apply_qwen_dense_fields!(r);
+                Some(Box::new(r))
+            }
+            "qwen3moe" => {
+                let mut r = crate::qwen_deepseek::Qwen3MoeRecipe::new_30b_a3b();
+                apply_qwen_dense_fields!(r.base);
+                if let Some(meta) = metadata {
+                    if let Some(ec) = meta.expert_count() {
+                        r.num_experts = ec;
+                    }
+                    if let Some(euc) = meta.expert_used_count() {
+                        r.num_experts_per_tok = euc;
+                    }
+                }
+                Some(Box::new(r))
+            }
+            "deepseek2" => Some(Self::hydrate_deepseek2_recipe(params, metadata)),
+            "qwen35" => Some(Self::hydrate_qwen35_recipe(params, metadata, false)),
+            "qwen35moe" => Some(Self::hydrate_qwen35_recipe(params, metadata, true)),
+            _ => None,
+        }
+    }
+
     /// Instantiates a boxed [`ArchRecipe`] dynamically hydrated from [`ModelMetadata`].
     #[must_use]
     pub fn instantiate_recipe(metadata: &ModelMetadata) -> Option<Box<dyn ArchRecipe>> {
@@ -908,6 +1149,11 @@ fn validate_recipe_against_metadata(
             ),
         });
     }
+
+    #[cfg(feature = "jero-kernels-rvv")]
+    crate::qwen_deepseek::validate_qwen_revision_from_probe(recipe.architecture_id(), |name| {
+        metadata.find_tensor(name).is_some()
+    })?;
 
     Ok(())
 }
@@ -1011,6 +1257,16 @@ mod tests {
             assert!(archs.contains(&"bert"));
             assert!(archs.contains(&"deberta-v3"));
         }
+        #[cfg(feature = "jero-kernels-rvv")]
+        {
+            assert!(archs.contains(&"qwen2"));
+            assert!(archs.contains(&"qwen3"));
+            assert!(archs.contains(&"qwen3moe"));
+            assert!(archs.contains(&"deepseek2"));
+            assert!(archs.contains(&"qwen35"));
+            assert!(archs.contains(&"qwen35moe"));
+            assert!(!archs.contains(&"qwen3.8"));
+        }
     }
 
     #[cfg(feature = "jero-arch-modernbert")]
@@ -1097,6 +1353,9 @@ mod tests {
             let llama4 = RecipeRegistry::find_recipe("llama4").expect("llama4 found");
             assert_eq!(llama4.architecture_id(), "llama4");
             let qwen2 = RecipeRegistry::find_recipe("qwen2").expect("qwen2 found");
+            #[cfg(feature = "jero-kernels-rvv")]
+            assert_eq!(qwen2.architecture_id(), "qwen2");
+            #[cfg(not(feature = "jero-kernels-rvv"))]
             assert_eq!(qwen2.architecture_id(), "llama");
         }
 

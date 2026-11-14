@@ -931,7 +931,12 @@ fn format_chat_messages(
     }
 
     let tmpl = tokenizer.chat_template().raw_template().unwrap_or_default();
-    if tmpl.contains("<|im_start|>") || arch_name == "qwen2" || arch_name == "dory" {
+    if tmpl.contains("<|im_start|>")
+        || matches!(
+            arch_name,
+            "qwen2" | "qwen3" | "qwen3moe" | "qwen35" | "qwen35moe" | "dory"
+        )
+    {
         let mut buf = String::new();
         if arch_name == "dory" {
             buf.push_str("<s>");

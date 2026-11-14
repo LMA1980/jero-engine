@@ -23,6 +23,7 @@ pub struct SingleSlotKvArena {
     head_dim: usize,
     elements_per_token: usize,
     elements_per_block: usize,
+    mla_split: Option<(usize, usize)>,
 }
 
 // SAFETY: SingleSlotKvArena owns an mmap/mlocked buffer of floats. Concurrent immutable access is safe.
@@ -39,10 +40,9 @@ struct ArenaLayout {
     aligned_bytes: usize,
 }
 
-fn calculate_arena_layout(
+fn build_arena_layout(
     layer_count: usize,
-    head_count_kv: usize,
-    head_dim: usize,
+    elements_per_token: usize,
     n_ctx: usize,
 ) -> Result<ArenaLayout, K3Error> {
     let num_blocks = n_ctx.div_ceil(KV_BLOCK_SIZE);
@@ -56,19 +56,6 @@ fn calculate_arena_layout(
                 buffer_len: usize::MAX,
                 reason: "allocated tokens overflowed usize".to_owned(),
             })?;
-
-    // 2 vectors (Key and Value) per layer * head_count_kv * head_dim
-    let elements_per_token = 2usize
-        .checked_mul(layer_count)
-        .and_then(|v| v.checked_mul(head_count_kv))
-        .and_then(|v| v.checked_mul(head_dim))
-        .ok_or_else(|| K3Error::TensorBoundsError {
-            tensor_name: "kv_arena".to_owned(),
-            offset: 0,
-            byte_len: 0,
-            buffer_len: usize::MAX,
-            reason: "elements per token overflowed usize".to_owned(),
-        })?;
 
     let elements_per_block = KV_BLOCK_SIZE
         .checked_mul(elements_per_token)
@@ -100,6 +87,7 @@ fn calculate_arena_layout(
             reason: "raw bytes overflowed usize".to_owned(),
         })?;
 
+    let _ = layer_count;
     let page_size = system_page_size();
     let aligned_bytes = align_up(raw_bytes, page_size);
 
@@ -110,6 +98,27 @@ fn calculate_arena_layout(
         total_elements,
         aligned_bytes,
     })
+}
+
+fn calculate_arena_layout(
+    layer_count: usize,
+    head_count_kv: usize,
+    head_dim: usize,
+    n_ctx: usize,
+) -> Result<ArenaLayout, K3Error> {
+    // 2 vectors (Key and Value) per layer * head_count_kv * head_dim
+    let elements_per_token = 2usize
+        .checked_mul(layer_count)
+        .and_then(|v| v.checked_mul(head_count_kv))
+        .and_then(|v| v.checked_mul(head_dim))
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_arena".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "elements per token overflowed usize".to_owned(),
+        })?;
+    build_arena_layout(layer_count, elements_per_token, n_ctx)
 }
 
 impl SingleSlotKvArena {
@@ -142,6 +151,11 @@ impl SingleSlotKvArena {
 
         let params = GgufHyperparams::from_metadata(metadata);
         let layer_count = params.block_count.max(1);
+        if metadata.architecture() == "deepseek2" || metadata.kv_lora_rank().is_some() {
+            let kv_lora_rank = metadata.kv_lora_rank().unwrap_or(512).max(1);
+            let qk_rope_head_dim = metadata.qk_rope_head_dim().unwrap_or(64).max(1);
+            return Self::with_mla_latent_dim(layer_count, kv_lora_rank, qk_rope_head_dim, n_ctx);
+        }
         let head_count_kv = params.head_count_kv.max(1);
         let head_dim = params
             .key_length
@@ -184,10 +198,6 @@ impl SingleSlotKvArena {
             return Ok(Self::empty(n_ctx));
         }
 
-        if !crate::memory::architecture_requires_kv_cache(metadata.architecture()) {
-            return Ok(Self::empty(n_ctx));
-        }
-
         let params = GgufHyperparams::from_gguf(gguf);
         let layer_count = if let Some(dory) = metadata.dory() {
             let virtual_layers = dory
@@ -203,6 +213,11 @@ impl SingleSlotKvArena {
         } else {
             params.block_count.max(1)
         };
+        if metadata.architecture() == "deepseek2" || metadata.kv_lora_rank().is_some() {
+            let kv_lora_rank = metadata.kv_lora_rank().unwrap_or(512).max(1);
+            let qk_rope_head_dim = metadata.qk_rope_head_dim().unwrap_or(64).max(1);
+            return Self::with_mla_latent_dim(layer_count, kv_lora_rank, qk_rope_head_dim, n_ctx);
+        }
         let head_count_kv = params.head_count_kv.max(1);
         let head_dim = params
             .key_length
@@ -216,19 +231,14 @@ impl SingleSlotKvArena {
         Self::with_dimensions(layer_count, head_count_kv, head_dim, n_ctx)
     }
 
-    /// Allocates and locks an arena with explicitly specified model dimensions.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`K3Error::InsufficientLockableMemory`] if allocation or `mlock` fails.
-    pub fn with_dimensions(
+    fn allocate_locked_arena(
+        layout: ArenaLayout,
+        n_ctx: usize,
         layer_count: usize,
         head_count_kv: usize,
         head_dim: usize,
-        n_ctx: usize,
+        mla_split: Option<(usize, usize)>,
     ) -> Result<Self, K3Error> {
-        let layout = calculate_arena_layout(layer_count, head_count_kv, head_dim, n_ctx)?;
-
         // 1. Allocate anonymous memory pages
         // SAFETY: mmap is called with valid length, anonymous mapping, and read/write protection.
         let raw_ptr = unsafe {
@@ -298,7 +308,74 @@ impl SingleSlotKvArena {
             head_dim,
             elements_per_token: layout.elements_per_token,
             elements_per_block: layout.elements_per_block,
+            mla_split,
         })
+    }
+
+    /// Allocates and locks an arena with explicitly specified model dimensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::InsufficientLockableMemory`] if allocation or `mlock` fails.
+    pub fn with_dimensions(
+        layer_count: usize,
+        head_count_kv: usize,
+        head_dim: usize,
+        n_ctx: usize,
+    ) -> Result<Self, K3Error> {
+        let layout = calculate_arena_layout(layer_count, head_count_kv, head_dim, n_ctx)?;
+        Self::allocate_locked_arena(layout, n_ctx, layer_count, head_count_kv, head_dim, None)
+    }
+
+    /// Allocates and locks an `MLA` compressed latent KV arena sized for `deepseek2`
+    /// (`layer_count * (kv_lora_rank + qk_rope_head_dim)` floats per token).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::CapabilityMismatch`] if any dimension is zero, or
+    /// [`K3Error::InsufficientLockableMemory`] / [`K3Error::TensorBoundsError`] on overflow or allocation failure.
+    pub fn with_mla_latent_dim(
+        layer_count: usize,
+        kv_lora_rank: usize,
+        qk_rope_head_dim: usize,
+        n_ctx: usize,
+    ) -> Result<Self, K3Error> {
+        if layer_count == 0 || kv_lora_rank == 0 || qk_rope_head_dim == 0 || n_ctx == 0 {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "deepseek2".to_owned(),
+                reason: format!(
+                    "MLA arena dimensions must all be > 0 (got layers={layer_count}, kv_lora_rank={kv_lora_rank}, qk_rope_head_dim={qk_rope_head_dim}, n_ctx={n_ctx})"
+                ),
+            });
+        }
+        let kv_latent_dim = kv_lora_rank.checked_add(qk_rope_head_dim).ok_or_else(|| {
+            K3Error::TensorBoundsError {
+                tensor_name: "kv_arena".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "MLA latent dimension overflowed usize".to_owned(),
+            }
+        })?;
+        let elements_per_token =
+            layer_count
+                .checked_mul(kv_latent_dim)
+                .ok_or_else(|| K3Error::TensorBoundsError {
+                    tensor_name: "kv_arena".to_owned(),
+                    offset: 0,
+                    byte_len: 0,
+                    buffer_len: usize::MAX,
+                    reason: "MLA elements per token overflowed usize".to_owned(),
+                })?;
+        let layout = build_arena_layout(layer_count, elements_per_token, n_ctx)?;
+        Self::allocate_locked_arena(
+            layout,
+            n_ctx,
+            layer_count,
+            1,
+            kv_latent_dim,
+            Some((kv_lora_rank, qk_rope_head_dim)),
+        )
     }
 
     /// Creates a zero-allocation arena handle for non-autoregressive architectures that do not
@@ -316,6 +393,7 @@ impl SingleSlotKvArena {
             head_dim: 0,
             elements_per_token: 0,
             elements_per_block: 0,
+            mla_split: None,
         }
     }
 
@@ -440,7 +518,51 @@ impl SingleSlotKvArena {
         Ok(&mut self.as_mut_slice()[start..end])
     }
 
-    /// Returns `(key_slice, value_slice)` views for a specific logical token position and layer.
+    fn resolve_token_layer_offsets(
+        &self,
+        token_pos: usize,
+        layer: usize,
+    ) -> Result<(usize, usize, usize, usize), K3Error> {
+        if token_pos >= self.n_ctx {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: token_pos + 1,
+                max_context_tokens: self.n_ctx,
+            });
+        }
+
+        if layer >= self.layer_count {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "kv_layer".to_owned(),
+                offset: layer,
+                byte_len: 0,
+                buffer_len: self.layer_count,
+                reason: format!(
+                    "layer index {layer} exceeds model layer count {}",
+                    self.layer_count
+                ),
+            });
+        }
+
+        let block_idx = token_pos / KV_BLOCK_SIZE;
+        let token_in_block = token_pos % KV_BLOCK_SIZE;
+        let token_start =
+            (block_idx * self.elements_per_block) + (token_in_block * self.elements_per_token);
+
+        if let Some((kv_lora_rank, qk_rope_head_dim)) = self.mla_split {
+            let latent_dim = kv_lora_rank + qk_rope_head_dim;
+            let c_kv_start = token_start + (layer * latent_dim);
+            let k_rope_start = c_kv_start + kv_lora_rank;
+            return Ok((c_kv_start, kv_lora_rank, k_rope_start, qk_rope_head_dim));
+        }
+
+        let head_kv_elements = self.head_count_kv * self.head_dim;
+        let key_start = token_start + (layer * 2 * head_kv_elements);
+        let val_start = key_start + head_kv_elements;
+        Ok((key_start, head_kv_elements, val_start, head_kv_elements))
+    }
+
+    /// Returns `(key_slice, value_slice)` views (or `(c_kv, k_rope)` for `MLA`) for a specific
+    /// logical token position and layer.
     ///
     /// # Errors
     ///
@@ -451,43 +573,17 @@ impl SingleSlotKvArena {
         token_pos: usize,
         layer: usize,
     ) -> Result<(&[f32], &[f32]), K3Error> {
-        if token_pos >= self.n_ctx {
-            return Err(K3Error::ContextLengthExceeded {
-                requested_tokens: token_pos + 1,
-                max_context_tokens: self.n_ctx,
-            });
-        }
-
-        if layer >= self.layer_count {
-            return Err(K3Error::TensorBoundsError {
-                tensor_name: "kv_layer".to_owned(),
-                offset: layer,
-                byte_len: 0,
-                buffer_len: self.layer_count,
-                reason: format!(
-                    "layer index {layer} exceeds model layer count {}",
-                    self.layer_count
-                ),
-            });
-        }
-
-        let block_idx = token_pos / KV_BLOCK_SIZE;
-        let token_in_block = token_pos % KV_BLOCK_SIZE;
-        let head_kv_elements = self.head_count_kv * self.head_dim;
-
-        let token_start =
-            (block_idx * self.elements_per_block) + (token_in_block * self.elements_per_token);
-        let layer_start = token_start + (layer * 2 * head_kv_elements);
-        let key_start = layer_start;
-        let key_end = key_start + head_kv_elements;
-        let val_start = key_end;
-        let val_end = val_start + head_kv_elements;
-
+        let (first_start, first_len, second_start, second_len) =
+            self.resolve_token_layer_offsets(token_pos, layer)?;
         let full = self.as_slice();
-        Ok((&full[key_start..key_end], &full[val_start..val_end]))
+        Ok((
+            &full[first_start..first_start + first_len],
+            &full[second_start..second_start + second_len],
+        ))
     }
 
-    /// Returns mutable `(key_slice, value_slice)` views for a specific logical token position and layer.
+    /// Returns mutable `(key_slice, value_slice)` views (or `(c_kv, k_rope)` for `MLA`) for a
+    /// specific logical token position and layer.
     ///
     /// # Errors
     ///
@@ -498,43 +594,12 @@ impl SingleSlotKvArena {
         token_pos: usize,
         layer: usize,
     ) -> Result<(&mut [f32], &mut [f32]), K3Error> {
-        if token_pos >= self.n_ctx {
-            return Err(K3Error::ContextLengthExceeded {
-                requested_tokens: token_pos + 1,
-                max_context_tokens: self.n_ctx,
-            });
-        }
-
-        if layer >= self.layer_count {
-            return Err(K3Error::TensorBoundsError {
-                tensor_name: "kv_layer".to_owned(),
-                offset: layer,
-                byte_len: 0,
-                buffer_len: self.layer_count,
-                reason: format!(
-                    "layer index {layer} exceeds model layer count {}",
-                    self.layer_count
-                ),
-            });
-        }
-
-        let block_idx = token_pos / KV_BLOCK_SIZE;
-        let token_in_block = token_pos % KV_BLOCK_SIZE;
-        let head_kv_elements = self.head_count_kv * self.head_dim;
-
-        let token_start =
-            (block_idx * self.elements_per_block) + (token_in_block * self.elements_per_token);
-        let layer_start = token_start + (layer * 2 * head_kv_elements);
-        let key_start = layer_start;
-        let key_end = key_start + head_kv_elements;
-        let val_start = key_end;
-
+        let (first_start, first_len, second_start, second_len) =
+            self.resolve_token_layer_offsets(token_pos, layer)?;
+        let first_end = first_start + first_len;
         let full = self.as_mut_slice();
-        let (left, right) = full.split_at_mut(val_start);
-        let key_slice = &mut left[key_start..key_end];
-        let val_slice = &mut right[..head_kv_elements];
-
-        Ok((key_slice, val_slice))
+        let (left, right) = full.split_at_mut(second_start);
+        Ok((&mut left[first_start..first_end], &mut right[..second_len]))
     }
 }
 
@@ -749,5 +814,53 @@ mod tests {
         };
         assert_eq!(view.slot_idx, 1);
         assert_eq!(view.active_len, 4);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_mla_kv_arena_layout_and_slices() {
+        use jero_core::GgufValue;
+        use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
+
+        let ds_kvs = [
+            ("deepseek2.block_count", GgufValue::Uint32(3)),
+            ("deepseek2.embedding_length", GgufValue::Uint32(128)),
+            ("deepseek2.attention.head_count", GgufValue::Uint32(4)),
+            ("deepseek2.attention.head_count_kv", GgufValue::Uint32(4)),
+            ("deepseek2.attention.kv_lora_rank", GgufValue::Uint32(16)),
+            ("deepseek2.rope.dimension_count", GgufValue::Uint32(8)),
+            ("deepseek2.context_length", GgufValue::Uint32(32)),
+        ];
+        let bytes = create_synthetic_gguf_v3_with_kvs("deepseek2", 32, &ds_kvs, &[]);
+        let gguf = GgufFile::parse(&bytes).expect("parse deepseek2 gguf");
+
+        let mut arena = SingleSlotKvArena::from_gguf(&gguf, 16).expect("allocate MLA kv arena");
+        // latent_dim = 16 + 8 = 24 floats per layer, 3 layers => 72 floats/token (no 2x factor)
+        assert_eq!(arena.layer_count(), 3);
+        assert_eq!(arena.head_count_kv(), 1);
+        assert_eq!(arena.head_dim(), 24);
+        assert_eq!(arena.elements_per_token(), 3 * 24);
+        assert_eq!(arena.total_elements(), 16 * 3 * 24);
+        assert!(arena.aligned_bytes() >= 16 * 3 * 24 * size_of::<f32>());
+
+        {
+            let (c_kv, k_rope) = arena
+                .token_kv_slice_mut(7, 2)
+                .expect("token 7 layer 2 mutable MLA slices");
+            assert_eq!(c_kv.len(), 16);
+            assert_eq!(k_rope.len(), 8);
+            c_kv[15] = 4.25;
+            k_rope[7] = -1.75;
+        }
+
+        let (c_kv_ref, k_rope_ref) = arena
+            .token_kv_slice(7, 2)
+            .expect("token 7 layer 2 immutable MLA slices");
+        assert_eq!(c_kv_ref.len(), 16);
+        assert_eq!(k_rope_ref.len(), 8);
+        assert!((c_kv_ref[15] - 4.25).abs() < f32::EPSILON);
+        assert!((k_rope_ref[7] + 1.75).abs() < f32::EPSILON);
+
+        assert!(SingleSlotKvArena::with_mla_latent_dim(3, 0, 8, 16).is_err());
     }
 }
