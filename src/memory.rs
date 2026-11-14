@@ -344,6 +344,158 @@ pub fn calculate_footprint(
     calculate_footprint_with_slots(metadata, n_ctx, 1)
 }
 
+/// Returns `true` if `arch` requires an autoregressive KV cache allocation (`false` for
+/// single-pass bidirectional encoders such as `modernbert`, `bert`, and `deberta-v3`).
+#[must_use]
+pub const fn architecture_requires_kv_cache(arch: &str) -> bool {
+    !matches!(arch.as_bytes(), b"modernbert" | b"bert" | b"deberta-v3")
+}
+
+/// Computes the raw unaligned KV cache size in bytes across `slots` concurrency slots.
+fn estimate_raw_kv_bytes_for_slots(
+    metadata: &ModelMetadata,
+    n_ctx: usize,
+    blocks_per_slot: usize,
+    slots: usize,
+) -> Result<usize, K3Error> {
+    if metadata.architecture() == "dory" {
+        let single_slot_dory_bytes = estimate_dory_kv_cache_bytes(metadata, n_ctx, None, None)?;
+        return single_slot_dory_bytes.checked_mul(slots).ok_or_else(|| {
+            K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "dory multi-slot kv bytes calculation overflowed usize".to_owned(),
+            }
+        });
+    }
+
+    if matches!(
+        metadata.architecture(),
+        "gemma2" | "gemma3" | "gemma4" | "functiongemma"
+    ) {
+        let per_slot_tokens = blocks_per_slot.checked_mul(KV_BLOCK_SIZE).ok_or_else(|| {
+            K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "per-slot kv allocated tokens overflow usize".to_owned(),
+            }
+        })?;
+        let layer_count = metadata.layer_count().max(1);
+        let head_count_kv = metadata.head_count_kv().max(1);
+        let head_dim = if metadata.head_count() > 0 {
+            metadata.embedding_dim() / metadata.head_count()
+        } else {
+            metadata.embedding_dim()
+        }
+        .max(1);
+        let policy_arch = if metadata.architecture() == "functiongemma" {
+            "gemma3"
+        } else {
+            metadata.architecture()
+        };
+        let policies = gemma_layer_kv_policies(policy_arch, layer_count, None);
+        let single_slot_gemma_bytes =
+            estimate_hybrid_kv_cache_bytes(per_slot_tokens, head_count_kv, head_dim, &policies)?;
+        return single_slot_gemma_bytes.checked_mul(slots).ok_or_else(|| {
+            K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "gemma multi-slot kv bytes calculation overflowed usize".to_owned(),
+            }
+        });
+    }
+
+    let kv_allocated_tokens = blocks_per_slot
+        .checked_mul(slots)
+        .and_then(|blocks| blocks.checked_mul(KV_BLOCK_SIZE))
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "kv allocated tokens calculation overflowed usize".to_owned(),
+        })?;
+    let layer_count = metadata.layer_count().max(1);
+    let head_count_kv = metadata.head_count_kv().max(1);
+    let head_dim = if metadata.head_count() > 0 {
+        metadata.embedding_dim() / metadata.head_count()
+    } else {
+        metadata.embedding_dim()
+    }
+    .max(1);
+
+    let elements_per_token = 2usize
+        .checked_mul(layer_count)
+        .and_then(|v| v.checked_mul(head_count_kv))
+        .and_then(|v| v.checked_mul(head_dim))
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "kv elements per token calculation overflowed usize".to_owned(),
+        })?;
+
+    let total_elements = kv_allocated_tokens
+        .checked_mul(elements_per_token)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "total kv elements calculation overflowed usize".to_owned(),
+        })?;
+
+    total_elements
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "raw kv bytes calculation overflowed usize".to_owned(),
+        })
+}
+
+/// Estimates page-aligned single-slot KV cache bytes for `metadata` and `n_ctx`.
+///
+/// Returns `Ok(0)` without reserving KV cache pages when `requires_kv_cache` is `false`
+/// or when `metadata.architecture()` is a zero-KV encoder (`modernbert`, `bert`, `deberta-v3`).
+///
+/// # Errors
+/// Returns [`K3Error::CapabilityMismatch`] if `n_ctx == 0`, [`K3Error::ContextLengthExceeded`]
+/// if `n_ctx > metadata.context_length()`, or [`K3Error::TensorBoundsError`] on size overflow.
+pub fn estimate_kv_cache_bytes(
+    metadata: &ModelMetadata,
+    n_ctx: usize,
+    requires_kv_cache: bool,
+) -> Result<usize, K3Error> {
+    if n_ctx == 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: metadata.architecture().to_owned(),
+            reason: "requested context length n_ctx must be greater than zero".to_owned(),
+        });
+    }
+    if metadata.context_length() > 0 && n_ctx > metadata.context_length() {
+        return Err(K3Error::ContextLengthExceeded {
+            requested_tokens: n_ctx,
+            max_context_tokens: metadata.context_length(),
+        });
+    }
+    if !requires_kv_cache || !architecture_requires_kv_cache(metadata.architecture()) {
+        return Ok(0);
+    }
+    let blocks_per_slot = n_ctx.div_ceil(KV_BLOCK_SIZE);
+    let raw_bytes = estimate_raw_kv_bytes_for_slots(metadata, n_ctx, blocks_per_slot, 1)?;
+    Ok(align_up(raw_bytes, system_page_size()))
+}
+
 /// Computes the exact page-aligned memory footprint required for model weights
 /// and a standalone KV cache arena sized to `n_ctx` tokens across `active_slots` concurrency slots (ADR-027, ADR-037, ADR-043).
 ///
@@ -351,7 +503,6 @@ pub fn calculate_footprint(
 ///
 /// Returns [`K3Error::ContextLengthExceeded`] if `n_ctx` exceeds the model's trained context limit.
 /// Returns [`K3Error::CapabilityMismatch`] if `n_ctx` is zero or if required architecture dimensions are zero.
-#[allow(clippy::too_many_lines)]
 pub fn calculate_footprint_with_slots(
     metadata: &ModelMetadata,
     n_ctx: usize,
@@ -385,6 +536,16 @@ pub fn calculate_footprint_with_slots(
             reason: "aligned weight bytes overflow u64".to_owned(),
         })?;
 
+    if !architecture_requires_kv_cache(metadata.architecture()) {
+        return Ok(MemoryFootprint {
+            weight_bytes,
+            kv_bytes: 0,
+            total_required_bytes: weight_bytes,
+            kv_block_count: 0,
+            kv_allocated_tokens: 0,
+        });
+    }
+
     // 2. Standalone KV cache footprint (16-token blocks scaled by active_slots, page-aligned)
     let blocks_per_slot = n_ctx.div_ceil(KV_BLOCK_SIZE);
     let slots = active_slots.max(1);
@@ -409,90 +570,7 @@ pub fn calculate_footprint_with_slots(
                 reason: "kv allocated tokens overflow usize".to_owned(),
             })?;
 
-    let raw_kv_bytes = if metadata.architecture() == "dory" {
-        let single_slot_dory_bytes = estimate_dory_kv_cache_bytes(metadata, n_ctx, None, None)?;
-        single_slot_dory_bytes
-            .checked_mul(slots)
-            .ok_or_else(|| K3Error::TensorBoundsError {
-                tensor_name: "kv_cache".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: usize::MAX,
-                reason: "dory multi-slot kv bytes calculation overflowed usize".to_owned(),
-            })?
-    } else if matches!(metadata.architecture(), "gemma2" | "gemma3" | "gemma4") {
-        let per_slot_tokens = blocks_per_slot.checked_mul(KV_BLOCK_SIZE).ok_or_else(|| {
-            K3Error::TensorBoundsError {
-                tensor_name: "kv_cache".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: usize::MAX,
-                reason: "per-slot kv allocated tokens overflow usize".to_owned(),
-            }
-        })?;
-        let layer_count = metadata.layer_count().max(1);
-        let head_count_kv = metadata.head_count_kv().max(1);
-        let head_dim = if metadata.head_count() > 0 {
-            metadata.embedding_dim() / metadata.head_count()
-        } else {
-            metadata.embedding_dim()
-        }
-        .max(1);
-        let policies = gemma_layer_kv_policies(metadata.architecture(), layer_count, None);
-        let single_slot_gemma_bytes =
-            estimate_hybrid_kv_cache_bytes(per_slot_tokens, head_count_kv, head_dim, &policies)?;
-        single_slot_gemma_bytes
-            .checked_mul(slots)
-            .ok_or_else(|| K3Error::TensorBoundsError {
-                tensor_name: "kv_cache".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: usize::MAX,
-                reason: "gemma multi-slot kv bytes calculation overflowed usize".to_owned(),
-            })?
-    } else {
-        let layer_count = metadata.layer_count().max(1);
-        let head_count_kv = metadata.head_count_kv().max(1);
-        let head_dim = if metadata.head_count() > 0 {
-            metadata.embedding_dim() / metadata.head_count()
-        } else {
-            metadata.embedding_dim()
-        }
-        .max(1);
-
-        // Each token stores Key and Value vectors: 2 * layer_count * head_count_kv * head_dim (f32 elements)
-        let elements_per_token = 2usize
-            .checked_mul(layer_count)
-            .and_then(|v| v.checked_mul(head_count_kv))
-            .and_then(|v| v.checked_mul(head_dim))
-            .ok_or_else(|| K3Error::TensorBoundsError {
-                tensor_name: "kv_cache".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: usize::MAX,
-                reason: "kv elements per token calculation overflowed usize".to_owned(),
-            })?;
-
-        let total_elements = kv_allocated_tokens
-            .checked_mul(elements_per_token)
-            .ok_or_else(|| K3Error::TensorBoundsError {
-                tensor_name: "kv_cache".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: usize::MAX,
-                reason: "total kv elements calculation overflowed usize".to_owned(),
-            })?;
-
-        total_elements
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| K3Error::TensorBoundsError {
-                tensor_name: "kv_cache".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: usize::MAX,
-                reason: "raw kv bytes calculation overflowed usize".to_owned(),
-            })?
-    };
+    let raw_kv_bytes = estimate_raw_kv_bytes_for_slots(metadata, n_ctx, blocks_per_slot, slots)?;
 
     let kv_bytes_aligned = align_up(raw_kv_bytes, page_size);
     let kv_bytes = u64::try_from(kv_bytes_aligned).map_err(|_| K3Error::TensorBoundsError {

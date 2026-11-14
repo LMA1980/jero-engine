@@ -136,6 +136,10 @@ impl SingleSlotKvArena {
             });
         }
 
+        if !crate::memory::architecture_requires_kv_cache(metadata.architecture()) {
+            return Ok(Self::empty(n_ctx));
+        }
+
         let params = GgufHyperparams::from_metadata(metadata);
         let layer_count = params.block_count.max(1);
         let head_count_kv = params.head_count_kv.max(1);
@@ -174,6 +178,14 @@ impl SingleSlotKvArena {
                 requested_tokens: n_ctx,
                 max_context_tokens: metadata.context_length(),
             });
+        }
+
+        if !crate::memory::architecture_requires_kv_cache(metadata.architecture()) {
+            return Ok(Self::empty(n_ctx));
+        }
+
+        if !crate::memory::architecture_requires_kv_cache(metadata.architecture()) {
+            return Ok(Self::empty(n_ctx));
         }
 
         let params = GgufHyperparams::from_gguf(gguf);
@@ -287,6 +299,24 @@ impl SingleSlotKvArena {
             elements_per_token: layout.elements_per_token,
             elements_per_block: layout.elements_per_block,
         })
+    }
+
+    /// Creates a zero-allocation arena handle for non-autoregressive architectures that do not
+    /// require a persistent KV cache (e.g., `modernbert`, `bert`, `deberta-v3`).
+    #[must_use]
+    pub const fn empty(n_ctx: usize) -> Self {
+        Self {
+            ptr: ptr::NonNull::<f32>::dangling().as_ptr(),
+            total_elements: 0,
+            aligned_bytes: 0,
+            n_ctx,
+            num_blocks: 0,
+            layer_count: 0,
+            head_count_kv: 0,
+            head_dim: 0,
+            elements_per_token: 0,
+            elements_per_block: 0,
+        }
     }
 
     /// Returns the maximum context sequence length configured for this arena.
@@ -510,6 +540,9 @@ impl SingleSlotKvArena {
 
 impl Drop for SingleSlotKvArena {
     fn drop(&mut self) {
+        if self.aligned_bytes == 0 {
+            return;
+        }
         let ptr = self.ptr.cast::<libc::c_void>();
         let bytes = self.aligned_bytes;
 
