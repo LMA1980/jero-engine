@@ -29,13 +29,15 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use jero_core::{CoordinationProfile, GgufFile, K3Error, ModelIdentity, QuantizationInfo};
-use jero_engine::affinity::{SplitStrategy, resolve_affinity_split};
+use jero_engine::affinity::{SplitStrategy, resolve_affinity_split, resolve_phase_policy};
 use jero_engine::forward::MatKernel;
 use jero_engine::memory::calculate_footprint;
 use jero_engine::{
-    ClusterPhasePolicy, LockedModelWeights, SinglePromptEngine, SingleSlotKvArena, StreamAction,
-    SystemMemoryInspector, WorkerPool, tokenize_prompt_utf8_safe,
+    A100_CLUSTER_MASK, ClusterPhasePolicy, LockedModelWeights, SinglePromptEngine,
+    SingleSlotKvArena, StreamAction, SystemMemoryInspector, WorkerPool, X100_CLUSTER_MASK,
+    tokenize_prompt_utf8_safe,
 };
+use jero_kernels_rvv::ime::ime_vmadot_count;
 use jero_tokenizer::{DetokenizeStep, GgufTokenizer};
 use serde::{Deserialize, Serialize};
 
@@ -620,6 +622,19 @@ fn print_usage() {
     );
 }
 
+fn resolve_engine_policy(
+    split: Option<SplitStrategy>,
+    architecture: &str,
+    prompt_len: usize,
+    effective_mask: u64,
+) -> ClusterPhasePolicy {
+    let requested = match split {
+        Some(SplitStrategy::Row) => ClusterPhasePolicy::RowSplit,
+        _ => ClusterPhasePolicy::Auto,
+    };
+    resolve_phase_policy(requested, architecture, prompt_len, effective_mask)
+}
+
 /// Executes multi-iteration evaluation pipeline for real GGUF models with placement, ceiling,
 /// cost-profile, and determinism benchmarking (US-02, US-03, US-04).
 pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Result<(), K3Error> {
@@ -718,10 +733,12 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
         let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
         let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
         let prompt_tokens = tokenize_prompt_utf8_safe(&tokenizer, prompt_text, true, n_ctx)?;
-        let phase_policy = match config.split {
-            Some(SplitStrategy::Row) => ClusterPhasePolicy::RowSplit,
-            _ => ClusterPhasePolicy::Auto,
-        };
+        let resolved_policy = resolve_engine_policy(
+            config.split,
+            recipe.architecture_id(),
+            prompt_tokens.len(),
+            resolved_affinity.effective_mask,
+        );
         (
             worker_pool,
             resolved_affinity,
@@ -733,7 +750,7 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
             prompt_tokens,
             effective_core_mask,
             thread_count,
-            SinglePromptEngine::new().with_phase_policy(phase_policy),
+            SinglePromptEngine::new().with_phase_policy(resolved_policy),
         )
     };
 
@@ -743,15 +760,26 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
         .min(n_ctx.saturating_sub(prompt_tokens.len()));
     let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
 
+    struct GgufArmOutcome {
+        samples: Vec<bench::ArmSample>,
+        observed_prefill_cores: u64,
+        observed_decode_cores: u64,
+        any_decode: bool,
+    }
+
     let run_gguf_arm = |engine: &mut SinglePromptEngine,
                         fault: Option<usize>|
-     -> Result<Vec<bench::ArmSample>, K3Error> {
+     -> Result<GgufArmOutcome, K3Error> {
         let mut samples = Vec::with_capacity(repeat_count);
+        let mut observed_prefill_cores = 0_u64;
+        let mut observed_decode_cores = 0_u64;
+        let mut any_decode = false;
         for run_idx in 0..repeat_count {
             if is_abort_requested() {
                 break;
             }
             let mut kv_arena = SingleSlotKvArena::from_gguf(&gguf_view, n_ctx)?;
+            let ime_before = ime_vmadot_count();
             let mut summary = engine.evaluate_prompt_with_pool(
                 recipe.as_ref(),
                 &locked_weights,
@@ -768,6 +796,12 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
                     }
                 },
             )?;
+            let vmadot_issued = ime_vmadot_count().saturating_sub(ime_before);
+            observed_prefill_cores |= engine.last_prefill_cpu_mask();
+            observed_decode_cores |= engine.last_decode_cpu_mask();
+            if summary.timing.decode_steps > 0 {
+                any_decode = true;
+            }
             bench::inject_fault_if_requested(
                 fault,
                 run_idx,
@@ -778,29 +812,41 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
                 prompt_tokens: summary.prompt_tokens,
                 timing: summary.timing,
                 generated_tokens: summary.generated_tokens,
-                vmadot_issued: 0,
+                vmadot_issued,
             });
         }
-        Ok(samples)
+        Ok(GgufArmOutcome {
+            samples,
+            observed_prefill_cores,
+            observed_decode_cores,
+            any_decode,
+        })
     };
 
-    // 4. Multi-Run Execution Loop via SinglePromptEngine (and IME-off baseline when IME is on)
+    // 4. Multi-Run Execution Loop via SinglePromptEngine.
+    //    SinglePromptEngine/ArchRecipe do not expose an explicit IME kernel toggle,
+    //    so real GGUF runs record actual vmadot deltas and omit fabricated IME-off baselines.
     let primary_kernel = if ime_on {
         MatKernel::Ime
     } else {
         MatKernel::Vector
     };
-    let primary_samples = run_gguf_arm(&mut engine, bench::fault_index())?;
-    let baseline_samples = if ime_on {
-        Some((MatKernel::Vector, run_gguf_arm(&mut engine, None)?))
-    } else {
-        None
-    };
+    let GgufArmOutcome {
+        samples: primary_samples,
+        observed_prefill_cores,
+        observed_decode_cores,
+        any_decode,
+    } = run_gguf_arm(&mut engine, bench::fault_index())?;
+    let baseline_samples = None;
 
-    // 5. Re-verify worker affinities post-execution to guarantee zero cross-cluster migration
+    // 5. Re-verify worker affinities and actual per-phase execution masks post-execution
     let after = worker_pool.verify_live_affinities()?;
-    let (plan, row_split) =
-        bench::build_plan(&worker_pool, &affinity, primary_kernel, config.phase_policy)?;
+    let (plan, row_split) = bench::build_plan(
+        &worker_pool,
+        &affinity,
+        primary_kernel,
+        Some(engine.phase_policy()),
+    )?;
     let observed_all_cores = after
         .iter()
         .filter(|w| w.assigned_core < 64)
@@ -815,10 +861,45 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
             ),
         });
     }
-    let (expected_matmul, expected_vector) = bench::expected_phase_masks(&plan);
-    let observed_matmul = observed_all_cores & expected_matmul;
-    let observed_vector = observed_all_cores & expected_vector;
-    bench::verify_cluster_masks(&affinity, &plan, observed_matmul, observed_vector)?;
+    let (expected_prefill_mask, expected_decode_mask) = match engine.phase_policy() {
+        ClusterPhasePolicy::A100Only => (A100_CLUSTER_MASK, A100_CLUSTER_MASK),
+        ClusterPhasePolicy::X100Only => (X100_CLUSTER_MASK, X100_CLUSTER_MASK),
+        ClusterPhasePolicy::X100PrefillA100Decode | ClusterPhasePolicy::RowSplit => {
+            (X100_CLUSTER_MASK, A100_CLUSTER_MASK)
+        }
+        ClusterPhasePolicy::Auto => (
+            X100_CLUSTER_MASK | A100_CLUSTER_MASK,
+            X100_CLUSTER_MASK | A100_CLUSTER_MASK,
+        ),
+    };
+    if (observed_prefill_cores & expected_prefill_mask) == 0
+        || (observed_prefill_cores & !expected_prefill_mask) != 0
+    {
+        return Err(K3Error::AffinityError {
+            requested_mask: affinity.effective_mask,
+            requested_threads: affinity.threads,
+            reason: format!(
+                "prefill execution mask mismatch (observed 0x{observed_prefill_cores:04X} vs expected 0x{expected_prefill_mask:04X})"
+            ),
+        });
+    }
+    if any_decode
+        && ((observed_decode_cores & expected_decode_mask) == 0
+            || (observed_decode_cores & !expected_decode_mask) != 0)
+    {
+        return Err(K3Error::AffinityError {
+            requested_mask: affinity.effective_mask,
+            requested_threads: affinity.threads,
+            reason: format!(
+                "decode execution mask mismatch (observed 0x{observed_decode_cores:04X} vs expected 0x{expected_decode_mask:04X})"
+            ),
+        });
+    }
+    let observed_cores = observed_prefill_cores | observed_decode_cores;
+    let observed_matmul = observed_cores;
+    let observed_vector = observed_cores;
+    let exec_plan = bench::executed_phase_plan(&plan, true, any_decode);
+    bench::verify_cluster_masks(&affinity, &exec_plan, observed_matmul, observed_vector)?;
 
     // 6. Real GGUF model metadata, memory footprint & compute/bandwidth cost-profile telemetry
     let footprint = calculate_footprint(locked_weights.metadata(), n_ctx)?;
@@ -1027,6 +1108,14 @@ pub fn run_single_eval_session<W: Write>(config: &DiagConfig, mut out: W) -> Res
     let mut kv_arena = SingleSlotKvArena::from_gguf(&gguf_view, n_ctx)?;
     let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
     let prompt_tokens = tokenize_prompt_utf8_safe(&tokenizer, prompt_text, true, n_ctx)?;
+    if config.phase_policy.is_none() {
+        engine.set_phase_policy(resolve_engine_policy(
+            config.split,
+            recipe.architecture_id(),
+            prompt_tokens.len(),
+            worker_pool.affinity().effective_mask,
+        ));
+    }
 
     // 5. Execute isolated single-prompt forward pass and stream tokens unbuffered (US-01.6, US-01.7.2)
     let mut detokenizer = tokenizer.streaming_detokenizer();

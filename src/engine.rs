@@ -120,6 +120,8 @@ pub struct SinglePromptEngine {
     active_cycle: AtomicBool,
     phase: EnginePhase,
     phase_policy: ClusterPhasePolicy,
+    last_prefill_cpu_mask: u64,
+    last_decode_cpu_mask: u64,
 }
 
 impl Default for SinglePromptEngine {
@@ -161,6 +163,8 @@ impl SinglePromptEngine {
             active_cycle: AtomicBool::new(false),
             phase: EnginePhase::Idle,
             phase_policy: ClusterPhasePolicy::Auto,
+            last_prefill_cpu_mask: 0,
+            last_decode_cpu_mask: 0,
         }
     }
 
@@ -188,6 +192,18 @@ impl SinglePromptEngine {
         self.phase
     }
 
+    /// Returns the CPU bitmask observed executing prefill during the most recent pass.
+    #[must_use]
+    pub const fn last_prefill_cpu_mask(&self) -> u64 {
+        self.last_prefill_cpu_mask
+    }
+
+    /// Returns the CPU bitmask observed executing decode during the most recent pass.
+    #[must_use]
+    pub const fn last_decode_cpu_mask(&self) -> u64 {
+        self.last_decode_cpu_mask
+    }
+
     /// Returns `true` if a prompt is currently executing on this engine instance.
     #[must_use]
     pub fn is_busy(&self) -> bool {
@@ -213,20 +229,26 @@ impl SinglePromptEngine {
         }
     }
 
-    /// Executes a single phase-scheduled closure on `worker_pool` when present, or inline.
+    /// Executes a single phase-scheduled closure on `worker_pool` when present, or inline,
+    /// returning the CPU bitmask on which the closure executed.
     fn run_step_on_pool<F>(
         worker_pool: Option<&WorkerPool>,
         phase: EnginePhase,
         effective_policy: ClusterPhasePolicy,
         op: F,
-    ) -> Result<(), K3Error>
+    ) -> Result<u64, K3Error>
     where
         F: FnOnce() -> Result<(), K3Error> + Send,
     {
+        let wrapped = || -> Result<u64, K3Error> {
+            let cpu_mask = crate::affinity::current_execution_cpu_mask();
+            op()?;
+            Ok(cpu_mask)
+        };
         if let Some(pool) = worker_pool {
-            pool.install_for_phase(phase, effective_policy, op)
+            pool.install_for_phase(phase, effective_policy, wrapped)
         } else {
-            op()
+            wrapped()
         }
     }
 
@@ -281,15 +303,18 @@ impl SinglePromptEngine {
             pool.reset_barrier_wait();
         }
 
+        self.last_prefill_cpu_mask = 0;
+        self.last_decode_cpu_mask = 0;
         self.phase = EnginePhase::Prefill;
         let requires_kv = recipe.requires_kv_cache();
-        Self::run_step_on_pool(worker_pool, EnginePhase::Prefill, effective_policy, || {
-            if requires_kv {
-                recipe.prefill_step(&mut ctx, weights)
-            } else {
-                recipe.forward_classify(&mut ctx, weights)
-            }
-        })?;
+        self.last_prefill_cpu_mask =
+            Self::run_step_on_pool(worker_pool, EnginePhase::Prefill, effective_policy, || {
+                if requires_kv {
+                    recipe.prefill_step(&mut ctx, weights)
+                } else {
+                    recipe.forward_classify(&mut ctx, weights)
+                }
+            })?;
 
         let end_pos = ctx.position();
         let sample_len = vocab_size.min(ctx.logits().len());
@@ -356,10 +381,13 @@ impl SinglePromptEngine {
             pool.reset_barrier_wait();
         }
 
+        self.last_prefill_cpu_mask = 0;
+        self.last_decode_cpu_mask = 0;
         self.phase = EnginePhase::Decode;
-        Self::run_step_on_pool(worker_pool, EnginePhase::Decode, effective_policy, || {
-            recipe.decode_step(&mut ctx, weights)
-        })?;
+        self.last_decode_cpu_mask =
+            Self::run_step_on_pool(worker_pool, EnginePhase::Decode, effective_policy, || {
+                recipe.decode_step(&mut ctx, weights)
+            })?;
 
         let end_pos = ctx.position();
         let sample_len = vocab_size.min(ctx.logits().len());
@@ -466,16 +494,19 @@ impl SinglePromptEngine {
         }
 
         // 1. Transition Idle -> Prefill
+        self.last_prefill_cpu_mask = 0;
+        self.last_decode_cpu_mask = 0;
         self.phase = EnginePhase::Prefill;
         let prefill_start = Instant::now();
         let requires_kv = recipe.requires_kv_cache();
-        Self::run_step_on_pool(worker_pool, EnginePhase::Prefill, effective_policy, || {
-            if requires_kv {
-                recipe.prefill_step(&mut ctx, weights)
-            } else {
-                recipe.forward_classify(&mut ctx, weights)
-            }
-        })?;
+        self.last_prefill_cpu_mask =
+            Self::run_step_on_pool(worker_pool, EnginePhase::Prefill, effective_policy, || {
+                if requires_kv {
+                    recipe.prefill_step(&mut ctx, weights)
+                } else {
+                    recipe.forward_classify(&mut ctx, weights)
+                }
+            })?;
 
         let mut generated_tokens = Vec::with_capacity(max_tokens);
         if max_tokens == 0 {
@@ -540,9 +571,10 @@ impl SinglePromptEngine {
 
         while generated_tokens.len() < max_tokens && ctx.position() < n_ctx {
             ctx.prepare_decode(current_token)?;
-            Self::run_step_on_pool(worker_pool, EnginePhase::Decode, effective_policy, || {
-                recipe.decode_step(&mut ctx, weights)
-            })?;
+            self.last_decode_cpu_mask |=
+                Self::run_step_on_pool(worker_pool, EnginePhase::Decode, effective_policy, || {
+                    recipe.decode_step(&mut ctx, weights)
+                })?;
 
             let step_sample_len = vocab_size.min(ctx.logits().len());
             current_token =
@@ -621,6 +653,8 @@ impl SinglePromptEngine {
         let mut logits = vec![0.0_f32; num_labels];
         let mut ctx = ExecutionContext::new(prompt_tokens, n_ctx, &mut logits, &mut [])?;
         let pass_start = Instant::now();
+        self.last_prefill_cpu_mask = crate::affinity::current_execution_cpu_mask();
+        self.last_decode_cpu_mask = 0;
         self.phase = EnginePhase::Prefill;
         recipe.forward_classify(&mut ctx, weights)?;
 
@@ -680,6 +714,8 @@ impl SinglePromptEngine {
         )?;
 
         let pass_start = Instant::now();
+        self.last_prefill_cpu_mask = crate::affinity::current_execution_cpu_mask();
+        self.last_decode_cpu_mask = 0;
         self.phase = EnginePhase::Prefill;
         if recipe.requires_kv_cache() {
             recipe.prefill_step(&mut ctx, weights)?;

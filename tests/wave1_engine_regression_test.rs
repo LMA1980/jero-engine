@@ -14,7 +14,10 @@
     clippy::too_many_lines
 )]
 
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use jero_core::test_helpers::write_gguf_value;
 use jero_core::{
@@ -317,6 +320,7 @@ fn default_tokenizer_kvs<'a>(
         ),
         ("tokenizer.ggml.bos_token_id", GgufValue::Uint32(1)),
         ("tokenizer.ggml.eos_token_id", GgufValue::Uint32(extra_eos)),
+        ("tokenizer.ggml.padding_token_id", GgufValue::Uint32(0)),
     ]
 }
 
@@ -497,8 +501,7 @@ fn test_issue_94_qwen2_coder_mixed_legacy_and_k_quant_admission_and_forward() {
     assert_eq!(summary.final_position, 6);
 }
 
-#[test]
-fn test_issue_95_bitnet_i2_s_admission_and_forward() {
+fn build_bitnet_i2_s_test_gguf() -> Vec<u8> {
     let hidden = 128usize;
     let ffn = 256usize;
     let heads = 4usize;
@@ -636,7 +639,13 @@ fn test_issue_95_bitnet_i2_s_admission_and_forward() {
         ),
     ];
 
-    let bytes = build_custom_gguf_v3(32, &kvs, &tensors);
+    build_custom_gguf_v3(32, &kvs, &tensors)
+}
+
+#[test]
+fn test_issue_95_bitnet_i2_s_admission_and_forward() {
+    let vocab = 16usize;
+    let bytes = build_bitnet_i2_s_test_gguf();
     let gguf = GgufFile::parse(&bytes).expect("parse BitNet I2_S gguf");
     assert_eq!(
         gguf.metadata()
@@ -756,8 +765,7 @@ fn f32_tensor_slice(gguf: &GgufFile<'_>, name: &str) -> Vec<f32> {
         .collect()
 }
 
-#[test]
-fn test_issue_98_and_138_single_prompt_engine_scalar_parity_pos_0_to_8() {
+fn build_llama_f32_test_gguf(context_length: u32) -> Vec<u8> {
     let hidden = 8usize;
     let ffn = 16usize;
     let n_q = 2usize;
@@ -786,7 +794,7 @@ fn test_issue_98_and_138_single_prompt_engine_scalar_parity_pos_0_to_8() {
             "llama.attention.key_length",
             GgufValue::Uint32(head_dim as u32),
         ),
-        ("llama.context_length", GgufValue::Uint32(32)),
+        ("llama.context_length", GgufValue::Uint32(context_length)),
         ("llama.vocab_size", GgufValue::Uint32(vocab as u32)),
         ("llama.rope.freq_base", GgufValue::Float32(rope_theta)),
         (
@@ -887,7 +895,21 @@ fn test_issue_98_and_138_single_prompt_engine_scalar_parity_pos_0_to_8() {
         ),
     ];
 
-    let bytes = build_custom_gguf_v3(32, &kvs, &tensors);
+    build_custom_gguf_v3(32, &kvs, &tensors)
+}
+
+#[test]
+fn test_issue_98_and_138_single_prompt_engine_scalar_parity_pos_0_to_8() {
+    let hidden = 8usize;
+    let ffn = 16usize;
+    let n_q = 2usize;
+    let n_kv = 1usize;
+    let head_dim = hidden / n_q;
+    let vocab = 16usize;
+    let rms_eps = 1e-5_f32;
+    let rope_theta = 10_000.0_f32;
+
+    let bytes = build_llama_f32_test_gguf(32);
     let gguf = GgufFile::parse(&bytes).expect("parse scalar parity llama gguf");
     let recipe = verify_model_capabilities(&gguf).expect("verify llama recipe");
     let observer = LogitCaptureRecipe {
@@ -1470,5 +1492,203 @@ fn test_issue_120_mixed_quant_gguf_admission_phi3_llama_mistral() {
         let recipe = verify_model_capabilities(&model)
             .unwrap_or_else(|e| panic!("admit mixed quant {arch}: {e}"));
         assert_eq!(recipe.architecture_id(), arch);
+    }
+}
+
+struct TempGgufFile(PathBuf);
+
+impl TempGgufFile {
+    fn write(tag: &str, bytes: &[u8]) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let seq = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "jero_wave1_reg_{tag}_{}_{seq}.gguf",
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).expect("write temp gguf");
+        Self(path)
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.to_str().expect("utf-8 temp gguf path")
+    }
+}
+
+impl Drop for TempGgufFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn run_jero_diag_json(args: &[&str]) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_jero-diag"))
+        .args(args)
+        .env("K3_CPU_ONLINE_MASK", "0xFFFF")
+        .env("K3_SIMULATE_A100", "1")
+        .output()
+        .expect("execute jero-diag");
+    assert!(
+        output.status.success(),
+        "jero-diag {:?} failed (status {:?})\nstdout: {}\nstderr: {}",
+        args,
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    serde_json::from_slice(&output.stdout).expect("parse jero-diag --json output")
+}
+
+#[test]
+fn test_issue_187_real_gguf_ime_on_emits_no_fabricated_comparison() {
+    let gguf_file = TempGgufFile::write("issue187_llama", &build_llama_f32_test_gguf(64));
+    let report = run_jero_diag_json(&[
+        "--model",
+        gguf_file.as_str(),
+        "--cluster",
+        "a100",
+        "--ime",
+        "on",
+        "--prompt",
+        "t3 t4",
+        "--max-tokens",
+        "2",
+        "--json",
+    ]);
+
+    assert_eq!(report["execution_mode"].as_str(), Some("real_gguf"));
+    assert_eq!(report["architecture"].as_str(), Some("llama"));
+    assert_eq!(report["ime_enabled"].as_bool(), Some(true));
+    assert_eq!(report["ime_vmadot_issued"].as_u64(), Some(0));
+    assert!(
+        report["ime_comparison"].is_null(),
+        "real GGUF --ime on must not fabricate an ime_comparison block: {}",
+        report["ime_comparison"]
+    );
+    assert!(report["ime_delta_prefill_tps"].is_null());
+    assert!(report["ime_delta_decode_tps"].is_null());
+}
+
+#[test]
+fn test_issue_187_eval_suite_real_gguf_ime_on_never_fabricates_speedup() {
+    let gguf_file = TempGgufFile::write("issue187_eval_llama", &build_llama_f32_test_gguf(64));
+    let report = run_jero_diag_json(&[
+        "--model",
+        gguf_file.as_str(),
+        "--eval-suite",
+        "all",
+        "--cluster",
+        "a100",
+        "--ime",
+        "on",
+        "--n-ctx",
+        "64",
+        "--max-tokens",
+        "4",
+        "--json",
+    ]);
+
+    assert_eq!(report["architecture"].as_str(), Some("llama"));
+    assert_eq!(
+        report["runtime_efficiency"]["ime_enabled"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        report["runtime_efficiency"]["ime_speedup_prefill_pct"].as_f64(),
+        Some(0.0)
+    );
+    assert_eq!(
+        report["runtime_efficiency"]["ime_speedup_decode_pct"].as_f64(),
+        Some(0.0)
+    );
+}
+
+#[test]
+fn test_issue_188_phase_placement_reports_concrete_resolved_policy_and_real_cluster_masks() {
+    let llama_file = TempGgufFile::write("issue188_llama", &build_llama_f32_test_gguf(64));
+    let llama_report = run_jero_diag_json(&[
+        "--model",
+        llama_file.as_str(),
+        "--cluster",
+        "both",
+        "--split",
+        "phase",
+        "--prompt",
+        "t3 t4 t5 t6 t7",
+        "--max-tokens",
+        "2",
+        "--json",
+    ]);
+
+    assert_eq!(
+        llama_report["placement_prefill"]["matmul"][0]["cluster"].as_str(),
+        Some("x100")
+    );
+    assert_eq!(
+        llama_report["placement_prefill"]["vector"].as_str(),
+        Some("x100")
+    );
+    assert_eq!(
+        llama_report["placement_decode"]["matmul"][0]["cluster"].as_str(),
+        Some("a100")
+    );
+    assert_eq!(
+        llama_report["placement_decode"]["vector"].as_str(),
+        Some("a100")
+    );
+    let llama_mask = llama_report["matmul_cpu_mask"]
+        .as_u64()
+        .expect("llama matmul_cpu_mask");
+    assert_ne!(
+        llama_mask & 0x00FF,
+        0,
+        "llama phase split must observe X100 prefill core bits (mask={llama_mask:#x})"
+    );
+    assert_ne!(
+        llama_mask & 0xFF00,
+        0,
+        "llama phase split must observe A100 decode core bits (mask={llama_mask:#x})"
+    );
+
+    let bitnet_file = TempGgufFile::write("issue188_bitnet", &build_bitnet_i2_s_test_gguf());
+    for mode_args in [
+        vec!["--cluster", "both", "--split", "phase"],
+        vec!["--phase-policy", "auto"],
+    ] {
+        let mut args = vec!["--model", bitnet_file.as_str()];
+        args.extend(mode_args);
+        args.extend(["--prompt", "a b c d e", "--max-tokens", "2", "--json"]);
+
+        let bitnet_report = run_jero_diag_json(&args);
+        assert_eq!(
+            bitnet_report["placement_prefill"]["matmul"][0]["cluster"].as_str(),
+            Some("a100"),
+            "bitnet {args:?} must resolve prefill to a100"
+        );
+        assert_eq!(
+            bitnet_report["placement_prefill"]["vector"].as_str(),
+            Some("a100")
+        );
+        assert_eq!(
+            bitnet_report["placement_decode"]["matmul"][0]["cluster"].as_str(),
+            Some("a100"),
+            "bitnet {args:?} must resolve decode to a100"
+        );
+        assert_eq!(
+            bitnet_report["placement_decode"]["vector"].as_str(),
+            Some("a100")
+        );
+        let bitnet_mask = bitnet_report["matmul_cpu_mask"]
+            .as_u64()
+            .expect("bitnet matmul_cpu_mask");
+        assert_eq!(
+            bitnet_mask & 0x00FF,
+            0,
+            "bitnet {args:?} must not execute on X100 cores (mask={bitnet_mask:#x})"
+        );
+        assert_ne!(
+            bitnet_mask & 0xFF00,
+            0,
+            "bitnet {args:?} must observe A100 core bits (mask={bitnet_mask:#x})"
+        );
     }
 }

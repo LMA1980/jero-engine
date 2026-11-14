@@ -22,7 +22,6 @@ use jero_engine::forward::{
     row_split_share,
 };
 use jero_engine::{A100_CLUSTER_MASK, ClusterPhasePolicy, WorkerPool, X100_CLUSTER_MASK};
-use jero_kernels_rvv::ime::ime_vmadot_count;
 use serde::{Deserialize, Serialize};
 
 use crate::{DiagConfig, MetricStats, RunMetric, StatisticsSummary, is_abort_requested};
@@ -551,6 +550,32 @@ pub(crate) fn expected_phase_masks(plan: &PlacementPlan) -> (u64, u64) {
     (expected_matmul, expected_vector)
 }
 
+pub(crate) fn executed_phase_plan(
+    plan: &PlacementPlan,
+    single_cluster_phases: bool,
+    has_decode: bool,
+) -> PlacementPlan {
+    if !has_decode {
+        let prefill = if single_cluster_phases && plan.prefill.matmul.len() > 1 {
+            PhaseLayout {
+                matmul: vec![(Lane::X100, 1.0)],
+                vector: Lane::X100,
+            }
+        } else {
+            plan.prefill.clone()
+        };
+        return PlacementPlan {
+            prefill: prefill.clone(),
+            decode: prefill,
+        };
+    }
+    if single_cluster_phases && plan.prefill.matmul.len() > 1 {
+        // In SinglePromptEngine RowSplit mode, prefill runs on X100 and decode on A100.
+        return PlacementPlan::phase(Lane::X100, Lane::A100);
+    }
+    plan.clone()
+}
+
 pub(crate) fn verify_cluster_masks(
     affinity: &ResolvedAffinity,
     plan: &PlacementPlan,
@@ -558,12 +583,21 @@ pub(crate) fn verify_cluster_masks(
     observed_vector: u64,
 ) -> Result<(), K3Error> {
     let (expected_matmul, expected_vector) = expected_phase_masks(plan);
-    if observed_matmul & !expected_matmul != 0 || observed_vector & !expected_vector != 0 {
+    let missing_expected_cluster = |expected: u64, observed: u64| -> bool {
+        observed == 0
+            || ((expected & X100_CLUSTER_MASK) != 0 && (observed & X100_CLUSTER_MASK) == 0)
+            || ((expected & A100_CLUSTER_MASK) != 0 && (observed & A100_CLUSTER_MASK) == 0)
+    };
+    if (observed_matmul & !expected_matmul) != 0
+        || (observed_vector & !expected_vector) != 0
+        || missing_expected_cluster(expected_matmul, observed_matmul)
+        || missing_expected_cluster(expected_vector, observed_vector)
+    {
         return Err(K3Error::AffinityError {
             requested_mask: affinity.effective_mask,
             requested_threads: affinity.threads,
             reason: format!(
-                "work executed outside its assigned cluster (matmul cpus 0x{observed_matmul:04X} vs 0x{expected_matmul:04X}, vector cpus 0x{observed_vector:04X} vs 0x{expected_vector:04X})"
+                "cluster execution mask mismatch (matmul cpus 0x{observed_matmul:04X} vs expected 0x{expected_matmul:04X}, vector cpus 0x{observed_vector:04X} vs expected 0x{expected_vector:04X})"
             ),
         });
     }
@@ -612,18 +646,10 @@ pub(crate) fn build_telemetry_and_stats(
     };
 
     let ime_on = inputs.config.ime == Some(true);
-    let ime_before_ceilings = ime_vmadot_count();
     let (prefill_peak, _) = ceilings(&inputs.plan.prefill, inputs.kernel)?;
     let (_, decode_bw) = ceilings(&inputs.plan.decode, inputs.kernel)?;
-    if ime_on && ime_vmadot_count() == ime_before_ceilings && !inputs.affinity.a100_cores.is_empty()
-    {
-        // Exercise the A100 IME path when A100 handles decode rather than prefill.
-        let _ = measure_peak_macs(inputs.pool, Lane::A100, MatKernel::Ime)?;
-    }
-    let ceiling_vmadot = ime_vmadot_count().saturating_sub(ime_before_ceilings);
-    let sample_vmadot: u64 = inputs.primary_samples.iter().map(|s| s.vmadot_issued).sum();
-    let ime_vmadot_issued = if ime_on {
-        sample_vmadot.max(ceiling_vmadot)
+    let ime_vmadot_issued: u64 = if ime_on {
+        inputs.primary_samples.iter().map(|s| s.vmadot_issued).sum()
     } else {
         0
     };
@@ -697,7 +723,7 @@ pub(crate) fn build_telemetry_and_stats(
                 kernel_path: base_kernel.path_name().to_owned(),
                 prefill_tps: mean(base_runs.iter().map(sample_prefill_tps)),
                 decode_tps: mean(base_runs.iter().map(|s| s.timing.decode_tokens_per_sec)),
-                vmadot_issued: 0,
+                vmadot_issued: base_runs.iter().map(|s| s.vmadot_issued).sum(),
             };
             let pct_of = |d: f64, b: f64| if b > 0.0 { d / b * 100.0 } else { 0.0 };
             let dp = on.prefill_tps - off.prefill_tps;
@@ -1146,7 +1172,9 @@ pub(crate) fn run_matrix_benchmark<W: Write>(
         .summaries
         .iter()
         .fold(0, |m, s| m | s.vector_cpu_mask);
-    verify_cluster_masks(&affinity, &primary.plan, observed_matmul, observed_vector)?;
+    let has_decode = primary.summaries.iter().any(|s| s.timing.decode_steps > 0);
+    let exec_plan = executed_phase_plan(&primary.plan, false, has_decode);
+    verify_cluster_masks(&affinity, &exec_plan, observed_matmul, observed_vector)?;
 
     let first_summary = primary.summaries.first().ok_or_else(|| {
         cap_err(
@@ -1431,4 +1459,67 @@ pub(crate) fn write_benchmark_table<W: Write>(
         statistics.compute_utilization_ratio.stddev
     );
     let _ = writeln!(out, "{rule}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_affinity(effective_mask: u64, x100: Vec<usize>, a100: Vec<usize>) -> ResolvedAffinity {
+        ResolvedAffinity {
+            cluster: None,
+            selection: Some(jero_engine::affinity::ClusterSelection::Both {
+                split: SplitStrategy::Phase,
+            }),
+            vlen_domain: jero_engine::affinity::VlenDomain::Heterogeneous,
+            effective_mask,
+            threads: x100.len() + a100.len(),
+            assigned_cores: x100.iter().copied().chain(a100.iter().copied()).collect(),
+            x100_cores: x100,
+            a100_cores: a100,
+        }
+    }
+
+    #[test]
+    fn test_verify_cluster_masks_rejects_empty_or_missing_expected_cluster() {
+        let dual_aff = test_affinity(0xFFFF, vec![0, 1], vec![8, 9]);
+        let phase_plan = PlacementPlan::phase(Lane::X100, Lane::A100);
+
+        // Zero observed mask must fail rather than passing as a tautology.
+        assert!(matches!(
+            verify_cluster_masks(&dual_aff, &phase_plan, 0, 0),
+            Err(K3Error::AffinityError { .. })
+        ));
+
+        // Missing A100 decode cluster bits on a dual-cluster phase plan must fail.
+        assert!(matches!(
+            verify_cluster_masks(&dual_aff, &phase_plan, 0x0003, 0x0003),
+            Err(K3Error::AffinityError { .. })
+        ));
+
+        // Non-empty bits covering both expected clusters must succeed.
+        verify_cluster_masks(&dual_aff, &phase_plan, 0x0303, 0x0303)
+            .expect("both X100 and A100 observed bits valid");
+
+        // Wrong-cluster bits for A100Only must fail.
+        let a100_plan = PlacementPlan::single(Lane::A100);
+        assert!(matches!(
+            verify_cluster_masks(&dual_aff, &a100_plan, 0x0101, 0x0100),
+            Err(K3Error::AffinityError { .. })
+        ));
+    }
+
+    #[test]
+    fn test_executed_phase_plan_narrows_to_prefill_without_decode() {
+        let plan = PlacementPlan::phase(Lane::X100, Lane::A100);
+        let prefill_only = executed_phase_plan(&plan, true, false);
+        assert_eq!(expected_phase_masks(&prefill_only), (0x00FF, 0x00FF));
+
+        let with_decode = executed_phase_plan(&plan, true, true);
+        assert_eq!(expected_phase_masks(&with_decode), (0xFFFF, 0xFFFF));
+
+        let row = PlacementPlan::row(0.5, 0.5);
+        let row_engine = executed_phase_plan(&row, true, true);
+        assert_eq!(expected_phase_masks(&row_engine), (0xFFFF, 0xFFFF));
+    }
 }

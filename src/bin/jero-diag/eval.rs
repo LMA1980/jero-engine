@@ -869,7 +869,7 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
     worker_pool.verify_live_affinities()?;
 
     // 5. Compute runtime efficiency from actual SinglePromptEngine GGUF timings (#148),
-    // falling back to ForwardModel only for the synthetic test recipe or explicit IME equivalence check.
+    // falling back to ForwardModel only for explicit synthetic test recipes (#187).
     let kernel = if ime_requested {
         MatKernel::Ime
     } else {
@@ -907,7 +907,7 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
         ime_speedup_prefill_pct,
         ime_speedup_decode_pct,
         ime_vs_rvv_identical,
-    ) = if arch_name == "synthetic" || ime_requested {
+    ) = if arch_name == "synthetic" {
         let seed = locked_weights
             .as_bytes()
             .iter()
