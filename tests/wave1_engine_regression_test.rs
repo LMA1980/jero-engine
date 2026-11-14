@@ -1172,7 +1172,32 @@ fn test_issue_99_single_prompt_engine_multithread_worker_pool_parity() {
 
     // Verify 0xFF00 / 0xFFFF simulated SpacemiT K3 topology maps cleanly.
     let topo_16core = MockCpuTopology::spacemit_k3();
-    let a100_pool = WorkerPool::for_phase_policy_with(
+    let a100_resolved =
+        jero_engine::resolve_affinity_with(Some("a100"), Some(0xFF00), Some(4), &topo_16core)
+            .expect("resolve simulated 0xFF00 affinity");
+    assert_eq!(a100_resolved.assigned_cores, vec![8, 9, 10, 11]);
+    assert_eq!(a100_resolved.effective_mask, 0x0F00);
+
+    let dual_resolved = jero_engine::affinity::resolve_affinity_split_with(
+        Some("both"),
+        Some("phase"),
+        Some(0xFFFF),
+        Some(14),
+        &topo_16core,
+    )
+    .expect("resolve simulated 0xFFFF dual-cluster split affinity");
+    assert!(dual_resolved.is_dual_cluster());
+    assert_eq!(dual_resolved.x100_cores, vec![0, 1, 2, 3, 4, 5, 6]);
+    assert_eq!(dual_resolved.a100_cores, vec![8, 9, 10, 11, 12, 13, 14]);
+
+    let host_online_mask =
+        jero_engine::CpuTopologyInspector::online_cpu_mask(&jero_engine::SystemCpuTopology::new())
+            .expect("read host online CPU mask");
+    let host_has_a100 = (host_online_mask & jero_engine::A100_CLUSTER_MASK) != 0;
+
+    // Live OS thread pinning to cores 8..11 succeeds on 16-core K3 and non-Linux simulated hosts,
+    // and fails closed with AffinityError on <16-core Linux CI hosts without online A100 cores.
+    match WorkerPool::for_phase_policy_with(
         ClusterPhasePolicy::A100Only,
         gguf.metadata(),
         4,
@@ -1180,9 +1205,21 @@ fn test_issue_99_single_prompt_engine_multithread_worker_pool_parity() {
         Some(4),
         CoordinationProfile::Rayon,
         &topo_16core,
-    )
-    .expect("spawn simulated 0xFF00 pool");
-    assert_eq!(a100_pool.worker_statuses().len(), 4);
+    ) {
+        Ok(a100_pool) => {
+            assert_eq!(a100_pool.worker_statuses().len(), 4);
+        }
+        Err(err) => {
+            assert!(
+                cfg!(target_os = "linux") && !host_has_a100,
+                "unexpected 0xFF00 WorkerPool failure on host with online_mask=0x{host_online_mask:X}: {err}"
+            );
+            assert!(
+                matches!(err, K3Error::AffinityError { .. }),
+                "expected AffinityError on <16-core Linux runner, got {err:?}"
+            );
+        }
+    }
 
     let pool_single = WorkerPool::for_phase_policy(
         ClusterPhasePolicy::X100Only,
@@ -1193,17 +1230,19 @@ fn test_issue_99_single_prompt_engine_multithread_worker_pool_parity() {
         CoordinationProfile::Rayon,
     )
     .expect("single-thread pool");
+    let x100_online = (host_online_mask & jero_engine::X100_CLUSTER_MASK).count_ones() as usize;
+    let multi_threads = x100_online.clamp(1, 4);
     let pool_multi = WorkerPool::for_phase_policy(
         ClusterPhasePolicy::X100Only,
         gguf.metadata(),
         4,
         None,
-        Some(4),
+        Some(multi_threads),
         CoordinationProfile::Rayon,
     )
-    .expect("4-thread pool");
+    .expect("multi-thread X100 pool");
     let active_threads = pool_multi.install(rayon::current_num_threads);
-    assert!(active_threads >= 1);
+    assert_eq!(active_threads, multi_threads);
 
     let obs_1 = LogitCaptureRecipe {
         inner: recipe.as_ref(),
