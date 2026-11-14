@@ -25,7 +25,7 @@ use jero_engine::forward::{
 };
 use jero_engine::{
     LockedModelWeights, SinglePromptEngine, SingleSlotKvArena, StreamAction, SystemMemoryInspector,
-    WorkerPool, resolve_affinity,
+    WorkerPool, resolve_affinity, tokenize_prompt_utf8_safe,
 };
 use jero_tokenizer::{DetokenizeStep, GgufTokenizer};
 use serde::{Deserialize, Serialize};
@@ -687,9 +687,9 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
             LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
         let gguf_probe = GgufFile::parse(locked_weights.as_bytes())?;
         let tok_probe = GgufTokenizer::from_gguf(&gguf_probe)?;
-        let sample_len = tok_probe
-            .tokenize_prompt(&filtered_items[0].prompt, true, n_ctx)
-            .map_or(8, |t| t.len());
+        let sample_len =
+            tokenize_prompt_utf8_safe(&tok_probe, &filtered_items[0].prompt, true, n_ctx)
+                .map_or(8, |t| t.len());
         let worker_pool = WorkerPool::for_phase_policy(
             policy,
             locked_weights.metadata(),
@@ -793,7 +793,7 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
             suite_order.push(item.suite.clone());
         }
 
-        let prompt_tokens = tokenizer.tokenize_prompt(&item.prompt, true, n_ctx)?;
+        let prompt_tokens = tokenize_prompt_utf8_safe(&tokenizer, &item.prompt, true, n_ctx)?;
         let eval_tokens = if prompt_tokens.len() >= n_ctx {
             &prompt_tokens[..n_ctx.saturating_sub(4).max(1)]
         } else {
@@ -869,7 +869,7 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
     worker_pool.verify_live_affinities()?;
 
     // 5. Compute runtime efficiency from actual SinglePromptEngine GGUF timings (#148),
-    // falling back to ForwardModel only for the synthetic test recipe or explicit IME equivalence check.
+    // falling back to ForwardModel only for explicit synthetic test recipes (#187).
     let kernel = if ime_requested {
         MatKernel::Ime
     } else {
@@ -907,7 +907,7 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
         ime_speedup_prefill_pct,
         ime_speedup_decode_pct,
         ime_vs_rvv_identical,
-    ) = if arch_name == "synthetic" || ime_requested {
+    ) = if arch_name == "synthetic" {
         let seed = locked_weights
             .as_bytes()
             .iter()

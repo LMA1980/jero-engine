@@ -28,6 +28,46 @@ pub(crate) fn get_current_thread_core() -> Option<usize> {
     CURRENT_ASSIGNED_CORE.with(Cell::get)
 }
 
+/// Returns a single-bit CPU mask (`1 << core`) for the thread currently executing work,
+/// matching `sched_getcpu()` on physical Linux nodes and thread-local pinned core tracking
+/// under simulated `K3_CPU_ONLINE_MASK` / `K3_SIMULATE_A100`, non-Linux hosts, and Miri.
+#[must_use]
+pub(crate) fn current_execution_cpu_mask() -> u64 {
+    #[cfg(miri)]
+    {
+        return get_current_thread_core()
+            .filter(|&c| c < 64)
+            .map_or(0, |c| 1_u64 << c);
+    }
+    #[cfg(all(not(miri), target_os = "linux"))]
+    {
+        if std::env::var_os("K3_CPU_ONLINE_MASK").is_some()
+            || std::env::var_os("K3_SIMULATE_A100").is_some()
+        {
+            if let Some(core) = get_current_thread_core() {
+                if core < 64 {
+                    return 1_u64 << core;
+                }
+            }
+        }
+        // SAFETY: `sched_getcpu` has no preconditions.
+        let cpu = unsafe { libc::sched_getcpu() };
+        u64::try_from(cpu)
+            .ok()
+            .filter(|&c| c < 64)
+            .map_or(0, |c| 1_u64 << c)
+    }
+    #[cfg(all(not(miri), not(target_os = "linux")))]
+    {
+        if let Some(core) = get_current_thread_core() {
+            if core < 64 {
+                return 1_u64 << core;
+            }
+        }
+        0
+    }
+}
+
 /// Core bitmask for Cluster 0 (`X100` `OoO` cores 0–7, `zvl256b`).
 pub const X100_CLUSTER_MASK: u64 = 0x00FF;
 

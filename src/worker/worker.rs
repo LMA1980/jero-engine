@@ -6,6 +6,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Instant;
 
+use jero_core::K3Error;
 use jero_core::ipc::arrow::wrap_tokens_as_uint32_array;
 use jero_core::ipc::layout::{
     BLOCK_SIZE_TOKENS, KvBlockTag, OutputSlabHeader, SLAB_STATUS_WRITTEN, TokenInputSlotHeader,
@@ -18,35 +19,20 @@ use jero_core::ipc::protocol::{
 use jero_core::ipc::shm::SharedMemoryArena;
 use zerocopy::FromBytes;
 
-use std::sync::mpsc::{Sender, channel};
-use std::thread::{Builder, JoinHandle};
+use crate::affinity::{
+    ClusterPhasePolicy, ClusterPreset, ClusterSelection, CpuTopologyInspector, ResolvedAffinity,
+    SystemCpuTopology, VlenDomain, WorkerPool,
+};
+use crate::engine::{SinglePromptEngine, sample_greedy_argmax};
+use crate::kv::SingleSlotKvArena;
 
 use super::affinity::{
     A100_CLUSTER_MASK, DEFAULT_X100_COMPUTE_CAP_MASK, cores_from_mask, parse_affinity_spec,
-    pin_worker_core, verify_cluster_capabilities_full,
+    verify_cluster_capabilities_full,
 };
 use super::cli::WorkerConfig;
 use super::error::WorkerError;
 use super::weights::LockedWeights;
-
-enum ComputeTask {
-    Execute(Arc<dyn Fn() + Send + Sync>),
-    Shutdown,
-}
-
-struct WorkerThreadHandle {
-    sender: Sender<ComputeTask>,
-    handle: Option<JoinHandle<()>>,
-    assigned_core: usize,
-}
-
-impl std::fmt::Debug for WorkerThreadHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WorkerThreadHandle")
-            .field("assigned_core", &self.assigned_core)
-            .finish()
-    }
-}
 
 /// Isolated compute worker execution engine.
 #[derive(Debug)]
@@ -54,28 +40,90 @@ pub struct WorkerEngine {
     config: WorkerConfig,
     weights: LockedWeights,
     arena: Option<SharedMemoryArena>,
+    kv_arena: Option<SingleSlotKvArena>,
+    prompt_engine: SinglePromptEngine,
+    pool: Option<WorkerPool>,
     completed_passes: u64,
     is_busy: bool,
     compute_mask: u64,
     assigned_cores: Vec<usize>,
-    thread_workers: Vec<WorkerThreadHandle>,
 }
 
-impl Drop for WorkerEngine {
-    fn drop(&mut self) {
-        for worker in &mut self.thread_workers {
-            let _ = worker.sender.send(ComputeTask::Shutdown);
-            if let Some(h) = worker.handle.take() {
-                let _ = h.join();
-            }
+fn build_worker_pool(
+    cluster: &str,
+    compute_mask: u64,
+    assigned_cores: &[usize],
+) -> (ClusterPhasePolicy, Option<WorkerPool>) {
+    let preset = if cluster.eq_ignore_ascii_case("a100") {
+        ClusterPreset::A100
+    } else {
+        ClusterPreset::X100
+    };
+    let (vlen_domain, phase_policy, x100_cores, a100_cores) = match preset {
+        ClusterPreset::X100 => (
+            VlenDomain::Zvl256b,
+            ClusterPhasePolicy::X100Only,
+            assigned_cores.to_vec(),
+            Vec::new(),
+        ),
+        ClusterPreset::A100 => (
+            VlenDomain::Zvl1024b,
+            ClusterPhasePolicy::A100Only,
+            Vec::new(),
+            assigned_cores.to_vec(),
+        ),
+    };
+
+    let resolved = ResolvedAffinity {
+        cluster: Some(preset),
+        selection: Some(ClusterSelection::Single(preset)),
+        vlen_domain,
+        effective_mask: compute_mask,
+        threads: assigned_cores.len().max(1),
+        assigned_cores: assigned_cores.to_vec(),
+        x100_cores,
+        a100_cores,
+    };
+
+    if let Ok(pool) = WorkerPool::new(resolved) {
+        return (phase_policy, Some(pool));
+    }
+
+    // If the host OS exposes fewer online CPUs than the requested default cluster mask
+    // (e.g. a 4-core gateway node running with default X100 6-core mask), clamp pool threads
+    // to currently online CPUs in that cluster while preserving logical assigned_cores reporting.
+    let online_mask = SystemCpuTopology::new().online_cpu_mask().unwrap_or(0) & compute_mask;
+    if online_mask != 0 {
+        let online_cores = cores_from_mask(online_mask);
+        let fallback_threads = assigned_cores.len().min(online_cores.len()).max(1);
+        let fallback_cores = online_cores[..fallback_threads].to_vec();
+        let (fx, fa) = match preset {
+            ClusterPreset::X100 => (fallback_cores.clone(), Vec::new()),
+            ClusterPreset::A100 => (Vec::new(), fallback_cores.clone()),
+        };
+        let fallback_affinity = ResolvedAffinity {
+            cluster: Some(preset),
+            selection: Some(ClusterSelection::Single(preset)),
+            vlen_domain,
+            effective_mask: online_mask,
+            threads: fallback_threads,
+            assigned_cores: fallback_cores,
+            x100_cores: fx,
+            a100_cores: fa,
+        };
+        if let Ok(pool) = WorkerPool::new(fallback_affinity) {
+            return (phase_policy, Some(pool));
         }
     }
+
+    (phase_policy, None)
 }
 
 impl WorkerEngine {
     /// Attempts to construct a new [`WorkerEngine`] with the given configuration and loaded weights.
     ///
-    /// Validates cluster capabilities, thread bounds, and affinity specifications upfront (failing closed).
+    /// Validates cluster capabilities, thread bounds, affinity specifications, and initial KV arena
+    /// capacity upfront (failing closed).
     ///
     /// # Errors
     /// Returns [`WorkerError`] if configuration, affinity, or hardware verification fails.
@@ -105,43 +153,25 @@ impl WorkerEngine {
                 .collect()
         };
 
-        let mut thread_workers = Vec::with_capacity(assigned_cores.len());
-        for (i, &core) in assigned_cores.iter().enumerate() {
-            let (tx, rx) = channel::<ComputeTask>();
-            let spawn_res =
-                Builder::new()
-                    .name(format!("k3-worker-compute-{i}"))
-                    .spawn(move || {
-                        // SAFETY: Scalar-only thread pinning routine avoids scalable vector register spills.
-                        unsafe {
-                            let _ = pin_worker_core(core);
-                        }
-                        while let Ok(task) = rx.recv() {
-                            match task {
-                                ComputeTask::Execute(f) => f(),
-                                ComputeTask::Shutdown => break,
-                            }
-                        }
-                    });
+        let meta_ctx = weights.metadata().context_length();
+        let initial_n_ctx = if meta_ctx > 0 { meta_ctx.min(64) } else { 64 };
+        let initial_kv = weights.instantiate_kv_arena(initial_n_ctx)?;
 
-            if let Ok(handle) = spawn_res {
-                thread_workers.push(WorkerThreadHandle {
-                    sender: tx,
-                    handle: Some(handle),
-                    assigned_core: core,
-                });
-            }
-        }
+        let (phase_policy, pool) =
+            build_worker_pool(&config.cluster, compute_mask, &assigned_cores);
+        let prompt_engine = SinglePromptEngine::new().with_phase_policy(phase_policy);
 
         Ok(Self {
             config,
             weights,
             arena: None,
+            kv_arena: Some(initial_kv),
+            prompt_engine,
+            pool,
             completed_passes: 0,
             is_busy: false,
             compute_mask,
             assigned_cores,
-            thread_workers,
         })
     }
 
@@ -245,6 +275,12 @@ impl WorkerEngine {
 
                     let arena =
                         SharedMemoryArena::from_existing_fd(fd, len, "worker_arena", false)?;
+                    let hdr = *arena.header()?;
+                    let attach_n_ctx = usize::try_from(cmd.n_ctx.max(hdr.n_ctx))
+                        .unwrap_or(64)
+                        .max(1);
+                    let kv_arena = self.weights.instantiate_kv_arena(attach_n_ctx)?;
+                    self.kv_arena = Some(kv_arena);
                     self.arena = Some(arena);
 
                     // Send response frame (Type ID 206) with StatusCode::Success
@@ -283,13 +319,21 @@ impl WorkerEngine {
                             "received ForwardPassCommand before AttachArenaCommand".to_owned(),
                         )
                     })?;
+                    let kv_arena = self.kv_arena.as_mut().ok_or_else(|| {
+                        WorkerError::Internal(
+                            "worker KV arena uninitialized despite attached shared arena"
+                                .to_owned(),
+                        )
+                    })?;
 
                     let hdr = *arena.header()?;
-                    let vocab_size = if hdr.vocab_size > 0 {
-                        hdr.vocab_size as usize
+                    let model_vocab = self.weights.metadata().vocab_size().unwrap_or(0);
+                    let slab_vocab_size = if hdr.vocab_size > 0 {
+                        usize::try_from(hdr.vocab_size).unwrap_or(model_vocab.max(1))
                     } else {
-                        10
+                        model_vocab.max(1)
                     };
+                    let eval_vocab = model_vocab.max(slab_vocab_size).max(1);
 
                     // Zero-copy read tokens from TokenInputSlot using Apache Arrow UInt32Array view
                     let tokens_slot_offset =
@@ -311,6 +355,11 @@ impl WorkerEngine {
                     } else {
                         slot_hdr.token_len as usize
                     };
+                    if token_count == 0 {
+                        return Err(WorkerError::TensorBoundsError(
+                            "ForwardPassCommand received zero input tokens".to_owned(),
+                        ));
+                    }
 
                     let tokens_data_offset = tokens_slot_offset + 16;
                     let tokens_slice = arena.slice(tokens_data_offset, token_count * 4)?;
@@ -325,53 +374,85 @@ impl WorkerEngine {
                         )?
                     };
 
-                    let token_vals = arrow_tokens.values();
+                    let input_tokens: Vec<u32> = arrow_tokens.values().to_vec();
+                    let raw_start_pos = if slot_hdr.start_position != 0 {
+                        slot_hdr.start_position
+                    } else {
+                        cmd.token_offset
+                    };
+                    let start_pos = usize::try_from(raw_start_pos).unwrap_or(usize::MAX);
 
-                    // Reference mathematical computation for synthetic forward output logits:
-                    // logit[t] = token_id * 0.01 + pos * 0.1
-                    let mut logits = vec![0.0_f32; vocab_size];
-                    let active_workers: Vec<_> = self
-                        .thread_workers
-                        .iter()
-                        .filter(|w| w.handle.is_some())
-                        .collect();
-                    if active_workers.len() > 1 {
-                        let (done_tx, done_rx) = channel();
-                        let mut sent = 0;
-                        for worker in &active_workers {
-                            let tx = done_tx.clone();
-                            if worker
-                                .sender
-                                .send(ComputeTask::Execute(Arc::new(move || {
-                                    let _ = tx.send(());
-                                })))
-                                .is_ok()
-                            {
-                                sent += 1;
+                    let step_result = if cmd.is_prefill {
+                        self.prompt_engine.prefill_step_with_pool(
+                            self.weights.recipe(),
+                            &self.weights,
+                            kv_arena,
+                            self.pool.as_ref(),
+                            &input_tokens,
+                            start_pos,
+                            eval_vocab,
+                        )
+                    } else {
+                        let mut last_step = None;
+                        let mut step_err = None;
+                        for (idx, &tok) in input_tokens.iter().enumerate() {
+                            match self.prompt_engine.decode_step_with_pool(
+                                self.weights.recipe(),
+                                &self.weights,
+                                kv_arena,
+                                self.pool.as_ref(),
+                                tok,
+                                start_pos.saturating_add(idx),
+                                eval_vocab,
+                            ) {
+                                Ok(res) => last_step = Some(res),
+                                Err(e) => {
+                                    step_err = Some(e);
+                                    break;
+                                }
                             }
                         }
-                        for _ in 0..sent {
-                            let _ = done_rx.recv();
+                        match step_err {
+                            Some(e) => Err(e),
+                            None => last_step.ok_or_else(|| K3Error::TensorBoundsError {
+                                tensor_name: "token_input_slot".to_owned(),
+                                offset: start_pos,
+                                byte_len: 0,
+                                buffer_len: 0,
+                                reason: "empty token input in decode ForwardPassCommand".to_owned(),
+                            }),
                         }
-                    }
-                    for (i, val) in logits.iter_mut().enumerate() {
-                        let token_term = if !token_vals.is_empty() {
-                            (token_vals[i % token_vals.len()] as f32) * 0.01
-                        } else {
-                            0.0
-                        };
-                        *val = token_term + (i as f32) * 0.1;
-                    }
+                    };
 
-                    // Sample greedy argmax next token
-                    let next_token = logits
-                        .iter()
-                        .enumerate()
-                        .max_by(|(_, a), (_, b)| {
-                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .map(|(idx, _)| idx as u32)
-                        .unwrap_or(0);
+                    let (logits, end_pos) = match step_result {
+                        Ok((logits, _engine_next_tok, end_pos)) => (logits, end_pos),
+                        Err(k3_err) => {
+                            let reply = IpcMessage::ForwardPassCompleted(ForwardPassCompleted {
+                                request_id: cmd.request_id,
+                                sequence_id: cmd.sequence_id,
+                                committed_tokens: 0,
+                                prefill_latency_ms: 0.0,
+                                decode_latency_ms: 0.0,
+                                next_token: 0,
+                                status: StatusCode::from_k3_error(&k3_err),
+                                error_message: Some(k3_err.to_string()),
+                            });
+                            send_msg_frame(&stream, &reply, None).map_err(|e| {
+                                WorkerError::ProtocolError(format!(
+                                    "failed to send error ForwardPassCompleted: {e}"
+                                ))
+                            })?;
+                            self.is_busy = false;
+                            continue;
+                        }
+                    };
+
+                    let sample_len = if model_vocab > 0 {
+                        model_vocab.min(slab_vocab_size).min(logits.len())
+                    } else {
+                        slab_vocab_size.min(logits.len())
+                    };
+                    let next_token = sample_greedy_argmax(&logits[..sample_len]).unwrap_or(0);
 
                     // Deterministic in-place KvBlockMeta checkpointing per forward pass
                     let blocks_to_update = if cmd.block_indices.is_empty() {
@@ -432,15 +513,17 @@ impl WorkerEngine {
                         ))
                     })?;
                     slab_hdr.request_id = cmd.request_id;
-                    slab_hdr.vocab_size = vocab_size as u32;
-                    slab_hdr.position = cmd.token_offset + cmd.token_count;
+                    slab_hdr.vocab_size = slab_vocab_size as u32;
+                    slab_hdr.position =
+                        u32::try_from(end_pos).unwrap_or(cmd.token_offset + cmd.token_count);
                     slab_hdr.status = SLAB_STATUS_WRITTEN;
 
                     // Logits float array starting at slab_offset + 64
                     let logits_data_offset = slab_offset + 64;
-                    let logits_slice = arena.slice_mut(logits_data_offset, vocab_size * 4)?;
-                    for (i, &l) in logits.iter().enumerate() {
-                        logits_slice[i * 4..(i + 1) * 4].copy_from_slice(&l.to_ne_bytes());
+                    let logits_slice = arena.slice_mut(logits_data_offset, slab_vocab_size * 4)?;
+                    for i in 0..slab_vocab_size {
+                        let val = logits.get(i).copied().unwrap_or(0.0);
+                        logits_slice[i * 4..(i + 1) * 4].copy_from_slice(&val.to_ne_bytes());
                     }
 
                     let elapsed_ms = start_time.elapsed().as_secs_f64() * 1000.0;

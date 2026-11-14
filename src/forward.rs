@@ -288,33 +288,7 @@ fn requant(v: i32, shift: u32) -> i8 {
 }
 
 fn cpu_bit() -> u64 {
-    #[cfg(target_os = "linux")]
-    {
-        if std::env::var_os("K3_CPU_ONLINE_MASK").is_some()
-            || std::env::var_os("K3_SIMULATE_A100").is_some()
-        {
-            if let Some(core) = crate::affinity::get_current_thread_core() {
-                if core < 64 {
-                    return 1_u64 << core;
-                }
-            }
-        }
-        // SAFETY: `sched_getcpu` has no preconditions.
-        let cpu = unsafe { libc::sched_getcpu() };
-        u64::try_from(cpu)
-            .ok()
-            .filter(|&c| c < 64)
-            .map_or(0, |c| 1_u64 << c)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        if let Some(core) = crate::affinity::get_current_thread_core() {
-            if core < 64 {
-                return 1_u64 << core;
-            }
-        }
-        0
-    }
+    crate::affinity::current_execution_cpu_mask()
 }
 
 /// One weight matrix stored row-major (`n x k`, vector path) and IME-packed (IME path).

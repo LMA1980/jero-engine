@@ -23,10 +23,16 @@ const QUANT_SUPPORTED: &[QuantType] = &[
     QuantType::F16,
     QuantType::BF16,
     QuantType::Q4_0,
+    QuantType::Q4_1,
+    QuantType::Q5_0,
+    QuantType::Q5_1,
+    QuantType::Q2_K,
+    QuantType::Q3_K,
     QuantType::Q4_K_M,
     QuantType::Q5_K,
     QuantType::Q6_K,
     QuantType::Q8_0,
+    QuantType::IQ4_NL,
 ];
 
 const fn is_supported_quant(quant: QuantType) -> bool {
@@ -36,10 +42,16 @@ const fn is_supported_quant(quant: QuantType) -> bool {
             | QuantType::F16
             | QuantType::BF16
             | QuantType::Q4_0
+            | QuantType::Q4_1
+            | QuantType::Q5_0
+            | QuantType::Q5_1
+            | QuantType::Q2_K
+            | QuantType::Q3_K
             | QuantType::Q4_K_M
             | QuantType::Q5_K
             | QuantType::Q6_K
             | QuantType::Q8_0
+            | QuantType::IQ4_NL
     )
 }
 
@@ -597,24 +609,7 @@ fn project_lm_head(
                 view
             };
             let target = &mut logits[..target_rows];
-            if target_rows >= 4096
-                && sub_view.quant().block_elements() > 0
-                && shape[0] % sub_view.quant().block_elements() == 0
-                && cfg!(not(miri))
-            {
-                use rayon::prelude::*;
-
-                let chunk_rows = 2048_usize;
-                target.par_chunks_mut(chunk_rows).enumerate().try_for_each(
-                    |(chunk_idx, out_chunk)| -> Result<(), K3Error> {
-                        let row_start = chunk_idx * chunk_rows;
-                        let chunk_view = sub_view.slice_rows(row_start, out_chunk.len())?;
-                        matvec_any(out_chunk, &chunk_view, normed_final)
-                    },
-                )?;
-            } else {
-                matvec_any(target, &sub_view, normed_final)?;
-            }
+            matvec_any(target, &sub_view, normed_final)?;
             for (i, slot) in logits[target_rows..].iter_mut().enumerate() {
                 *slot = normed_final[(target_rows + i) % hidden_dim] * 0.05;
             }

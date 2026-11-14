@@ -12,8 +12,9 @@ use jero_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, 
 use jero_kernels_rvv::{
     BaselineKernel, VectorKernel, apply_rope_inplace, dequantize_token_row, dot_product_f32_scalar,
     geglu_f32, gqa_causal_attention_f32, logit_softcap_tanh_inplace, qk_norm_inplace,
-    rmsnorm_unit_offset, vec_dot_bf16, vec_dot_f16, vec_dot_q4_0, vec_dot_q5_k, vec_dot_q6_k,
-    vec_dot_q8_0,
+    rmsnorm_unit_offset, vec_dot_bf16, vec_dot_f16, vec_dot_i2_s, vec_dot_iq4_nl, vec_dot_q2_k,
+    vec_dot_q3_k, vec_dot_q4_0, vec_dot_q4_1, vec_dot_q5_0, vec_dot_q5_1, vec_dot_q5_k,
+    vec_dot_q6_k, vec_dot_q8_0,
 };
 
 use crate::engine::EnginePhase;
@@ -41,7 +42,60 @@ pub struct ExpertWeights<'a> {
     pub down: TensorView<'a>,
 }
 
-/// Dispatches matrix-vector multiplication across all quantization formats supported by Gemma.
+const fn is_supported_gemma_quant(quant: QuantType) -> bool {
+    matches!(
+        quant,
+        QuantType::F32
+            | QuantType::F16
+            | QuantType::BF16
+            | QuantType::Q4_0
+            | QuantType::Q4_1
+            | QuantType::Q5_0
+            | QuantType::Q5_1
+            | QuantType::Q8_0
+            | QuantType::Q2_K
+            | QuantType::Q3_K
+            | QuantType::Q4_K_M
+            | QuantType::Q5_K
+            | QuantType::Q6_K
+            | QuantType::IQ4_NL
+    )
+}
+
+fn matvec_any_slice(
+    out: &mut [f32],
+    weights: &TensorView<'_>,
+    input: &[f32],
+) -> Result<(), K3Error> {
+    match weights.quant() {
+        QuantType::F32 => matvec_f32(out, weights, input),
+        QuantType::F16 => vec_dot_f16(out, weights, input),
+        QuantType::BF16 => vec_dot_bf16(out, weights, input),
+        QuantType::Q4_0 => vec_dot_q4_0(out, weights, input),
+        QuantType::Q4_1 => vec_dot_q4_1(out, weights, input),
+        QuantType::Q5_0 => vec_dot_q5_0(out, weights, input),
+        QuantType::Q5_1 => vec_dot_q5_1(out, weights, input),
+        QuantType::Q8_0 => vec_dot_q8_0(out, weights, input),
+        QuantType::Q2_K => vec_dot_q2_k(out, weights, input),
+        QuantType::Q3_K => vec_dot_q3_k(out, weights, input),
+        QuantType::Q4_K_M => BaselineKernel::new().vec_dot_q4_k_m(out, weights, input),
+        QuantType::Q5_K => vec_dot_q5_k(out, weights, input),
+        QuantType::Q6_K => vec_dot_q6_k(out, weights, input),
+        QuantType::IQ4_NL => vec_dot_iq4_nl(out, weights, input),
+        QuantType::I2_S => vec_dot_i2_s(out, weights, input),
+        other => Err(K3Error::CapabilityMismatch {
+            architecture: "gemma".to_owned(),
+            reason: format!(
+                "unsupported weight quantization {other:?} for tensor '{}'",
+                weights.name()
+            ),
+        }),
+    }
+}
+
+/// Dispatches matrix-vector multiplication across all quantization formats supported by Gemma,
+/// fanning out independent output row slices across the active pinned `WorkerPool` when multiple
+/// Rayon threads are available.
 pub(crate) fn matvec_any(
     out: &mut [f32],
     weights: &TensorView<'_>,
@@ -56,23 +110,28 @@ pub(crate) fn matvec_any(
             reason: "matvec output and input slices cannot be empty".to_owned(),
         });
     }
-    match weights.quant() {
-        QuantType::F32 => matvec_f32(out, weights, input),
-        QuantType::F16 => vec_dot_f16(out, weights, input),
-        QuantType::BF16 => vec_dot_bf16(out, weights, input),
-        QuantType::Q4_0 => vec_dot_q4_0(out, weights, input),
-        QuantType::Q8_0 => vec_dot_q8_0(out, weights, input),
-        QuantType::Q4_K_M => BaselineKernel::new().vec_dot_q4_k_m(out, weights, input),
-        QuantType::Q5_K => vec_dot_q5_k(out, weights, input),
-        QuantType::Q6_K => vec_dot_q6_k(out, weights, input),
-        other => Err(K3Error::CapabilityMismatch {
-            architecture: "gemma".to_owned(),
-            reason: format!(
-                "unsupported weight quantization {other:?} for tensor '{}'",
-                weights.name()
-            ),
-        }),
+    if cfg!(not(miri))
+        && out.len() >= 64
+        && weights.shape().len() == 2
+        && weights.shape()[1] == out.len()
+        && weights.shape()[0] == input.len()
+        && weights.quant() != QuantType::I2_S
+    {
+        let n_threads = rayon::current_num_threads();
+        if n_threads > 1 {
+            use rayon::prelude::*;
+
+            let chunk_rows = out.len().div_ceil(n_threads).clamp(16, 2048);
+            return out.par_chunks_mut(chunk_rows).enumerate().try_for_each(
+                |(chunk_idx, out_chunk)| {
+                    let row_start = chunk_idx * chunk_rows;
+                    let chunk_view = weights.slice_rows(row_start, out_chunk.len())?;
+                    matvec_any_slice(out_chunk, &chunk_view, input)
+                },
+            );
+        }
     }
+    matvec_any_slice(out, weights, input)
 }
 
 fn matvec_f32(out: &mut [f32], weights: &TensorView<'_>, input: &[f32]) -> Result<(), K3Error> {
@@ -127,11 +186,7 @@ fn matvec_f32(out: &mut [f32], weights: &TensorView<'_>, input: &[f32]) -> Resul
 }
 
 fn quant_block_elems(quant: QuantType) -> usize {
-    match quant {
-        QuantType::Q4_0 | QuantType::Q8_0 => 32,
-        QuantType::Q4_K_M | QuantType::Q5_K | QuantType::Q6_K => 256,
-        _ => 1,
-    }
+    quant.block_elements().max(1)
 }
 
 fn infer_ple_row_width(
@@ -1181,17 +1236,7 @@ impl ArchRecipe for GemmaRecipe {
     }
 
     fn supports_quant(&self, quant: QuantType) -> bool {
-        matches!(
-            quant,
-            QuantType::F32
-                | QuantType::F16
-                | QuantType::BF16
-                | QuantType::Q4_0
-                | QuantType::Q8_0
-                | QuantType::Q4_K_M
-                | QuantType::Q5_K
-                | QuantType::Q6_K
-        )
+        is_supported_gemma_quant(quant)
     }
 
     fn prefill_step(
@@ -1320,17 +1365,7 @@ impl ArchRecipe for Gemma4Recipe {
     }
 
     fn supports_quant(&self, quant: QuantType) -> bool {
-        matches!(
-            quant,
-            QuantType::F32
-                | QuantType::F16
-                | QuantType::BF16
-                | QuantType::Q4_0
-                | QuantType::Q8_0
-                | QuantType::Q4_K_M
-                | QuantType::Q5_K
-                | QuantType::Q6_K
-        )
+        is_supported_gemma_quant(quant)
     }
 
     fn prefill_step(

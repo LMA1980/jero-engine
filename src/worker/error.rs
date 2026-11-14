@@ -14,6 +14,7 @@ pub const EXIT_CAPABILITY_MISMATCH: i32 = 10;
 pub const EXIT_INSUFFICIENT_MEMLOCK: i32 = 11;
 pub const EXIT_RESOURCE_EXHAUSTED: i32 = 12;
 pub const EXIT_PROTOCOL_ERROR: i32 = 13;
+pub const EXIT_TENSOR_BOUNDS: i32 = 14;
 
 /// Errors produced during worker initialization and execution.
 #[derive(Debug)]
@@ -28,6 +29,8 @@ pub enum WorkerError {
     ResourceExhausted(String),
     /// UDS framing, magic, or sequence protocol violation (exit code 13).
     ProtocolError(String),
+    /// GGUF parsing, tensor descriptor bounds, or out-of-range index failure (exit code 14).
+    TensorBoundsError(String),
     /// Internal unexpected execution failure (exit code 13).
     Internal(String),
 }
@@ -42,6 +45,7 @@ impl WorkerError {
             Self::InsufficientLockableMemory(_) => EXIT_INSUFFICIENT_MEMLOCK,
             Self::ResourceExhausted(_) => EXIT_RESOURCE_EXHAUSTED,
             Self::ProtocolError(_) | Self::Internal(_) => EXIT_PROTOCOL_ERROR,
+            Self::TensorBoundsError(_) => EXIT_TENSOR_BOUNDS,
         }
     }
 
@@ -54,6 +58,7 @@ impl WorkerError {
             Self::InsufficientLockableMemory(_) => StatusCode::InsufficientLockableMemory,
             Self::ResourceExhausted(_) => StatusCode::InternalError,
             Self::ProtocolError(_) => StatusCode::ProtocolError,
+            Self::TensorBoundsError(_) => StatusCode::TensorBoundsError,
             Self::Internal(_) => StatusCode::InternalError,
         }
     }
@@ -69,6 +74,7 @@ impl fmt::Display for WorkerError {
             }
             Self::ResourceExhausted(msg) => write!(f, "resource exhausted: {msg}"),
             Self::ProtocolError(msg) => write!(f, "protocol error: {msg}"),
+            Self::TensorBoundsError(msg) => write!(f, "tensor bounds error: {msg}"),
             Self::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
@@ -95,7 +101,7 @@ impl From<K3Error> for WorkerError {
             }
             K3Error::ContextLengthExceeded { .. } => Self::ResourceExhausted(err.to_string()),
             K3Error::AffinityError { reason, .. } => Self::CapabilityMismatch(reason),
-            K3Error::TensorBoundsError { reason, .. } => Self::ProtocolError(reason),
+            K3Error::TensorBoundsError { reason, .. } => Self::TensorBoundsError(reason),
             K3Error::RoutingUnavailable { reason } => Self::ProtocolError(reason),
             K3Error::QueueSaturated { .. } => Self::ResourceExhausted(err.to_string()),
         }

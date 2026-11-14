@@ -9,9 +9,10 @@ description: "Configure and run the jero-engine compute runtime, RecipeRegistry 
 
 - Register architecture recipes (`jero-arch-synthetic`, `jero-arch-llama`, `jero-arch-mistral`, `jero-arch-phi3`, `jero-arch-bitnet`, `jero-arch-dory`) in `RecipeRegistry` and validate GGUF metadata via `verify_metadata_capabilities` / `verify_model_capabilities` before locking weights.
 
-## 2. Conservative Diagnostic Context Bounds (`n_ctx: 64`)
+## 2. Conservative Diagnostic Context Bounds (`n_ctx: 64`) & Real vs. Synthetic Routing
 
 - Diagnostic utilities (`jero-diag`) and default integration test harnesses must use conservative context bounds (e.g., `n_ctx: 64`, requiring ~64 KiB KV cache) so tests run cleanly out-of-the-box in unprivileged environments without `InsufficientLockableMemory` (exit code `11`) admission refusal.
+- Passing `--model <path.gguf>` always executes real GGUF weights through the hydrated `ArchRecipe` and reports `"execution_mode": "real_gguf"` with `architecture`, `model_filename`, and `quant_summary`. Synthetic `ForwardModel` hardware calibration requires the explicit `--synthetic-matrix` flag (mutually exclusive with `--model`), emitting `"execution_mode": "synthetic_matrix"`.
 - Pre-validate compilation locally (`cargo check --target riscv64gc-unknown-linux-gnu --workspace --tests`) before dispatching runs to target hardware.
 
 ## 3. Worker Execution (`jero-worker`)

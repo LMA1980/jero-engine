@@ -1222,10 +1222,8 @@ fn test_tier1_f9_01_ime_kernel_execution_a100() {
 
 #[test]
 fn test_tier1_f9_02_ime_kernel_json_flag() {
-    let fixture = TempModelFixture::new("f9_02");
     let (out, val, _report) = run_diag_json(&[
-        "--model",
-        fixture.path_str(),
+        "--synthetic-matrix",
         "--cluster",
         "a100",
         "--ime",
@@ -1245,7 +1243,7 @@ fn test_tier1_f9_02_ime_kernel_json_flag() {
         .expect("ime_vmadot_issued present");
     assert!(
         vmadot > 0,
-        "A100 --ime on must issue smt.vmadot instructions"
+        "A100 --synthetic-matrix --ime on must issue smt.vmadot instructions"
     );
 }
 
@@ -1426,10 +1424,8 @@ fn test_tier1_f11_01_ime_delta_fields_present() {
 
 #[test]
 fn test_tier1_f11_02_ime_delta_arithmetic_equality() {
-    let fixture = TempModelFixture::new("f11_02");
     let (out_on, val_on, _rep_on) = run_diag_json(&[
-        "--model",
-        fixture.path_str(),
+        "--synthetic-matrix",
         "--cluster",
         "a100",
         "--ime",
