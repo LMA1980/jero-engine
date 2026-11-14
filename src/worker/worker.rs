@@ -6,7 +6,6 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Instant;
 
-use jero_core::K3Error;
 use jero_core::ipc::arrow::wrap_tokens_as_uint32_array;
 use jero_core::ipc::layout::{
     BLOCK_SIZE_TOKENS, KvBlockTag, OutputSlabHeader, SLAB_STATUS_WRITTEN, TokenInputSlotHeader,
@@ -17,13 +16,16 @@ use jero_core::ipc::protocol::{
     send_msg_frame,
 };
 use jero_core::ipc::shm::SharedMemoryArena;
+use jero_core::{GgufFile, GgufValue, K3Error};
+use jero_tokenizer::GgufTokenizer;
 use zerocopy::FromBytes;
 
 use crate::affinity::{
     ClusterPhasePolicy, ClusterPreset, ClusterSelection, CpuTopologyInspector, ResolvedAffinity,
     SystemCpuTopology, VlenDomain, WorkerPool,
 };
-use crate::engine::{SinglePromptEngine, sample_greedy_argmax};
+use crate::chat_template::discover_stop_token_ids;
+use crate::engine::{GenerationConfig, SinglePromptEngine, StopReason, sample_greedy_argmax};
 use crate::kv::SingleSlotKvArena;
 
 use super::affinity::{
@@ -34,6 +36,70 @@ use super::cli::WorkerConfig;
 use super::error::WorkerError;
 use super::weights::LockedWeights;
 
+const SLAB_STOP_MAGIC: [u8; 4] = *b"K3S1";
+const SLAB_STOP_KIND_NONE: u8 = 0;
+const SLAB_STOP_KIND_EOS_TOKEN: u8 = 1;
+const SLAB_STOP_KIND_MAX_TOKENS: u8 = 2;
+
+/// Encodes an optional [`StopReason`] into [`OutputSlabHeader::_reserved`] without altering the
+/// 64-byte shared-memory ABI (`#156`).
+pub fn encode_slab_stop_reason(hdr: &mut OutputSlabHeader, stop_reason: Option<StopReason>) {
+    hdr._reserved[0..4].copy_from_slice(&SLAB_STOP_MAGIC);
+    match stop_reason {
+        None => {
+            hdr._reserved[4] = SLAB_STOP_KIND_NONE;
+            hdr._reserved[8..12].copy_from_slice(&0_u32.to_le_bytes());
+        }
+        Some(StopReason::EosToken { token_id }) => {
+            hdr._reserved[4] = SLAB_STOP_KIND_EOS_TOKEN;
+            hdr._reserved[8..12].copy_from_slice(&token_id.to_le_bytes());
+        }
+        Some(StopReason::MaxTokens) => {
+            hdr._reserved[4] = SLAB_STOP_KIND_MAX_TOKENS;
+            hdr._reserved[8..12].copy_from_slice(&0_u32.to_le_bytes());
+        }
+    }
+}
+
+/// Decodes a [`StopReason`] previously written to [`OutputSlabHeader::_reserved`] by `jero-worker`.
+#[must_use]
+pub fn decode_slab_stop_reason(hdr: &OutputSlabHeader) -> Option<StopReason> {
+    if hdr._reserved[0..4] != SLAB_STOP_MAGIC {
+        return None;
+    }
+    match hdr._reserved[4] {
+        SLAB_STOP_KIND_EOS_TOKEN => {
+            let token_id = u32::from_le_bytes([
+                hdr._reserved[8],
+                hdr._reserved[9],
+                hdr._reserved[10],
+                hdr._reserved[11],
+            ]);
+            Some(StopReason::EosToken { token_id })
+        }
+        SLAB_STOP_KIND_MAX_TOKENS => Some(StopReason::MaxTokens),
+        _ => None,
+    }
+}
+
+fn discover_worker_stop_tokens(weights: &LockedWeights) -> Vec<u32> {
+    if let Ok(gguf) = GgufFile::parse(weights.as_slice()) {
+        if let Ok(tok) = GgufTokenizer::from_gguf(&gguf) {
+            return discover_stop_token_ids(&tok);
+        }
+        let mut ids = Vec::new();
+        for key in ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"] {
+            if let Some(id) = gguf.metadata_value(key).and_then(GgufValue::as_u32)
+                && !ids.contains(&id)
+            {
+                ids.push(id);
+            }
+        }
+        return ids;
+    }
+    Vec::new()
+}
+
 /// Isolated compute worker execution engine.
 #[derive(Debug)]
 pub struct WorkerEngine {
@@ -43,6 +109,9 @@ pub struct WorkerEngine {
     kv_arena: Option<SingleSlotKvArena>,
     prompt_engine: SinglePromptEngine,
     pool: Option<WorkerPool>,
+    stop_token_ids: Vec<u32>,
+    attach_n_ctx: usize,
+    last_stop_reason: Option<StopReason>,
     completed_passes: u64,
     is_busy: bool,
     compute_mask: u64,
@@ -157,9 +226,14 @@ impl WorkerEngine {
         let initial_n_ctx = if meta_ctx > 0 { meta_ctx.min(64) } else { 64 };
         let initial_kv = weights.instantiate_kv_arena(initial_n_ctx)?;
 
+        let stop_token_ids = discover_worker_stop_tokens(&weights);
         let (phase_policy, pool) =
             build_worker_pool(&config.cluster, compute_mask, &assigned_cores);
-        let prompt_engine = SinglePromptEngine::new().with_phase_policy(phase_policy);
+        let prompt_engine = SinglePromptEngine::new()
+            .with_phase_policy(phase_policy)
+            .with_generation_config(
+                GenerationConfig::new().with_stop_token_ids(stop_token_ids.iter().copied()),
+            );
 
         Ok(Self {
             config,
@@ -168,6 +242,9 @@ impl WorkerEngine {
             kv_arena: Some(initial_kv),
             prompt_engine,
             pool,
+            stop_token_ids,
+            attach_n_ctx: initial_n_ctx,
+            last_stop_reason: None,
             completed_passes: 0,
             is_busy: false,
             compute_mask,
@@ -219,6 +296,28 @@ impl WorkerEngine {
     #[must_use]
     pub const fn has_arena(&self) -> bool {
         self.arena.is_some()
+    }
+
+    /// Returns the discovered EOS/EOT stop token IDs enforced for IPC passes.
+    #[must_use]
+    pub fn stop_token_ids(&self) -> &[u32] {
+        &self.stop_token_ids
+    }
+
+    /// Replaces the stop token IDs enforced on subsequent IPC passes.
+    pub fn set_stop_token_ids<I>(&mut self, stop_token_ids: I)
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        let gen_cfg = GenerationConfig::new().with_stop_token_ids(stop_token_ids);
+        self.stop_token_ids = gen_cfg.stop_token_ids.clone();
+        self.prompt_engine.set_generation_config(gen_cfg);
+    }
+
+    /// Returns the [`StopReason`] recorded for the most recent `ForwardPassCommand`, if any.
+    #[must_use]
+    pub const fn last_stop_reason(&self) -> Option<StopReason> {
+        self.last_stop_reason
     }
 
     /// Runs the worker event loop on the connected Unix domain stream socket.
@@ -281,6 +380,7 @@ impl WorkerEngine {
                         .max(1);
                     let kv_arena = self.weights.instantiate_kv_arena(attach_n_ctx)?;
                     self.kv_arena = Some(kv_arena);
+                    self.attach_n_ctx = attach_n_ctx;
                     self.arena = Some(arena);
 
                     // Send response frame (Type ID 206) with StatusCode::Success
@@ -517,6 +617,17 @@ impl WorkerEngine {
                     slab_hdr.position =
                         u32::try_from(end_pos).unwrap_or(cmd.token_offset + cmd.token_count);
                     slab_hdr.status = SLAB_STATUS_WRITTEN;
+                    let step_stop_reason = if self.stop_token_ids.contains(&next_token) {
+                        Some(StopReason::EosToken {
+                            token_id: next_token,
+                        })
+                    } else if end_pos >= self.attach_n_ctx {
+                        Some(StopReason::MaxTokens)
+                    } else {
+                        None
+                    };
+                    self.last_stop_reason = step_stop_reason;
+                    encode_slab_stop_reason(slab_hdr, step_stop_reason);
 
                     // Logits float array starting at slab_offset + 64
                     let logits_data_offset = slab_offset + 64;
@@ -611,4 +722,31 @@ fn step_xoshiro256ss(state: &mut [u64; 4]) -> u64 {
 #[inline]
 fn st_is_zero(state: &[u64; 4]) -> bool {
     state.iter().all(|&x| x == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_output_slab_stop_reason_roundtrip_preserves_abi() {
+        #[repr(C, align(64))]
+        struct AlignedSlab([u8; 64]);
+
+        let mut buf = AlignedSlab([0_u8; 64]);
+        let hdr = OutputSlabHeader::mut_from_bytes(&mut buf.0).expect("64B slab header");
+        assert_eq!(decode_slab_stop_reason(hdr), None);
+
+        encode_slab_stop_reason(hdr, Some(StopReason::EosToken { token_id: 128_009 }));
+        assert_eq!(
+            decode_slab_stop_reason(hdr),
+            Some(StopReason::EosToken { token_id: 128_009 })
+        );
+
+        encode_slab_stop_reason(hdr, Some(StopReason::MaxTokens));
+        assert_eq!(decode_slab_stop_reason(hdr), Some(StopReason::MaxTokens));
+
+        encode_slab_stop_reason(hdr, None);
+        assert_eq!(decode_slab_stop_reason(hdr), None);
+    }
 }

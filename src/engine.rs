@@ -37,6 +37,100 @@ pub enum StreamAction {
     Stop,
 }
 
+/// Terminal reason a sequence generation pass stopped (`#156`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    /// Generation halted immediately on a matching EOS/EOT stop token ID.
+    EosToken {
+        /// Vocabulary token ID that triggered early termination.
+        token_id: u32,
+    },
+    /// Generation reached the configured `max_tokens` (or context length) ceiling.
+    #[default]
+    MaxTokens,
+}
+
+impl StopReason {
+    /// Returns the canonical snake-case label (`"eos_token"` or `"max_tokens"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EosToken { .. } => "eos_token",
+            Self::MaxTokens => "max_tokens",
+        }
+    }
+
+    /// Returns the matched stop token ID when stopped by [`Self::EosToken`].
+    #[must_use]
+    pub const fn token_id(self) -> Option<u32> {
+        match self {
+            Self::EosToken { token_id } => Some(token_id),
+            Self::MaxTokens => None,
+        }
+    }
+}
+
+/// Autoregressive stopping controls applied natively inside [`SinglePromptEngine`] (`#155`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct GenerationConfig {
+    /// Vocabulary token IDs (EOS, EOT, `<|eot_id|>`, `<|im_end|>`, `<|end|>`,
+    /// `<end_of_turn>`, `<｜end▁of▁sentence｜>`, etc.) that immediately halt decoding.
+    #[serde(default)]
+    pub stop_token_ids: Vec<u32>,
+    /// When `true`, ignore `stop_token_ids` and continue until `max_tokens` (`--ignore-eos`).
+    #[serde(default)]
+    pub ignore_eos: bool,
+}
+
+impl GenerationConfig {
+    /// Creates a [`GenerationConfig`] with no stop tokens and `ignore_eos = false`.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            stop_token_ids: Vec::new(),
+            ignore_eos: false,
+        }
+    }
+
+    /// Populates `stop_token_ids` automatically from a parsed GGUF tokenizer (`#155`).
+    #[must_use]
+    pub fn from_tokenizer(tokenizer: &jero_tokenizer::GgufTokenizer) -> Self {
+        Self {
+            stop_token_ids: crate::chat_template::discover_stop_token_ids(tokenizer),
+            ignore_eos: false,
+        }
+    }
+
+    /// Sets deduplicated `stop_token_ids` on this configuration.
+    #[must_use]
+    pub fn with_stop_token_ids<I>(mut self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        self.stop_token_ids.clear();
+        for id in ids {
+            if !self.stop_token_ids.contains(&id) {
+                self.stop_token_ids.push(id);
+            }
+        }
+        self
+    }
+
+    /// Configures whether EOS/EOT stop token matching should be ignored (`--ignore-eos`).
+    #[must_use]
+    pub const fn with_ignore_eos(mut self, ignore_eos: bool) -> Self {
+        self.ignore_eos = ignore_eos;
+        self
+    }
+
+    /// Returns `true` if `token_id` triggers immediate termination under this config.
+    #[must_use]
+    pub fn is_stop_token(&self, token_id: u32) -> bool {
+        !self.ignore_eos && self.stop_token_ids.contains(&token_id)
+    }
+}
+
 /// Execution timing, throughput, and synchronization barrier wait metrics for a single forward pass.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PassTiming {
@@ -63,21 +157,14 @@ pub struct PassTiming {
     pub compute_utilization_ratio: f64,
     /// Number of decode steps executed.
     pub decode_steps: usize,
+    /// Reason token generation stopped for this forward pass (`"eos_token"` or `"max_tokens"`).
+    #[serde(default)]
+    pub stop_reason: StopReason,
 }
 
 impl Default for PassTiming {
     fn default() -> Self {
-        Self {
-            ttft_ms: 0.0,
-            prefill_ms: 0.0,
-            decode_ms: 0.0,
-            decode_tokens_per_sec: 0.0,
-            total_wall_time_ms: 0.0,
-            cumulative_barrier_wait_ms: 0.0,
-            barrier_wait_ratio: 0.0,
-            compute_utilization_ratio: 1.0,
-            decode_steps: 0,
-        }
+        Self::zero()
     }
 }
 
@@ -95,6 +182,7 @@ impl PassTiming {
             barrier_wait_ratio: 0.0,
             compute_utilization_ratio: 1.0,
             decode_steps: 0,
+            stop_reason: StopReason::MaxTokens,
         }
     }
 }
@@ -120,6 +208,7 @@ pub struct SinglePromptEngine {
     active_cycle: AtomicBool,
     phase: EnginePhase,
     phase_policy: ClusterPhasePolicy,
+    generation_config: GenerationConfig,
     last_prefill_cpu_mask: u64,
     last_decode_cpu_mask: u64,
 }
@@ -163,9 +252,45 @@ impl SinglePromptEngine {
             active_cycle: AtomicBool::new(false),
             phase: EnginePhase::Idle,
             phase_policy: ClusterPhasePolicy::Auto,
+            generation_config: GenerationConfig::new(),
             last_prefill_cpu_mask: 0,
             last_decode_cpu_mask: 0,
         }
+    }
+
+    /// Configures autoregressive stopping rules (`stop_token_ids` and `ignore_eos`).
+    #[must_use]
+    pub fn with_generation_config(mut self, generation_config: GenerationConfig) -> Self {
+        self.generation_config = generation_config;
+        self
+    }
+
+    /// Updates autoregressive stopping rules (`stop_token_ids` and `ignore_eos`).
+    pub fn set_generation_config(&mut self, generation_config: GenerationConfig) {
+        self.generation_config = generation_config;
+    }
+
+    /// Configures explicit stop token IDs that immediately halt decoding (unless `ignore_eos` is set).
+    #[must_use]
+    pub fn with_stop_token_ids<I>(mut self, stop_token_ids: I) -> Self
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        self.generation_config = self.generation_config.with_stop_token_ids(stop_token_ids);
+        self
+    }
+
+    /// Configures whether EOS/EOT stop token termination is bypassed (`--ignore-eos`).
+    #[must_use]
+    pub const fn with_ignore_eos(mut self, ignore_eos: bool) -> Self {
+        self.generation_config.ignore_eos = ignore_eos;
+        self
+    }
+
+    /// Returns the active [`GenerationConfig`] for this engine instance.
+    #[must_use]
+    pub const fn generation_config(&self) -> &GenerationConfig {
+        &self.generation_config
     }
 
     /// Configures the execution-phase cluster scheduling policy for this engine instance.
@@ -545,6 +670,28 @@ impl SinglePromptEngine {
         let prefill_ms = ttft_ms;
 
         generated_tokens.push(current_token);
+        if self.generation_config.is_stop_token(current_token) {
+            self.phase = EnginePhase::Completed;
+            return Ok(EvaluationSummary {
+                prompt_tokens: prompt_tokens.len(),
+                generated_tokens,
+                final_position: ctx.position(),
+                final_phase: self.phase,
+                timing: compute_pass_timing_with_reason(
+                    pass_start,
+                    ttft_ms,
+                    prefill_ms,
+                    0.0,
+                    0,
+                    0.0,
+                    worker_pool,
+                    StopReason::EosToken {
+                        token_id: current_token,
+                    },
+                ),
+            });
+        }
+
         if on_token(current_token)? == StreamAction::Stop || !requires_kv {
             self.phase = EnginePhase::Completed;
             return Ok(EvaluationSummary {
@@ -568,6 +715,7 @@ impl SinglePromptEngine {
         self.phase = EnginePhase::Decode;
         let decode_start = Instant::now();
         let mut decode_steps = 0usize;
+        let mut stop_reason = StopReason::MaxTokens;
 
         while generated_tokens.len() < max_tokens && ctx.position() < n_ctx {
             ctx.prepare_decode(current_token)?;
@@ -587,6 +735,12 @@ impl SinglePromptEngine {
 
             generated_tokens.push(current_token);
             decode_steps += 1;
+            if self.generation_config.is_stop_token(current_token) {
+                stop_reason = StopReason::EosToken {
+                    token_id: current_token,
+                };
+                break;
+            }
             if on_token(current_token)? == StreamAction::Stop {
                 break;
             }
@@ -607,7 +761,7 @@ impl SinglePromptEngine {
             generated_tokens,
             final_position: ctx.position(),
             final_phase: self.phase,
-            timing: compute_pass_timing(
+            timing: compute_pass_timing_with_reason(
                 pass_start,
                 ttft_ms,
                 prefill_ms,
@@ -615,6 +769,7 @@ impl SinglePromptEngine {
                 decode_steps,
                 decode_tokens_per_sec,
                 worker_pool,
+                stop_reason,
             ),
         })
     }
@@ -1230,6 +1385,29 @@ pub(crate) fn compute_pass_timing(
     decode_tokens_per_sec: f64,
     worker_pool: Option<&WorkerPool>,
 ) -> PassTiming {
+    compute_pass_timing_with_reason(
+        pass_start,
+        ttft_ms,
+        prefill_ms,
+        decode_ms,
+        decode_steps,
+        decode_tokens_per_sec,
+        worker_pool,
+        StopReason::MaxTokens,
+    )
+}
+
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+pub(crate) fn compute_pass_timing_with_reason(
+    pass_start: Instant,
+    ttft_ms: f64,
+    prefill_ms: f64,
+    decode_ms: f64,
+    decode_steps: usize,
+    decode_tokens_per_sec: f64,
+    worker_pool: Option<&WorkerPool>,
+    stop_reason: StopReason,
+) -> PassTiming {
     let total_wall_time_ms = pass_start.elapsed().as_secs_f64() * 1000.0;
     let cumulative_barrier_wait_ms =
         worker_pool.map_or(0.0, WorkerPool::cumulative_barrier_wait_ms);
@@ -1252,6 +1430,7 @@ pub(crate) fn compute_pass_timing(
         barrier_wait_ratio,
         compute_utilization_ratio,
         decode_steps,
+        stop_reason,
     }
 }
 
@@ -1954,5 +2133,59 @@ mod tests {
         assert_eq!(parse_llamaguard_hazard("unsafe\nS0"), None);
         assert_eq!(parse_llamaguard_hazard("unsafe\nS15"), None);
         assert_eq!(parse_llamaguard_hazard(""), None);
+    }
+
+    #[cfg(feature = "jero-arch-synthetic")]
+    #[test]
+    fn test_generation_config_multi_eos_halt_ignore_eos_and_stop_reason() {
+        use jero_arch_synthetic::SyntheticRecipe;
+
+        let tensor_specs = [
+            ("blk.0.attn_q.weight", QuantType::Q4_K_M, &[256, 2][..]),
+            ("output_norm.weight", QuantType::F32, &[16][..]),
+        ];
+        let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
+        let gguf = GgufFile::parse(&bytes).expect("parse gguf");
+        let recipe = SyntheticRecipe::new();
+
+        // 1. Halts immediately on configured EOT/EOS token (11), excluding terminal token from stream
+        let mut kv_arena = SingleSlotKvArena::new(gguf.metadata(), 32).expect("kv");
+        let mut engine = SinglePromptEngine::new().with_stop_token_ids(vec![11]);
+        let mut streamed = Vec::new();
+        let summary = engine
+            .evaluate_prompt(&recipe, &gguf, &mut kv_arena, &[1, 9, 10], 16, 6, |tok| {
+                streamed.push(tok);
+                Ok(StreamAction::Continue)
+            })
+            .expect("evaluate stop");
+        assert_eq!(streamed, vec![9, 10]);
+        assert_eq!(summary.generated_tokens, vec![9, 10, 11]);
+        assert_eq!(
+            summary.timing.stop_reason,
+            StopReason::EosToken { token_id: 11 }
+        );
+        assert_eq!(summary.timing.decode_steps, 2);
+
+        // 2. `--ignore-eos` ignores stop token 11 and runs all 4 requested tokens -> MaxTokens
+        let mut kv_arena2 = SingleSlotKvArena::new(gguf.metadata(), 32).expect("kv");
+        engine.set_generation_config(
+            GenerationConfig::new()
+                .with_stop_token_ids(vec![11])
+                .with_ignore_eos(true),
+        );
+        let mut ignored_stream = Vec::new();
+        let summary_ignored = engine
+            .evaluate_prompt(&recipe, &gguf, &mut kv_arena2, &[1, 9, 10], 16, 4, |tok| {
+                ignored_stream.push(tok);
+                Ok(StreamAction::Continue)
+            })
+            .expect("evaluate ignore eos");
+        assert_eq!(ignored_stream, vec![9, 10, 11, 12]);
+        assert_eq!(summary_ignored.timing.stop_reason, StopReason::MaxTokens);
+
+        // 3. StopReason serde roundtrip + backward-compatible PassTiming default
+        let json_eos = serde_json::to_string(&summary.timing).expect("serialize timing");
+        let parsed: PassTiming = serde_json::from_str(&json_eos).expect("deserialize timing");
+        assert_eq!(parsed.stop_reason, StopReason::EosToken { token_id: 11 });
     }
 }

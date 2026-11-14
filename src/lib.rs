@@ -7,6 +7,7 @@
 pub mod affinity;
 pub mod capability;
 pub mod certification;
+pub mod chat_template;
 pub mod engine;
 #[cfg(feature = "jero-kernels-rvv")]
 pub mod forward;
@@ -40,11 +41,16 @@ pub use certification::{
     tokenize_prompt_utf8_safe, verify_intrinsic_parity, verify_parity_against_golden,
     verify_prompt_sensitivity,
 };
+pub use chat_template::{
+    ChatTemplateFamily, detect_chat_template_family, detokenize_excluding_stop_tokens,
+    discover_stop_token_ids, encode_formatted_prompt_utf8_safe, format_single_turn_prompt,
+};
 pub use engine::{
-    CalibratedGuardrailScore, EnginePhase, EvaluationSummary, FsmDecisionConstraint, PassTiming,
-    SinglePromptEngine, StreamAction, apply_fsm_logit_mask, compute_calibrated_binary_risk,
-    execute_jump_forward_prefill, harvest_decision_logprobs, infer_logits_buffer_len,
-    parse_llamaguard_hazard, sample_greedy_argmax,
+    CalibratedGuardrailScore, EnginePhase, EvaluationSummary, FsmDecisionConstraint,
+    GenerationConfig, PassTiming, SinglePromptEngine, StopReason, StreamAction,
+    apply_fsm_logit_mask, compute_calibrated_binary_risk, execute_jump_forward_prefill,
+    harvest_decision_logprobs, infer_logits_buffer_len, parse_llamaguard_hazard,
+    sample_greedy_argmax,
 };
 pub use jero_core as k3_core;
 pub use jero_core::{

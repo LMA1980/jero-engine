@@ -753,6 +753,8 @@ pub(crate) fn build_telemetry_and_stats(
             cumulative_barrier_wait_ms: s.timing.cumulative_barrier_wait_ms,
             barrier_wait_ratio: s.timing.barrier_wait_ratio,
             compute_utilization_ratio: s.timing.compute_utilization_ratio,
+            stop_reason: s.timing.stop_reason.as_str().to_owned(),
+            stop_token_id: s.timing.stop_reason.token_id(),
             tokens: Some(s.generated_tokens.clone()),
         })
         .collect();

@@ -24,8 +24,9 @@ use jero_engine::forward::{
     ForwardModel, Lane, MatKernel, PlacementPlan, measure_memory_bandwidth, measure_peak_macs,
 };
 use jero_engine::{
-    LockedModelWeights, SinglePromptEngine, SingleSlotKvArena, StreamAction, SystemMemoryInspector,
-    WorkerPool, resolve_affinity, tokenize_prompt_utf8_safe,
+    GenerationConfig, LockedModelWeights, SinglePromptEngine, SingleSlotKvArena, StreamAction,
+    SystemMemoryInspector, WorkerPool, discover_stop_token_ids, resolve_affinity,
+    tokenize_prompt_utf8_safe,
 };
 use jero_tokenizer::{DetokenizeStep, GgufTokenizer};
 use serde::{Deserialize, Serialize};
@@ -636,6 +637,37 @@ pub fn calibrated_suite_score(
     (fp16_baseline * quant_retention * clamped_ratio).min(100.0)
 }
 
+/// Resolved execution bounds and decoding controls for `--eval-suite` runs (`#153`, `#152`, `#155`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvalSuiteConfig {
+    /// Context length bound passed to `SingleSlotKvArena` (`64` default for unprivileged tests).
+    pub n_ctx: usize,
+    /// Unclamped maximum generated tokens per dataset item (`16` default for unprivileged tests).
+    pub max_tokens: usize,
+    /// Skip chat-template framing (`--raw-prompt`).
+    pub raw_prompt: bool,
+    /// Bypass EOS/EOT stopping (`--ignore-eos`).
+    pub ignore_eos: bool,
+}
+
+impl EvalSuiteConfig {
+    /// Conservative context length (`64`) preserving `RLIMIT_MEMLOCK` headroom in automated tests.
+    pub const DEFAULT_N_CTX: usize = 64;
+    /// Conservative default generation budget (`16`) when `--max-tokens` is omitted.
+    pub const DEFAULT_MAX_TOKENS: usize = 16;
+
+    /// Resolves `EvalSuiteConfig` from CLI/diagnostic flags without clamping caller-specified bounds.
+    #[must_use]
+    pub fn from_diag_config(config: &DiagConfig) -> Self {
+        Self {
+            n_ctx: config.n_ctx.unwrap_or(Self::DEFAULT_N_CTX),
+            max_tokens: config.max_tokens.unwrap_or(Self::DEFAULT_MAX_TOKENS),
+            raw_prompt: config.raw_prompt,
+            ignore_eos: config.ignore_eos,
+        }
+    }
+}
+
 /// Executes the in-process public open-source benchmark suite (`--eval-suite`).
 pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Result<(), K3Error> {
     let model_path = config
@@ -646,8 +678,10 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
             reason: "missing required --model <path>".to_owned(),
         })?;
     let selected_suite = config.eval_suite.unwrap_or(EvalSuite::All);
-    let n_ctx = config.n_ctx.unwrap_or(64);
-    let max_tokens = config.max_tokens.unwrap_or(16).min(32);
+    let eval_cfg = EvalSuiteConfig::from_diag_config(config);
+    let n_ctx = eval_cfg.n_ctx;
+    let max_tokens = eval_cfg.max_tokens;
+    let apply_chat_template = !eval_cfg.raw_prompt;
     let profile = config.coord.unwrap_or(if config.phase_policy.is_some() {
         CoordinationProfile::Rayon
     } else {
@@ -687,9 +721,13 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
             LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
         let gguf_probe = GgufFile::parse(locked_weights.as_bytes())?;
         let tok_probe = GgufTokenizer::from_gguf(&gguf_probe)?;
-        let sample_len =
-            tokenize_prompt_utf8_safe(&tok_probe, &filtered_items[0].prompt, true, n_ctx)
-                .map_or(8, |t| t.len());
+        let sample_len = tokenize_prompt_utf8_safe(
+            &tok_probe,
+            &filtered_items[0].prompt,
+            apply_chat_template,
+            n_ctx,
+        )
+        .map_or(8, |t| t.len());
         let worker_pool = WorkerPool::for_phase_policy(
             policy,
             locked_weights.metadata(),
@@ -768,6 +806,10 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
     let resolved_affinity = worker_pool.affinity().clone();
     let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
     let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
+    let stop_token_ids = discover_stop_token_ids(&tokenizer);
+    engine.set_generation_config(
+        GenerationConfig::from_tokenizer(&tokenizer).with_ignore_eos(eval_cfg.ignore_eos),
+    );
 
     let arch_name = locked_weights.metadata().architecture().to_owned();
     let quant_str = QuantizationInfo::from_descriptors(locked_weights.metadata().tensors()).primary;
@@ -793,7 +835,8 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
             suite_order.push(item.suite.clone());
         }
 
-        let prompt_tokens = tokenize_prompt_utf8_safe(&tokenizer, &item.prompt, true, n_ctx)?;
+        let prompt_tokens =
+            tokenize_prompt_utf8_safe(&tokenizer, &item.prompt, apply_chat_template, n_ctx)?;
         let eval_tokens = if prompt_tokens.len() >= n_ctx {
             &prompt_tokens[..n_ctx.saturating_sub(4).max(1)]
         } else {
@@ -812,15 +855,29 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
             eval_tokens,
             tokenizer.vocab_size(),
             max_tokens.min(n_ctx.saturating_sub(eval_tokens.len()).max(1)),
-            |tok| match detok.push_token(tok)? {
-                DetokenizeStep::Emit(piece) => {
-                    text_out.push_str(&piece);
-                    Ok(StreamAction::Continue)
+            |tok| {
+                if stop_token_ids.contains(&tok) {
+                    return Ok(if eval_cfg.ignore_eos {
+                        StreamAction::Continue
+                    } else {
+                        StreamAction::Stop
+                    });
                 }
-                DetokenizeStep::Hold => Ok(StreamAction::Continue),
-                DetokenizeStep::Stop(prefix) => {
-                    text_out.push_str(&prefix);
-                    Ok(StreamAction::Stop)
+                match detok.push_token(tok)? {
+                    DetokenizeStep::Emit(piece) => {
+                        text_out.push_str(&piece);
+                        Ok(StreamAction::Continue)
+                    }
+                    DetokenizeStep::Hold => Ok(StreamAction::Continue),
+                    DetokenizeStep::Stop(prefix) => {
+                        text_out.push_str(&prefix);
+                        if eval_cfg.ignore_eos {
+                            detok = tokenizer.streaming_detokenizer();
+                            Ok(StreamAction::Continue)
+                        } else {
+                            Ok(StreamAction::Stop)
+                        }
+                    }
                 }
             },
         )?;
@@ -1320,5 +1377,37 @@ mod tests {
 
         let half = calibrated_suite_score("llama", "F16", 80.0, 0.5);
         assert!((half - 40.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn eval_suite_config_honors_unclamped_max_tokens_and_conservative_defaults() {
+        let defaults = DiagConfig::default();
+        let resolved_defaults = EvalSuiteConfig::from_diag_config(&defaults);
+        assert_eq!(resolved_defaults.n_ctx, 64);
+        assert_eq!(resolved_defaults.max_tokens, 16);
+        assert!(!resolved_defaults.raw_prompt);
+        assert!(!resolved_defaults.ignore_eos);
+
+        let args = [
+            "jero-diag",
+            "--model",
+            "m.gguf",
+            "--eval-suite",
+            "all",
+            "--n-ctx",
+            "1024",
+            "--max-tokens",
+            "256",
+            "--raw-prompt",
+            "--ignore-eos",
+        ];
+        let custom = DiagConfig::parse_args(args.into_iter().map(str::to_owned))
+            .expect("parse")
+            .expect("some");
+        let resolved_custom = EvalSuiteConfig::from_diag_config(&custom);
+        assert_eq!(resolved_custom.n_ctx, 1024);
+        assert_eq!(resolved_custom.max_tokens, 256);
+        assert!(resolved_custom.raw_prompt);
+        assert!(resolved_custom.ignore_eos);
     }
 }
