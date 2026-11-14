@@ -30,9 +30,9 @@ const BIN_PATH: &str = env!("CARGO_BIN_EXE_jero-worker");
 /// Helper to create a dummy valid model file
 fn create_dummy_model(name: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(name);
+    let gguf = jero_core::test_helpers::create_synthetic_gguf_v3("synthetic", 32, &[]);
     let mut f = File::create(&path).expect("create dummy model");
-    f.write_all(b"CHALLENGER_EMPIRICAL_TEST_MODEL_V3")
-        .expect("write dummy model");
+    f.write_all(&gguf).expect("write dummy model");
     path
 }
 

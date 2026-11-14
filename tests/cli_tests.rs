@@ -1,5 +1,6 @@
 #![allow(clippy::pedantic, clippy::undocumented_unsafe_blocks)]
 
+use jero_core::test_helpers::create_synthetic_gguf_v3;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -130,7 +131,8 @@ fn test_capability_mismatch_exit_10() {
     let model_path = std::env::temp_dir().join("k3_worker_cap_model.gguf");
     {
         let mut f = File::create(&model_path).unwrap();
-        f.write_all(b"VALID_GGUF_V3_MODEL_HEADER").unwrap();
+        f.write_all(&create_synthetic_gguf_v3("synthetic", 32, &[]))
+            .unwrap();
     }
 
     // 1. Requesting A100 cluster on non-riscv64 host without K3_SIMULATE_A100 -> exit code 10
@@ -194,7 +196,8 @@ fn test_cli_invalid_affinity_out_of_bounds_exit_2() {
     let model_path = std::env::temp_dir().join("k3_worker_aff64_model.gguf");
     {
         let mut f = File::create(&model_path).unwrap();
-        f.write_all(b"VALID_GGUF_HEADER").unwrap();
+        f.write_all(&create_synthetic_gguf_v3("synthetic", 32, &[]))
+            .unwrap();
     }
 
     let output = Command::new(BIN_PATH)
@@ -222,7 +225,8 @@ fn test_signal_termination_sigint_and_sigterm_exit_0() {
     let model_path = std::env::temp_dir().join("k3_worker_sig_test_model.gguf");
     {
         let mut f = File::create(&model_path).unwrap();
-        f.write_all(b"VALID_GGUF_HEADER").unwrap();
+        f.write_all(&create_synthetic_gguf_v3("synthetic", 32, &[]))
+            .unwrap();
     }
 
     for &sig in &[libc::SIGINT, libc::SIGTERM] {
@@ -309,7 +313,8 @@ fn test_cli_threads_rejections() {
     let model_path = std::env::temp_dir().join("k3_worker_threads_test_model.gguf");
     {
         let mut f = File::create(&model_path).unwrap();
-        f.write_all(b"VALID_GGUF_HEADER").unwrap();
+        f.write_all(&create_synthetic_gguf_v3("synthetic", 32, &[]))
+            .unwrap();
     }
 
     // --threads 0 -> exit code 2 (InvalidArguments)
@@ -416,7 +421,8 @@ fn test_worker_engine_multi_thread_affinity_and_no_control_encroachment() {
     let model_path = std::env::temp_dir().join("k3_worker_engine_threads_model.gguf");
     {
         let mut f = File::create(&model_path).unwrap();
-        f.write_all(b"VALID_GGUF_HEADER").unwrap();
+        f.write_all(&create_synthetic_gguf_v3("synthetic", 32, &[]))
+            .unwrap();
     }
 
     let config = jero_engine::worker::WorkerConfig {
@@ -452,7 +458,8 @@ fn test_worker_engine_non_contiguous_affinity_multi_thread() {
     let model_path = std::env::temp_dir().join("k3_worker_engine_noncontig_model.gguf");
     {
         let mut f = File::create(&model_path).unwrap();
-        f.write_all(b"VALID_GGUF_HEADER").unwrap();
+        f.write_all(&create_synthetic_gguf_v3("synthetic", 32, &[]))
+            .unwrap();
     }
 
     let config = jero_engine::worker::WorkerConfig {
@@ -488,7 +495,8 @@ fn test_cli_non_contiguous_and_cross_cluster_rejections() {
     let model_path = std::env::temp_dir().join("k3_worker_noncontig_rejections.gguf");
     {
         let mut f = File::create(&model_path).unwrap();
-        f.write_all(b"VALID_GGUF_HEADER").unwrap();
+        f.write_all(&create_synthetic_gguf_v3("synthetic", 32, &[]))
+            .unwrap();
     }
 
     // --affinity 0,2 with --threads 3 -> exit code 10 (exceeds available cores in mask)
@@ -601,7 +609,8 @@ fn test_worker_engine_try_new_fail_closed_validation() {
     let model_path = std::env::temp_dir().join("k3_worker_engine_try_new_model.gguf");
     {
         let mut f = File::create(&model_path).unwrap();
-        f.write_all(b"VALID_GGUF_HEADER").unwrap();
+        f.write_all(&create_synthetic_gguf_v3("synthetic", 32, &[]))
+            .unwrap();
     }
 
     // 1. Encroaching on active control cores 6-7 (0x00C0)

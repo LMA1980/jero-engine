@@ -1,7 +1,7 @@
 //! Differential logit and greedy-token parity exporter (`jero-diag --dump-parity`, ADR-045).
 //!
 //! Executes an isolated forward pass on a real or fixture GGUF checkpoint via [`LockedModelWeights`],
-//! [`GgufTokenizer`], and [`ArchRecipe`], writing a machine-readable [`ParityDumpReport`] JSON file
+//! [`GgufTokenizer`], and [`jero_core::ArchRecipe`], writing a machine-readable [`ParityDumpReport`] JSON file
 //! for differential comparison against `llama.cpp` (`llama-cli`) or git-tracked golden fixtures.
 
 use std::io::Write;

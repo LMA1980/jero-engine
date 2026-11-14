@@ -6,16 +6,19 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 use std::ptr;
 
+use jero_core::ipc::shm::DEFAULT_LIMIT_MEMLOCK_BYTES;
 use jero_core::{
     ArchRecipe, GgufFile, K3Error, ModelMetadata, ModelWeights, TensorDescriptor, TensorView,
 };
 
 use crate::capability::verify_model_capabilities;
-use crate::memory::{MemoryFootprint, MemoryInspector, check_memory_admission_with};
+use crate::memory::{
+    MemoryFootprint, MemoryInspector, SystemMemoryInspector, check_memory_admission_with,
+};
 
 /// Locked in-memory resident model weights backed by a read-only `mmap` mapping
 /// with an active shared file lock (`flock(LOCK_SH)`).
@@ -24,6 +27,7 @@ pub struct LockedModelWeights {
     file: File,
     ptr: *mut u8,
     len: usize,
+    is_locked: bool,
     metadata: ModelMetadata,
     tensor_index: BTreeMap<String, usize>,
 }
@@ -34,65 +38,222 @@ unsafe impl Send for LockedModelWeights {}
 // SAFETY: Concurrent immutable access across threads to read-only mmap memory is safe.
 unsafe impl Sync for LockedModelWeights {}
 
-fn map_and_lock_file(fd: std::os::fd::RawFd, file_len: usize) -> Result<*mut u8, K3Error> {
-    #[cfg(target_os = "linux")]
-    let map_flags = libc::MAP_PRIVATE | libc::MAP_POPULATE;
-    #[cfg(not(target_os = "linux"))]
-    let map_flags = libc::MAP_PRIVATE;
+type OpenedWeights = (
+    LockedModelWeights,
+    Option<Box<dyn ArchRecipe>>,
+    Option<MemoryFootprint>,
+);
 
-    // SAFETY: mmap is called with valid arguments: length > 0, valid fd, PROT_READ, MAP_PRIVATE.
-    let ptr = unsafe { libc::mmap(ptr::null_mut(), file_len, libc::PROT_READ, map_flags, fd, 0) };
+type ParsedWeights = (
+    ModelMetadata,
+    Option<Box<dyn ArchRecipe>>,
+    Option<MemoryFootprint>,
+);
 
-    if ptr == libc::MAP_FAILED {
+#[allow(clippy::too_many_lines)]
+fn open_from_file_inner<I: MemoryInspector>(
+    file: File,
+    label: &str,
+    admission: Option<(Option<usize>, &I)>,
+    allow_unprivileged_mlock_eperm: bool,
+) -> Result<OpenedWeights, K3Error> {
+    let fd = file.as_raw_fd();
+
+    // 1. Acquire shared advisory lock flock(LOCK_SH | LOCK_NB) per ADR-040
+    // SAFETY: flock on a valid open file descriptor with LOCK_SH | LOCK_NB is non-blocking.
+    let flock_res = unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) };
+    if flock_res != 0 {
+        let last_err = std::io::Error::last_os_error();
+        let raw_code = last_err.raw_os_error().unwrap_or(0);
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "unknown".to_owned(),
+            reason: format!(
+                "model file '{label}' is locked exclusively by another process (flock error: {last_err} [errno: {raw_code}])"
+            ),
+        });
+    }
+
+    // 2. Query file length
+    let metadata_fs = file.metadata().map_err(|err| {
+        // SAFETY: Releasing the shared lock acquired above.
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+        K3Error::TensorBoundsError {
+            tensor_name: "header".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: 0,
+            reason: format!("failed to read file metadata: {err}"),
+        }
+    })?;
+
+    let file_len = usize::try_from(metadata_fs.len()).map_err(|_| {
+        // SAFETY: Releasing the shared lock.
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+        K3Error::TensorBoundsError {
+            tensor_name: "header".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "file length exceeds usize capacity".to_owned(),
+        }
+    })?;
+
+    if file_len == 0 {
+        // SAFETY: Releasing the shared lock.
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "header".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: 0,
+            reason: "model file is empty (0 bytes)".to_owned(),
+        });
+    }
+
+    let file_len_u64 = u64::try_from(file_len).unwrap_or(u64::MAX);
+    if file_len_u64 > DEFAULT_LIMIT_MEMLOCK_BYTES {
+        // SAFETY: Releasing the shared lock before returning LimitMEMLOCK refusal.
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
         return Err(K3Error::InsufficientLockableMemory {
-            required_bytes: u64::try_from(file_len).unwrap_or(u64::MAX),
-            weight_bytes: u64::try_from(file_len).unwrap_or(u64::MAX),
+            required_bytes: file_len_u64,
+            weight_bytes: file_len_u64,
+            kv_bytes: 0,
+            available_bytes: DEFAULT_LIMIT_MEMLOCK_BYTES,
+            rlimit_memlock_bytes: DEFAULT_LIMIT_MEMLOCK_BYTES,
+        });
+    }
+
+    // 3. Map read-only without mlock first so pre-flight checks fail before locking RAM
+    // SAFETY: mmap is called with valid length > 0, valid fd, PROT_READ, MAP_PRIVATE.
+    let raw_void_ptr = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            file_len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            fd,
+            0,
+        )
+    };
+    if raw_void_ptr == libc::MAP_FAILED {
+        // SAFETY: Releasing flock upon mapping failure.
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+        return Err(K3Error::InsufficientLockableMemory {
+            required_bytes: file_len_u64,
+            weight_bytes: file_len_u64,
             kv_bytes: 0,
             available_bytes: 0,
             rlimit_memlock_bytes: 0,
         });
     }
+    let raw_ptr = raw_void_ptr.cast::<u8>();
 
-    // 4. Best-effort huge page hint (ADR-037)
-    // SAFETY: madvise is called on valid mapped range [ptr .. ptr + file_len].
+    // 4. Parse GGUF v3 header & verify capabilities and memory admission before mlock
+    // SAFETY: raw_ptr is valid for reads up to file_len.
+    let slice = unsafe { std::slice::from_raw_parts(raw_ptr, file_len) };
+    let parsed = (|| -> Result<ParsedWeights, K3Error> {
+        let gguf = GgufFile::parse(slice)?;
+        if let Some((opt_n_ctx, inspector)) = admission {
+            let recipe = verify_model_capabilities(&gguf)?;
+            let effective_n_ctx = if let Some(n) = opt_n_ctx {
+                n
+            } else {
+                let meta_ctx = gguf.metadata().context_length();
+                if meta_ctx > 0 { meta_ctx.min(64) } else { 64 }
+            };
+            let footprint =
+                check_memory_admission_with(gguf.metadata(), effective_n_ctx, inspector)?;
+            Ok((gguf.metadata().clone(), Some(recipe), Some(footprint)))
+        } else {
+            Ok((gguf.metadata().clone(), None, None))
+        }
+    })();
+
+    let (metadata, recipe_opt, footprint_opt) = match parsed {
+        Ok(res) => res,
+        Err(err) => {
+            // SAFETY: Unmapping and releasing flock on pre-flight rejection before any mlock.
+            unsafe {
+                libc::munmap(raw_void_ptr, file_len);
+                libc::flock(fd, libc::LOCK_UN);
+            }
+            return Err(err);
+        }
+    };
+
+    // 5. Best-effort huge page hint and mlock() (ADR-037)
+    // SAFETY: raw_void_ptr is a valid mapped memory region of length file_len.
     #[cfg(all(target_os = "linux", not(miri)))]
     unsafe {
-        libc::madvise(ptr, file_len, libc::MADV_HUGEPAGE);
+        libc::madvise(raw_void_ptr, file_len, libc::MADV_HUGEPAGE);
     }
-
-    // 5. Mandatory mlock() (ADR-037)
-    // SAFETY: mlock is called on valid mapped memory [ptr .. ptr + file_len].
+    // SAFETY: mlock is called on the valid mapped range [raw_void_ptr .. raw_void_ptr + file_len].
     #[cfg(not(miri))]
-    let mlock_res = unsafe { libc::mlock(ptr, file_len) };
+    let mlock_res = unsafe { libc::mlock(raw_void_ptr, file_len) };
     #[cfg(miri)]
     let mlock_res = 0;
-    if mlock_res != 0 {
-        // SAFETY: Unmapping memory upon mlock failure.
-        unsafe {
-            libc::munmap(ptr, file_len);
+
+    let is_locked = if mlock_res == 0 {
+        true
+    } else {
+        let last_err = std::io::Error::last_os_error();
+        if allow_unprivileged_mlock_eperm && last_err.raw_os_error() == Some(libc::EPERM) {
+            false
+        } else {
+            let (avail, rlim) = admission.map_or((0, 0), |(_, insp)| {
+                (
+                    insp.available_memory_bytes().unwrap_or(0),
+                    insp.rlimit_memlock_bytes().unwrap_or(0),
+                )
+            });
+            // SAFETY: Unmapping and releasing flock on mlock failure.
+            unsafe {
+                libc::munmap(raw_void_ptr, file_len);
+                libc::flock(fd, libc::LOCK_UN);
+            }
+            return Err(K3Error::InsufficientLockableMemory {
+                required_bytes: footprint_opt
+                    .as_ref()
+                    .map_or(file_len_u64, |fp| fp.total_required_bytes),
+                weight_bytes: footprint_opt
+                    .as_ref()
+                    .map_or(file_len_u64, |fp| fp.weight_bytes),
+                kv_bytes: footprint_opt.as_ref().map_or(0, |fp| fp.kv_bytes),
+                available_bytes: avail,
+                rlimit_memlock_bytes: rlim,
+            });
         }
-        return Err(K3Error::InsufficientLockableMemory {
-            required_bytes: u64::try_from(file_len).unwrap_or(u64::MAX),
-            weight_bytes: u64::try_from(file_len).unwrap_or(u64::MAX),
-            kv_bytes: 0,
-            available_bytes: 0,
-            rlimit_memlock_bytes: 0,
-        });
+    };
+
+    let mut tensor_index = BTreeMap::new();
+    for (i, desc) in metadata.tensors().iter().enumerate() {
+        tensor_index.insert(desc.name().to_owned(), i);
     }
 
-    Ok(ptr.cast::<u8>())
+    Ok((
+        LockedModelWeights {
+            file,
+            ptr: raw_ptr,
+            len: file_len,
+            is_locked,
+            metadata,
+            tensor_index,
+        },
+        recipe_opt,
+        footprint_opt,
+    ))
 }
 
 impl LockedModelWeights {
     /// Opens the GGUF model file at `path`, acquires an advisory shared lock (`LOCK_SH`),
-    /// maps the file read-only with `MAP_POPULATE`, applies huge page hints, and locks
+    /// maps the file read-only, parses GGUF v3 metadata/tensor descriptors, and locks
     /// pages into physical memory via `mlock` (ADR-037, ADR-040).
     ///
     /// # Errors
     ///
     /// - Returns [`K3Error::CapabilityMismatch`] if the file cannot be opened or if another process
     ///   holds an exclusive lock (`LOCK_EX`).
-    /// - Returns [`K3Error::InsufficientLockableMemory`] if `mlock` fails due to memory limits.
+    /// - Returns [`K3Error::InsufficientLockableMemory`] if `mlock` fails or size exceeds `DEFAULT_LIMIT_MEMLOCK_BYTES`.
     /// - Returns [`K3Error::TensorBoundsError`] if GGUF v3 parsing fails or the file is truncated.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, K3Error> {
         let path_ref = path.as_ref();
@@ -100,101 +261,29 @@ impl LockedModelWeights {
             architecture: "unknown".to_owned(),
             reason: format!("failed to open model file '{}': {err}", path_ref.display()),
         })?;
+        let label = path_ref.display().to_string();
+        let (weights, _, _) =
+            open_from_file_inner::<SystemMemoryInspector>(file, &label, None, false)?;
+        Ok(weights)
+    }
 
-        let fd = file.as_raw_fd();
+    /// Wraps an already-opened [`File`] (e.g., from `memfd_create` / `SCM_RIGHTS`), acquires `LOCK_SH`,
+    /// maps read-only, parses GGUF v3 metadata/tensor bounds, and locks pages via `mlock`.
+    ///
+    /// # Errors
+    /// Same as [`Self::open`].
+    pub fn from_file(file: File) -> Result<Self, K3Error> {
+        let (weights, _, _) =
+            open_from_file_inner::<SystemMemoryInspector>(file, "<fd>", None, false)?;
+        Ok(weights)
+    }
 
-        // 1. Acquire shared advisory lock flock(LOCK_SH | LOCK_NB) per ADR-040
-        // SAFETY: flock on a valid open file descriptor with LOCK_SH | LOCK_NB is non-blocking.
-        let flock_res = unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) };
-        if flock_res != 0 {
-            let last_err = std::io::Error::last_os_error();
-            let raw_code = last_err.raw_os_error().unwrap_or(0);
-            return Err(K3Error::CapabilityMismatch {
-                architecture: "unknown".to_owned(),
-                reason: format!(
-                    "model file '{}' is locked exclusively by another process (flock error: {last_err} [errno: {raw_code}])",
-                    path_ref.display()
-                ),
-            });
-        }
-
-        // 2. Query file length
-        let metadata_fs = file.metadata().map_err(|err| {
-            // SAFETY: Releasing the shared lock acquired above.
-            unsafe { libc::flock(fd, libc::LOCK_UN) };
-            K3Error::TensorBoundsError {
-                tensor_name: "header".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: 0,
-                reason: format!("failed to read file metadata: {err}"),
-            }
-        })?;
-
-        let file_len = usize::try_from(metadata_fs.len()).map_err(|_| {
-            // SAFETY: Releasing the shared lock.
-            unsafe { libc::flock(fd, libc::LOCK_UN) };
-            K3Error::TensorBoundsError {
-                tensor_name: "header".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: usize::MAX,
-                reason: "file length exceeds usize capacity".to_owned(),
-            }
-        })?;
-
-        if file_len == 0 {
-            // SAFETY: Releasing the shared lock.
-            unsafe { libc::flock(fd, libc::LOCK_UN) };
-            return Err(K3Error::TensorBoundsError {
-                tensor_name: "header".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: 0,
-                reason: "model file is empty (0 bytes)".to_owned(),
-            });
-        }
-
-        let raw_ptr = match map_and_lock_file(fd, file_len) {
-            Ok(p) => p,
-            Err(err) => {
-                // SAFETY: Releasing flock upon mapping failure.
-                unsafe { libc::flock(fd, libc::LOCK_UN) };
-                return Err(err);
-            }
-        };
-
-        // 6. Parse GGUF v3 from mapped buffer
-        // SAFETY: ptr is valid for reads up to file_len for the lifetime of this struct.
-        let slice = unsafe { std::slice::from_raw_parts(raw_ptr, file_len) };
-        let gguf = match GgufFile::parse(slice) {
-            Ok(parsed) => parsed,
-            Err(err) => {
-                // Clean up mlock, mmap, and flock on parse error
-                // SAFETY: Cleaning up locked memory and lock on parse error.
-                unsafe {
-                    #[cfg(not(miri))]
-                    libc::munlock(raw_ptr.cast(), file_len);
-                    libc::munmap(raw_ptr.cast(), file_len);
-                    libc::flock(fd, libc::LOCK_UN);
-                }
-                return Err(err);
-            }
-        };
-
-        let metadata = gguf.metadata().clone();
-        let mut tensor_index = BTreeMap::new();
-        for (i, desc) in metadata.tensors().iter().enumerate() {
-            tensor_index.insert(desc.name().to_owned(), i);
-        }
-
-        Ok(Self {
-            file,
-            ptr: raw_ptr,
-            len: file_len,
-            metadata,
-            tensor_index,
-        })
+    /// Wraps an [`OwnedFd`] (such as an `SCM_RIGHTS` or `memfd_create` descriptor) via [`Self::from_file`].
+    ///
+    /// # Errors
+    /// Same as [`Self::open`].
+    pub fn from_fd(fd: OwnedFd) -> Result<Self, K3Error> {
+        Self::from_file(File::from(fd))
     }
 
     /// Opens the GGUF model file at `path`, acquires `flock(LOCK_SH | LOCK_NB)`, parses the
@@ -209,7 +298,6 @@ impl LockedModelWeights {
     /// - Returns [`K3Error::InsufficientLockableMemory`] if pre-flight RAM admission or `mlock` fails.
     /// - Returns [`K3Error::ContextLengthExceeded`] if `n_ctx` exceeds the model's context window.
     /// - Returns [`K3Error::TensorBoundsError`] if the GGUF v3 binary header or tensor bounds are invalid.
-    #[allow(clippy::too_many_lines)]
     pub fn open_with_admission<P: AsRef<Path>, I: MemoryInspector>(
         path: P,
         n_ctx: usize,
@@ -220,152 +308,79 @@ impl LockedModelWeights {
             architecture: "unknown".to_owned(),
             reason: format!("failed to open model file '{}': {err}", path_ref.display()),
         })?;
+        let label = path_ref.display().to_string();
+        Self::from_file_with_admission_labeled(file, &label, Some(n_ctx), inspector, false)
+    }
 
-        let fd = file.as_raw_fd();
+    /// Wraps an already-opened [`File`] with full GGUF capability verification and bounded memory
+    /// admission against `inspector`. When `n_ctx` is `None`, uses `min(metadata.context_length(), 64)`.
+    ///
+    /// # Errors
+    /// Same as [`Self::open_with_admission`].
+    pub fn from_file_with_admission<I: MemoryInspector>(
+        file: File,
+        n_ctx: Option<usize>,
+        inspector: &I,
+        allow_unprivileged_mlock_eperm: bool,
+    ) -> Result<(Self, Box<dyn ArchRecipe>, MemoryFootprint), K3Error> {
+        Self::from_file_with_admission_labeled(
+            file,
+            "<fd>",
+            n_ctx,
+            inspector,
+            allow_unprivileged_mlock_eperm,
+        )
+    }
 
-        // 1. Acquire shared advisory lock flock(LOCK_SH | LOCK_NB) per ADR-040
-        // SAFETY: flock on a valid open file descriptor with LOCK_SH | LOCK_NB is non-blocking.
-        let flock_res = unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) };
-        if flock_res != 0 {
-            let last_err = std::io::Error::last_os_error();
-            let raw_code = last_err.raw_os_error().unwrap_or(0);
-            return Err(K3Error::CapabilityMismatch {
-                architecture: "unknown".to_owned(),
-                reason: format!(
-                    "model file '{}' is locked exclusively by another process (flock error: {last_err} [errno: {raw_code}])",
-                    path_ref.display()
-                ),
-            });
-        }
+    /// Wraps an [`OwnedFd`] (`SCM_RIGHTS` / `memfd_create`) with full GGUF capability verification
+    /// and memory admission against `inspector`.
+    ///
+    /// # Errors
+    /// Same as [`Self::open_with_admission`].
+    pub fn from_fd_with_admission<I: MemoryInspector>(
+        fd: OwnedFd,
+        n_ctx: Option<usize>,
+        inspector: &I,
+        allow_unprivileged_mlock_eperm: bool,
+    ) -> Result<(Self, Box<dyn ArchRecipe>, MemoryFootprint), K3Error> {
+        Self::from_file_with_admission(
+            File::from(fd),
+            n_ctx,
+            inspector,
+            allow_unprivileged_mlock_eperm,
+        )
+    }
 
-        let metadata_fs = file.metadata().map_err(|err| {
-            // SAFETY: Releasing the shared lock acquired above.
-            unsafe { libc::flock(fd, libc::LOCK_UN) };
-            K3Error::TensorBoundsError {
-                tensor_name: "header".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: 0,
-                reason: format!("failed to read file metadata: {err}"),
-            }
+    /// Labeled internal constructor shared by path-based and FD-based admission paths.
+    #[doc(hidden)]
+    pub fn from_file_with_admission_labeled<I: MemoryInspector>(
+        file: File,
+        label: &str,
+        n_ctx: Option<usize>,
+        inspector: &I,
+        allow_unprivileged_mlock_eperm: bool,
+    ) -> Result<(Self, Box<dyn ArchRecipe>, MemoryFootprint), K3Error> {
+        let (weights, recipe_opt, footprint_opt) = open_from_file_inner(
+            file,
+            label,
+            Some((n_ctx, inspector)),
+            allow_unprivileged_mlock_eperm,
+        )?;
+        let recipe = recipe_opt.ok_or_else(|| K3Error::CapabilityMismatch {
+            architecture: weights.metadata.architecture().to_owned(),
+            reason: "internal admission error: missing ArchRecipe".to_owned(),
         })?;
-
-        let file_len = usize::try_from(metadata_fs.len()).map_err(|_| {
-            // SAFETY: Releasing the shared lock.
-            unsafe { libc::flock(fd, libc::LOCK_UN) };
-            K3Error::TensorBoundsError {
-                tensor_name: "header".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: usize::MAX,
-                reason: "file length exceeds usize capacity".to_owned(),
-            }
+        let footprint = footprint_opt.ok_or_else(|| K3Error::CapabilityMismatch {
+            architecture: weights.metadata.architecture().to_owned(),
+            reason: "internal admission error: missing MemoryFootprint".to_owned(),
         })?;
+        Ok((weights, recipe, footprint))
+    }
 
-        if file_len == 0 {
-            // SAFETY: Releasing the shared lock.
-            unsafe { libc::flock(fd, libc::LOCK_UN) };
-            return Err(K3Error::TensorBoundsError {
-                tensor_name: "header".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: 0,
-                reason: "model file is empty (0 bytes)".to_owned(),
-            });
-        }
-
-        // 2. Map read-only without mlock first to inspect GGUF metadata and run admission checks
-        // SAFETY: mmap is called with valid length > 0, valid fd, PROT_READ, MAP_PRIVATE.
-        let raw_void_ptr = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                file_len,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE,
-                fd,
-                0,
-            )
-        };
-        if raw_void_ptr == libc::MAP_FAILED {
-            // SAFETY: Releasing flock on mmap failure.
-            unsafe { libc::flock(fd, libc::LOCK_UN) };
-            return Err(K3Error::InsufficientLockableMemory {
-                required_bytes: u64::try_from(file_len).unwrap_or(u64::MAX),
-                weight_bytes: u64::try_from(file_len).unwrap_or(u64::MAX),
-                kv_bytes: 0,
-                available_bytes: 0,
-                rlimit_memlock_bytes: 0,
-            });
-        }
-        let raw_ptr = raw_void_ptr.cast::<u8>();
-
-        // 3. Parse GGUF v3 header & verify capabilities and memory admission before mlock
-        // SAFETY: raw_ptr is valid for reads up to file_len.
-        let slice = unsafe { std::slice::from_raw_parts(raw_ptr, file_len) };
-        let preflight =
-            (|| -> Result<(ModelMetadata, Box<dyn ArchRecipe>, MemoryFootprint), K3Error> {
-                let gguf = GgufFile::parse(slice)?;
-                let recipe = verify_model_capabilities(&gguf)?;
-                let footprint = check_memory_admission_with(gguf.metadata(), n_ctx, inspector)?;
-                Ok((gguf.metadata().clone(), recipe, footprint))
-            })();
-
-        let (metadata, recipe, footprint) = match preflight {
-            Ok(res) => res,
-            Err(err) => {
-                // SAFETY: Unmapping and releasing flock on pre-flight rejection before any mlock.
-                unsafe {
-                    libc::munmap(raw_void_ptr, file_len);
-                    libc::flock(fd, libc::LOCK_UN);
-                }
-                return Err(err);
-            }
-        };
-
-        // 4. Best-effort huge page hint and mandatory mlock() (ADR-037)
-        // SAFETY: raw_void_ptr is a valid mapped memory region of length file_len.
-        #[cfg(all(target_os = "linux", not(miri)))]
-        unsafe {
-            libc::madvise(raw_void_ptr, file_len, libc::MADV_HUGEPAGE);
-        }
-        // SAFETY: mlock is called on the valid mapped range [raw_void_ptr .. raw_void_ptr + file_len].
-        #[cfg(not(miri))]
-        let mlock_res = unsafe { libc::mlock(raw_void_ptr, file_len) };
-        #[cfg(miri)]
-        let mlock_res = 0;
-        if mlock_res != 0 {
-            let avail = inspector.available_memory_bytes().unwrap_or(0);
-            let rlim = inspector.rlimit_memlock_bytes().unwrap_or(0);
-            // SAFETY: Unmapping and releasing flock on mlock failure.
-            unsafe {
-                libc::munmap(raw_void_ptr, file_len);
-                libc::flock(fd, libc::LOCK_UN);
-            }
-            return Err(K3Error::InsufficientLockableMemory {
-                required_bytes: footprint.total_required_bytes,
-                weight_bytes: footprint.weight_bytes,
-                kv_bytes: footprint.kv_bytes,
-                available_bytes: avail,
-                rlimit_memlock_bytes: rlim,
-            });
-        }
-
-        let mut tensor_index = BTreeMap::new();
-        for (i, desc) in metadata.tensors().iter().enumerate() {
-            tensor_index.insert(desc.name().to_owned(), i);
-        }
-
-        Ok((
-            Self {
-                file,
-                ptr: raw_ptr,
-                len: file_len,
-                metadata,
-                tensor_index,
-            },
-            recipe,
-            footprint,
-        ))
+    /// Returns `true` if pages are locked into physical RAM via `mlock`.
+    #[must_use]
+    pub const fn is_locked(&self) -> bool {
+        self.is_locked
     }
 
     /// Returns the parsed [`ModelMetadata`] for the locked model.
@@ -455,11 +470,13 @@ impl Drop for LockedModelWeights {
         let ptr = self.ptr.cast::<libc::c_void>();
         let len = self.len;
 
-        // SAFETY: self.ptr and self.len were mapped by mmap and locked with mlock.
-        // We munlock, munmap, and release the flock advisory lock.
+        // SAFETY: self.ptr and self.len were mapped by mmap and conditionally locked with mlock.
+        // We munlock (when locked), munmap, and release the flock advisory lock.
         unsafe {
             #[cfg(not(miri))]
-            libc::munlock(ptr, len);
+            if self.is_locked {
+                libc::munlock(ptr, len);
+            }
             libc::munmap(ptr, len);
             libc::flock(fd, libc::LOCK_UN);
         }

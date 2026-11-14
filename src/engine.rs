@@ -194,6 +194,186 @@ impl SinglePromptEngine {
         self.active_cycle.load(Ordering::SeqCst)
     }
 
+    /// Resolves the effective cluster phase scheduling policy for a forward step.
+    fn resolve_effective_policy(
+        &self,
+        recipe: &dyn ArchRecipe,
+        prompt_len: usize,
+        worker_pool: Option<&WorkerPool>,
+    ) -> ClusterPhasePolicy {
+        match self.phase_policy {
+            ClusterPhasePolicy::Auto => worker_pool
+                .and_then(WorkerPool::phase_policy)
+                .unwrap_or_else(|| {
+                    let online_mask =
+                        worker_pool.map_or(X100_CLUSTER_MASK, |p| p.affinity().effective_mask);
+                    select_phase_policy_for_arch(recipe.architecture_id(), prompt_len, online_mask)
+                }),
+            explicit => explicit,
+        }
+    }
+
+    /// Executes a single phase-scheduled closure on `worker_pool` when present, or inline.
+    fn run_step_on_pool<F>(
+        worker_pool: Option<&WorkerPool>,
+        phase: EnginePhase,
+        effective_policy: ClusterPhasePolicy,
+        op: F,
+    ) -> Result<(), K3Error>
+    where
+        F: FnOnce() -> Result<(), K3Error> + Send,
+    {
+        if let Some(pool) = worker_pool {
+            pool.install_for_phase(phase, effective_policy, op)
+        } else {
+            op()
+        }
+    }
+
+    /// Executes a single prompt prefill (or chunked prefill) step against `recipe`, `weights`,
+    /// `kv_arena`, and optional `worker_pool`, returning `(logits, greedy_next_token, end_position)`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::CapabilityMismatch`] if another cycle is active or inputs/vocab are empty,
+    /// [`K3Error::ContextLengthExceeded`] if `start_position + prompt_tokens.len() > kv_arena.n_ctx()`,
+    /// or any underlying tensor/weight error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_step_with_pool(
+        &mut self,
+        recipe: &dyn ArchRecipe,
+        weights: &dyn ModelWeights,
+        kv_arena: &mut SingleSlotKvArena,
+        worker_pool: Option<&WorkerPool>,
+        prompt_tokens: &[u32],
+        start_position: usize,
+        vocab_size: usize,
+    ) -> Result<(Vec<f32>, u32, usize), K3Error> {
+        let _guard = CycleGuard::acquire(&self.active_cycle, recipe.architecture_id())?;
+
+        if prompt_tokens.is_empty() {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: recipe.architecture_id().to_owned(),
+                reason: "prompt token sequence cannot be empty".to_owned(),
+            });
+        }
+        if vocab_size == 0 {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: recipe.architecture_id().to_owned(),
+                reason: "vocabulary size must be greater than zero".to_owned(),
+            });
+        }
+
+        let n_ctx = kv_arena.n_ctx();
+        let logits_len = infer_logits_buffer_len(weights, vocab_size);
+        let mut logits = vec![0.0_f32; logits_len];
+        let mut ctx = ExecutionContext::new_prefill_chunk(
+            prompt_tokens,
+            n_ctx,
+            start_position,
+            true,
+            &mut logits,
+            kv_arena.as_mut_slice(),
+        )?;
+
+        let effective_policy =
+            self.resolve_effective_policy(recipe, prompt_tokens.len(), worker_pool);
+        if let Some(pool) = worker_pool {
+            pool.reset_barrier_wait();
+        }
+
+        self.phase = EnginePhase::Prefill;
+        let requires_kv = recipe.requires_kv_cache();
+        Self::run_step_on_pool(worker_pool, EnginePhase::Prefill, effective_policy, || {
+            if requires_kv {
+                recipe.prefill_step(&mut ctx, weights)
+            } else {
+                recipe.forward_classify(&mut ctx, weights)
+            }
+        })?;
+
+        let end_pos = ctx.position();
+        let sample_len = vocab_size.min(ctx.logits().len());
+        let next_token = sample_greedy_argmax(&ctx.logits()[..sample_len]).ok_or_else(|| {
+            K3Error::CapabilityMismatch {
+                architecture: recipe.architecture_id().to_owned(),
+                reason: "empty logits buffer after prefill step".to_owned(),
+            }
+        })?;
+        let out_logits = ctx.logits()[..sample_len].to_vec();
+        self.phase = EnginePhase::Completed;
+        Ok((out_logits, next_token, end_pos))
+    }
+
+    /// Executes a single-token autoregressive decode step at `position` against `recipe`,
+    /// `weights`, `kv_arena`, and optional `worker_pool`, returning `(logits, greedy_next_token, end_position)`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::CapabilityMismatch`] if another cycle is active, the recipe does not
+    /// maintain a KV cache, or `vocab_size == 0`; returns [`K3Error::ContextLengthExceeded`] if
+    /// `position + 1 > kv_arena.n_ctx()`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_step_with_pool(
+        &mut self,
+        recipe: &dyn ArchRecipe,
+        weights: &dyn ModelWeights,
+        kv_arena: &mut SingleSlotKvArena,
+        worker_pool: Option<&WorkerPool>,
+        token_id: u32,
+        position: usize,
+        vocab_size: usize,
+    ) -> Result<(Vec<f32>, u32, usize), K3Error> {
+        let _guard = CycleGuard::acquire(&self.active_cycle, recipe.architecture_id())?;
+
+        if vocab_size == 0 {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: recipe.architecture_id().to_owned(),
+                reason: "vocabulary size must be greater than zero".to_owned(),
+            });
+        }
+        if !recipe.requires_kv_cache() {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: recipe.architecture_id().to_owned(),
+                reason: "autoregressive decode_step requires a KV cache architecture".to_owned(),
+            });
+        }
+
+        let n_ctx = kv_arena.n_ctx();
+        let logits_len = infer_logits_buffer_len(weights, vocab_size);
+        let mut logits = vec![0.0_f32; logits_len];
+        let tok_slice = [token_id];
+        let mut ctx = ExecutionContext::new_prefill_chunk(
+            &tok_slice,
+            n_ctx,
+            position,
+            true,
+            &mut logits,
+            kv_arena.as_mut_slice(),
+        )?;
+        ctx.prepare_decode(token_id)?;
+
+        let effective_policy = self.resolve_effective_policy(recipe, 1, worker_pool);
+        if let Some(pool) = worker_pool {
+            pool.reset_barrier_wait();
+        }
+
+        self.phase = EnginePhase::Decode;
+        Self::run_step_on_pool(worker_pool, EnginePhase::Decode, effective_policy, || {
+            recipe.decode_step(&mut ctx, weights)
+        })?;
+
+        let end_pos = ctx.position();
+        let sample_len = vocab_size.min(ctx.logits().len());
+        let next_token = sample_greedy_argmax(&ctx.logits()[..sample_len]).ok_or_else(|| {
+            K3Error::CapabilityMismatch {
+                architecture: recipe.architecture_id().to_owned(),
+                reason: "empty logits buffer after decode step".to_owned(),
+            }
+        })?;
+        let out_logits = ctx.logits()[..sample_len].to_vec();
+        self.phase = EnginePhase::Completed;
+        Ok((out_logits, next_token, end_pos))
+    }
+
     /// Executes an isolated single-prompt forward pass (prefill + autoregressive decode)
     /// without a multi-thread worker pool (single-thread baseline).
     ///
@@ -277,20 +457,8 @@ impl SinglePromptEngine {
         let mut ctx =
             ExecutionContext::new(prompt_tokens, n_ctx, &mut logits, kv_arena.as_mut_slice())?;
 
-        let effective_policy = match self.phase_policy {
-            ClusterPhasePolicy::Auto => worker_pool
-                .and_then(WorkerPool::phase_policy)
-                .unwrap_or_else(|| {
-                    let online_mask =
-                        worker_pool.map_or(X100_CLUSTER_MASK, |p| p.affinity().effective_mask);
-                    select_phase_policy_for_arch(
-                        recipe.architecture_id(),
-                        prompt_tokens.len(),
-                        online_mask,
-                    )
-                }),
-            explicit => explicit,
-        };
+        let effective_policy =
+            self.resolve_effective_policy(recipe, prompt_tokens.len(), worker_pool);
 
         let pass_start = Instant::now();
         if let Some(pool) = worker_pool {
@@ -301,19 +469,13 @@ impl SinglePromptEngine {
         self.phase = EnginePhase::Prefill;
         let prefill_start = Instant::now();
         let requires_kv = recipe.requires_kv_cache();
-        if let Some(pool) = worker_pool {
-            pool.install_for_phase(EnginePhase::Prefill, effective_policy, || {
-                if requires_kv {
-                    recipe.prefill_step(&mut ctx, weights)
-                } else {
-                    recipe.forward_classify(&mut ctx, weights)
-                }
-            })?;
-        } else if requires_kv {
-            recipe.prefill_step(&mut ctx, weights)?;
-        } else {
-            recipe.forward_classify(&mut ctx, weights)?;
-        }
+        Self::run_step_on_pool(worker_pool, EnginePhase::Prefill, effective_policy, || {
+            if requires_kv {
+                recipe.prefill_step(&mut ctx, weights)
+            } else {
+                recipe.forward_classify(&mut ctx, weights)
+            }
+        })?;
 
         let mut generated_tokens = Vec::with_capacity(max_tokens);
         if max_tokens == 0 {
@@ -378,13 +540,9 @@ impl SinglePromptEngine {
 
         while generated_tokens.len() < max_tokens && ctx.position() < n_ctx {
             ctx.prepare_decode(current_token)?;
-            if let Some(pool) = worker_pool {
-                pool.install_for_phase(EnginePhase::Decode, effective_policy, || {
-                    recipe.decode_step(&mut ctx, weights)
-                })?;
-            } else {
-                recipe.decode_step(&mut ctx, weights)?;
-            }
+            Self::run_step_on_pool(worker_pool, EnginePhase::Decode, effective_policy, || {
+                recipe.decode_step(&mut ctx, weights)
+            })?;
 
             let step_sample_len = vocab_size.min(ctx.logits().len());
             current_token =

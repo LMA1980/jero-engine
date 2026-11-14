@@ -1,38 +1,58 @@
-//! Read-only memory-mapped and locked model weights management for `k3-worker`.
+//! Read-only memory-mapped, GGUF-validated, and `mlock`-backed model weights management
+//! for `k3-worker`.
+//!
+//! Unifies worker weight admission with [`LockedModelWeights`], `CapabilityVerifier`
+//! (`verify_model_capabilities`), bounded `RLIMIT_MEMLOCK` admission checks
+//! (`check_memory_admission_with`), and `ArchRecipe` + `SingleSlotKvArena` instantiation
+//! across both filesystem paths and `SCM_RIGHTS` / `memfd_create` file descriptors.
 
 use std::fs::File;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::OwnedFd;
 use std::path::Path;
-use std::ptr::NonNull;
 
 use jero_core::ipc::shm::DEFAULT_LIMIT_MEMLOCK_BYTES;
+use jero_core::{ArchRecipe, GgufFile, K3Error, ModelMetadata, ModelWeights, TensorView};
+
+use crate::kv::SingleSlotKvArena;
+use crate::memory::{
+    MemoryFootprint, MemoryInspector, SystemMemoryInspector, check_memory_admission_with,
+};
+use crate::weights::LockedModelWeights;
 
 use super::error::WorkerError;
 
-/// Holds a read-only memory-mapped and locked GGUF model file.
+/// Admitted, read-only memory-mapped, and locked GGUF model weights for `k3-worker`.
 #[derive(Debug)]
 pub struct LockedWeights {
-    _file: File,
-    fd: RawFd,
-    ptr: NonNull<u8>,
-    len: usize,
-    is_locked: bool,
+    inner: LockedModelWeights,
+    recipe: Box<dyn ArchRecipe>,
+    footprint: MemoryFootprint,
 }
 
-// SAFETY: Mapped memory is read-only (PROT_READ) and valid for concurrent thread access.
-unsafe impl Send for LockedWeights {}
-// SAFETY: Mapped memory is read-only and immutable across threads.
-unsafe impl Sync for LockedWeights {}
-
 impl LockedWeights {
-    /// Opens the model file, acquires non-blocking shared lock (`LOCK_SH`),
-    /// maps read-only (`MAP_SHARED`), verifies memory limit, and locks pages in RAM.
+    /// Opens a GGUF model file at `path`, acquires `flock(LOCK_SH | LOCK_NB)`,
+    /// validates GGUF headers/tensors and `CapabilityVerifier`, checks bounded memory
+    /// admission, and locks pages in RAM via `mlock`.
     ///
     /// # Errors
-    /// Returns [`WorkerError::ResourceExhausted`] if file does not exist or has 0 bytes.
-    /// Returns [`WorkerError::CapabilityMismatch`] if another process holds an exclusive lock.
-    /// Returns [`WorkerError::InsufficientLockableMemory`] if file exceeds 28 GiB ceiling or `mlock` fails.
+    /// - Returns [`WorkerError::ResourceExhausted`] (exit 12) if file does not exist or has 0 bytes.
+    /// - Returns [`WorkerError::CapabilityMismatch`] (exit 10) if locked exclusively or unsupported arch/quant.
+    /// - Returns [`WorkerError::InsufficientLockableMemory`] (exit 11) if file exceeds 28 GiB ceiling,
+    ///   admitted footprint exceeds RAM/RLIMIT_MEMLOCK headroom, or `mlock` fails with `ENOMEM`.
+    /// - Returns [`WorkerError::TensorBoundsError`] (exit 14) if GGUF header/tensor descriptors are malformed.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, WorkerError> {
+        Self::open_with_admission(path, None, &SystemMemoryInspector::new())
+    }
+
+    /// Opens a GGUF model file at `path` with explicit context window `n_ctx` and memory `inspector`.
+    ///
+    /// # Errors
+    /// Same as [`Self::open`].
+    pub fn open_with_admission<P: AsRef<Path>, I: MemoryInspector>(
+        path: P,
+        n_ctx: Option<usize>,
+        inspector: &I,
+    ) -> Result<Self, WorkerError> {
         let p = path.as_ref();
         if !p.exists() {
             return Err(WorkerError::ResourceExhausted(format!(
@@ -48,173 +68,206 @@ impl LockedWeights {
             ))
         })?;
 
-        let fd = file.as_raw_fd();
+        Self::from_file_with_label(file, &p.display().to_string(), n_ctx, inspector)
+    }
 
-        // 1. Shared advisory lock: flock(LOCK_SH | LOCK_NB)
-        // SAFETY: flock on valid open file descriptor with non-blocking flag.
-        let flock_res = unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) };
-        if flock_res != 0 {
-            let last_err = std::io::Error::last_os_error();
-            let raw_code = last_err.raw_os_error().unwrap_or(0);
-            return Err(WorkerError::CapabilityMismatch(format!(
-                "model file '{}' is exclusively locked by another process (flock error: {last_err} [errno: {raw_code}])",
-                p.display()
-            )));
-        }
+    /// Admits an `SCM_RIGHTS` / `memfd_create` [`OwnedFd`] through GGUF header/tensor validation,
+    /// `CapabilityVerifier`, bounded memory admission, and `mlock`.
+    ///
+    /// # Errors
+    /// Returns structured admission errors (`CapabilityMismatch`, `InsufficientLockableMemory`,
+    /// `TensorBoundsError`, or `ResourceExhausted`).
+    pub fn from_fd(fd: OwnedFd) -> Result<Self, WorkerError> {
+        Self::from_fd_with_admission(fd, None, &SystemMemoryInspector::new())
+    }
 
-        // 2. Query file size
-        let metadata = match file.metadata() {
-            Ok(m) => m,
-            Err(e) => {
-                // SAFETY: Unlock on failure before returning.
-                unsafe { libc::flock(fd, libc::LOCK_UN) };
-                return Err(WorkerError::ResourceExhausted(format!(
-                    "failed to stat model file: {e}"
-                )));
-            }
-        };
+    /// Admits an `SCM_RIGHTS` / `memfd_create` [`OwnedFd`] using explicit `n_ctx` and `inspector`.
+    ///
+    /// # Errors
+    /// Same as [`Self::from_fd`].
+    pub fn from_fd_with_admission<I: MemoryInspector>(
+        fd: OwnedFd,
+        n_ctx: Option<usize>,
+        inspector: &I,
+    ) -> Result<Self, WorkerError> {
+        Self::from_file_with_label(File::from(fd), "<scm_rights_fd>", n_ctx, inspector)
+    }
+
+    /// Admits an `SCM_RIGHTS` / `memfd_create` [`OwnedFd`] and instantiates the corresponding
+    /// [`SingleSlotKvArena`] sized for `n_ctx` in one unified step.
+    ///
+    /// # Errors
+    /// Same as [`Self::from_fd`] plus [`SingleSlotKvArena`] bounds errors.
+    pub fn from_fd_and_instantiate<I: MemoryInspector>(
+        fd: OwnedFd,
+        n_ctx: usize,
+        inspector: &I,
+    ) -> Result<(Self, SingleSlotKvArena), WorkerError> {
+        let weights = Self::from_fd_with_admission(fd, Some(n_ctx), inspector)?;
+        let kv_arena = weights.instantiate_kv_arena_with(n_ctx, inspector)?;
+        Ok((weights, kv_arena))
+    }
+
+    fn from_file_with_label<I: MemoryInspector>(
+        file: File,
+        label: &str,
+        n_ctx: Option<usize>,
+        inspector: &I,
+    ) -> Result<Self, WorkerError> {
+        let metadata = file.metadata().map_err(|e| {
+            WorkerError::ResourceExhausted(format!(
+                "failed to stat model descriptor '{label}': {e}"
+            ))
+        })?;
 
         let file_len = metadata.len();
         if file_len == 0 {
-            // SAFETY: Unlock on failure.
-            unsafe { libc::flock(fd, libc::LOCK_UN) };
             return Err(WorkerError::ResourceExhausted(format!(
-                "model file '{}' is empty (0 bytes)",
-                p.display()
+                "model file '{label}' is empty (0 bytes)"
             )));
         }
 
-        // 3. Check memory limit against 28 GiB operator bound
         if file_len > DEFAULT_LIMIT_MEMLOCK_BYTES {
-            // SAFETY: Unlock on failure.
-            unsafe { libc::flock(fd, libc::LOCK_UN) };
             return Err(WorkerError::InsufficientLockableMemory(format!(
-                "model weight size ({} bytes) exceeds operator LimitMEMLOCK bound ({} bytes)",
-                file_len, DEFAULT_LIMIT_MEMLOCK_BYTES
+                "model weight size ({file_len} bytes) exceeds operator LimitMEMLOCK bound ({DEFAULT_LIMIT_MEMLOCK_BYTES} bytes)"
             )));
         }
 
-        let len_usize = usize::try_from(file_len).map_err(|_| {
-            // SAFETY: Releasing the shared flock on error.
-            unsafe { libc::flock(fd, libc::LOCK_UN) };
-            WorkerError::ResourceExhausted("file size overflowed usize".to_owned())
-        })?;
-
-        // 4. Memory-map read-only with MAP_SHARED
-        // SAFETY: mmap read-only shared mapping of open file descriptor.
-        let mmap_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len_usize,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-
-        if mmap_ptr == libc::MAP_FAILED {
-            let last_err = std::io::Error::last_os_error();
-            // SAFETY: Releasing the shared flock on mmap error.
-            unsafe { libc::flock(fd, libc::LOCK_UN) };
-            return Err(WorkerError::ResourceExhausted(format!(
-                "mmap failed on model file: {last_err}"
-            )));
-        }
-
-        let ptr = match NonNull::new(mmap_ptr.cast::<u8>()) {
-            Some(p) => p,
-            None => {
-                // SAFETY: Cleaning up mmap and flock on null pointer failure.
-                unsafe {
-                    libc::munmap(mmap_ptr, len_usize);
-                    libc::flock(fd, libc::LOCK_UN);
-                }
-                return Err(WorkerError::Internal(
-                    "mmap returned null pointer".to_owned(),
-                ));
-            }
-        };
-
-        // 5. Optional mlock within RLIMIT_MEMLOCK bounds
-        let mut is_locked = false;
-        // SAFETY: ptr points to len_usize valid mapped bytes.
-        #[cfg(not(miri))]
-        let mlock_res = unsafe { libc::mlock(ptr.as_ptr().cast(), len_usize) };
-        #[cfg(miri)]
-        let mlock_res = 0;
-        if mlock_res == 0 {
-            is_locked = true;
-        } else {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ENOMEM) {
-                // Insufficient memory locking allowance
-                // SAFETY: Unmapping memory and unlocking file descriptor before error return.
-                unsafe {
-                    libc::munmap(ptr.as_ptr().cast(), len_usize);
-                    libc::flock(fd, libc::LOCK_UN);
-                }
-                return Err(WorkerError::InsufficientLockableMemory(format!(
-                    "mlock failed with ENOMEM: {err}"
-                )));
-            }
-            // In unprivileged test / container environments, mlock may fail with EPERM.
-            // Allow execution to proceed if unprivileged rather than crashing.
-        }
+        let (inner, recipe, footprint) = LockedModelWeights::from_file_with_admission_labeled(
+            file, label, n_ctx, inspector, true,
+        )?;
 
         Ok(Self {
-            _file: file,
-            fd,
-            ptr,
-            len: len_usize,
-            is_locked,
+            inner,
+            recipe,
+            footprint,
         })
+    }
+
+    /// Validates memory admission for `n_ctx` against [`SystemMemoryInspector`] and instantiates
+    /// a [`SingleSlotKvArena`] matching this model's GGUF metadata.
+    ///
+    /// # Errors
+    /// Returns [`WorkerError::InsufficientLockableMemory`], [`WorkerError::TensorBoundsError`], or
+    /// [`WorkerError::CapabilityMismatch`] if `n_ctx` or KV footprint fails admission.
+    pub fn instantiate_kv_arena(&self, n_ctx: usize) -> Result<SingleSlotKvArena, WorkerError> {
+        self.instantiate_kv_arena_with(n_ctx, &SystemMemoryInspector::new())
+    }
+
+    /// Validates memory admission for `n_ctx` against `inspector` and instantiates
+    /// a [`SingleSlotKvArena`] matching this model's GGUF metadata.
+    ///
+    /// # Errors
+    /// Same as [`Self::instantiate_kv_arena`].
+    pub fn instantiate_kv_arena_with<I: MemoryInspector>(
+        &self,
+        n_ctx: usize,
+        inspector: &I,
+    ) -> Result<SingleSlotKvArena, WorkerError> {
+        let _ = check_memory_admission_with(self.inner.metadata(), n_ctx, inspector)?;
+        let gguf = GgufFile::parse(self.as_slice())?;
+        Ok(SingleSlotKvArena::from_gguf(&gguf, n_ctx)?)
     }
 
     /// Returns mapped length of model weights in bytes.
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.len
+        self.inner.len()
     }
 
     /// Returns `true` if weights file length is 0.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.len == 0
+        self.inner.is_empty()
     }
 
     /// Returns `true` if physical pages are locked in RAM via `mlock`.
     #[must_use]
     pub const fn is_locked(&self) -> bool {
-        self.is_locked
+        self.inner.is_locked()
     }
 
     /// Returns byte slice view of mapped weights.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: self.ptr is valid for reads up to self.len while self is live.
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        self.inner.as_bytes()
+    }
+
+    /// Returns the underlying [`LockedModelWeights`].
+    #[must_use]
+    pub const fn inner(&self) -> &LockedModelWeights {
+        &self.inner
+    }
+
+    /// Returns parsed GGUF [`ModelMetadata`].
+    #[must_use]
+    pub const fn metadata(&self) -> &ModelMetadata {
+        self.inner.metadata()
+    }
+
+    /// Returns the hydrated [`ArchRecipe`] admitted for this model.
+    #[must_use]
+    pub fn recipe(&self) -> &dyn ArchRecipe {
+        &*self.recipe
+    }
+
+    /// Returns the admitted [`MemoryFootprint`] computed at load time.
+    #[must_use]
+    pub const fn footprint(&self) -> &MemoryFootprint {
+        &self.footprint
     }
 }
 
-impl Drop for LockedWeights {
-    fn drop(&mut self) {
-        // SAFETY: Clean teardown of mlock, mmap, and flock on valid pointers and fd.
-        unsafe {
-            #[cfg(not(miri))]
-            if self.is_locked {
-                libc::munlock(self.ptr.as_ptr().cast(), self.len);
-            }
-            libc::munmap(self.ptr.as_ptr().cast(), self.len);
-            libc::flock(self.fd, libc::LOCK_UN);
-        }
+impl ModelWeights for LockedWeights {
+    fn tensor(&self, name: &str) -> Result<TensorView<'_>, K3Error> {
+        self.inner.tensor(name)
+    }
+
+    fn tensor_count(&self) -> usize {
+        self.inner.tensor_count()
+    }
+
+    fn total_weight_bytes(&self) -> usize {
+        self.inner.total_weight_bytes()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::MockMemoryInspector;
+    use jero_core::ipc::protocol::StatusCode;
+    use jero_core::test_helpers::create_synthetic_gguf_v3;
     use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    fn create_anonymous_fd_with_bytes(name: &str, bytes: &[u8]) -> OwnedFd {
+        #[cfg(target_os = "linux")]
+        {
+            let cname = std::ffi::CString::new(name).expect("valid CString");
+            // SAFETY: memfd_create allocates an in-memory anonymous file descriptor with MFD_CLOEXEC.
+            let raw_fd = unsafe { libc::syscall(libc::SYS_memfd_create, cname.as_ptr(), 1) as i32 };
+            if raw_fd >= 0 {
+                // SAFETY: raw_fd is newly returned by memfd_create.
+                let mut file = unsafe { <File as std::os::fd::FromRawFd>::from_raw_fd(raw_fd) };
+                file.write_all(bytes).expect("write memfd bytes");
+                return file.into();
+            }
+        }
+
+        let unique = format!("k3_worker_memfd_{name}_{}.gguf", std::process::id());
+        let temp = std::env::temp_dir().join(unique);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp)
+            .expect("create backing file");
+        let _ = std::fs::remove_file(&temp);
+        (&file).write_all(bytes).expect("write fd bytes");
+        file.into()
+    }
 
     #[test]
     fn test_nonexistent_model() {
@@ -241,14 +294,17 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn test_valid_model_mapping() {
+        let gguf_bytes = create_synthetic_gguf_v3("synthetic", 32, &[]);
         let temp = std::env::temp_dir().join("k3_worker_valid_model.gguf");
         {
             let mut f = File::create(&temp).unwrap();
-            f.write_all(b"GGUFv3_SYNTHETIC_WEIGHTS_DATA").unwrap();
+            f.write_all(&gguf_bytes).unwrap();
         }
-        let weights = LockedWeights::open(&temp).expect("open valid model");
-        assert_eq!(weights.len(), 29);
-        assert_eq!(weights.as_slice(), b"GGUFv3_SYNTHETIC_WEIGHTS_DATA");
+        let weights = LockedWeights::open(&temp).expect("open valid miniature GGUF");
+        assert_eq!(weights.len(), gguf_bytes.len());
+        assert_eq!(weights.as_slice(), gguf_bytes.as_slice());
+        assert_eq!(weights.recipe().architecture_id(), "synthetic");
+        assert_eq!(weights.metadata().architecture(), "synthetic");
         drop(weights);
         let _ = std::fs::remove_file(&temp);
     }
@@ -256,10 +312,11 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn test_exclusive_lock_conflict() {
+        let gguf_bytes = create_synthetic_gguf_v3("synthetic", 32, &[]);
         let temp = std::env::temp_dir().join("k3_worker_locked_model.gguf");
         {
             let mut f = File::create(&temp).unwrap();
-            f.write_all(b"LOCKED_MODEL_CONTENT").unwrap();
+            f.write_all(&gguf_bytes).unwrap();
         }
         let f_ex = File::open(&temp).unwrap();
         // SAFETY: Test acquires exclusive flock to test worker error handling.
@@ -276,5 +333,67 @@ mod tests {
         unsafe { libc::flock(f_ex.as_raw_fd(), libc::LOCK_UN) };
         drop(f_ex);
         let _ = std::fs::remove_file(&temp);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_memfd_admission_valid_miniature_gguf() {
+        let gguf_bytes = create_synthetic_gguf_v3("synthetic", 32, &[]);
+        let fd = create_anonymous_fd_with_bytes("valid_synthetic", &gguf_bytes);
+
+        let (weights, kv_arena) =
+            LockedWeights::from_fd_and_instantiate(fd, 32, &SystemMemoryInspector::new())
+                .expect("memfd miniature GGUF must be admitted cleanly");
+        assert_eq!(weights.recipe().architecture_id(), "synthetic");
+        assert_eq!(kv_arena.n_ctx(), 32);
+        assert_eq!(weights.len(), gguf_bytes.len());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_memfd_admission_rejects_truncated_gguf_with_tensor_bounds_error() {
+        let mut gguf_bytes = create_synthetic_gguf_v3("synthetic", 32, &[]);
+        gguf_bytes.truncate(20);
+        let fd = create_anonymous_fd_with_bytes("truncated_gguf", &gguf_bytes);
+
+        let err = LockedWeights::from_fd(fd).expect_err("truncated GGUF must fail closed");
+        assert!(
+            matches!(err, WorkerError::TensorBoundsError(_)),
+            "expected TensorBoundsError, got {err:?}"
+        );
+        assert_eq!(err.status_code(), StatusCode::TensorBoundsError);
+        assert_eq!(err.exit_code(), 14);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_memfd_admission_rejects_unsupported_arch_with_capability_mismatch() {
+        let gguf_bytes = create_synthetic_gguf_v3("unsupported_arch_v99", 32, &[]);
+        let fd = create_anonymous_fd_with_bytes("unsupported_arch", &gguf_bytes);
+
+        let err = LockedWeights::from_fd(fd).expect_err("unsupported arch must fail closed");
+        assert!(
+            matches!(err, WorkerError::CapabilityMismatch(_)),
+            "expected CapabilityMismatch, got {err:?}"
+        );
+        assert_eq!(err.status_code(), StatusCode::CapabilityMismatch);
+        assert_eq!(err.exit_code(), 10);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_memfd_admission_rejects_insufficient_memlock_headroom() {
+        let gguf_bytes = create_synthetic_gguf_v3("synthetic", 32, &[]);
+        let fd = create_anonymous_fd_with_bytes("low_memlock", &gguf_bytes);
+        let constrained = MockMemoryInspector::new(128, 128);
+
+        let err = LockedWeights::from_fd_with_admission(fd, Some(32), &constrained)
+            .expect_err("constrained RLIMIT_MEMLOCK must fail closed");
+        assert!(
+            matches!(err, WorkerError::InsufficientLockableMemory(_)),
+            "expected InsufficientLockableMemory, got {err:?}"
+        );
+        assert_eq!(err.status_code(), StatusCode::InsufficientLockableMemory);
+        assert_eq!(err.exit_code(), 11);
     }
 }

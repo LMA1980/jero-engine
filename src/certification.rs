@@ -470,14 +470,78 @@ fn encode_chunk_without_bos(
     if chunk.is_empty() {
         return Ok(());
     }
-    let mut sub = tokenizer.encode(chunk)?;
-    if tokenizer.special_tokens().add_bos_token
-        && let Some(bos) = tokenizer.special_tokens().bos_token_id
-        && sub.first() == Some(&bos)
-    {
-        sub.remove(0);
+    match tokenizer.encode(chunk) {
+        Ok(mut sub) => {
+            if tokenizer.special_tokens().add_bos_token
+                && let Some(bos) = tokenizer.special_tokens().bos_token_id
+                && sub.first() == Some(&bos)
+            {
+                sub.remove(0);
+            }
+            out.extend_from_slice(&sub);
+            return Ok(());
+        }
+        Err(K3Error::CapabilityMismatch { .. }) => {}
+        Err(other) => return Err(other),
     }
-    out.extend_from_slice(&sub);
+
+    let mut cursor = 0_usize;
+    while cursor < chunk.len() {
+        let remaining = &chunk[cursor..];
+        if remaining.starts_with('<')
+            && let Some(special_len) = longest_vocab_prefix_len(tokenizer, remaining, true)
+            && let Some(special_id) = tokenizer.token_to_id(&remaining[..special_len])
+        {
+            out.push(special_id);
+            cursor += special_len;
+            continue;
+        }
+
+        if let Some(matched_len) = longest_vocab_prefix_len(tokenizer, remaining, false)
+            && let Some(matched_id) = tokenizer.token_to_id(&remaining[..matched_len])
+        {
+            out.push(matched_id);
+            cursor += matched_len;
+            continue;
+        }
+
+        let ch = remaining.chars().next().unwrap_or('\0');
+        let char_len = ch.len_utf8().min(remaining.len()).max(1);
+        let ch_slice = &remaining[..char_len];
+        match tokenizer.encode(ch_slice) {
+            Ok(mut sub) => {
+                if tokenizer.special_tokens().add_bos_token
+                    && let Some(bos) = tokenizer.special_tokens().bos_token_id
+                    && sub.first() == Some(&bos)
+                {
+                    sub.remove(0);
+                }
+                out.extend_from_slice(&sub);
+            }
+            Err(K3Error::CapabilityMismatch { .. }) => {
+                for &b in ch_slice.as_bytes() {
+                    let hex_upper = format!("<0x{b:02X}>");
+                    let hex_lower = format!("<0x{b:02x}>");
+                    if let Some(byte_id) = tokenizer
+                        .token_to_id(&hex_upper)
+                        .or_else(|| tokenizer.token_to_id(&hex_lower))
+                    {
+                        out.push(byte_id);
+                    } else if let Some(pad_id) = tokenizer.special_tokens().padding_token_id {
+                        out.push(pad_id);
+                    } else {
+                        return Err(K3Error::CapabilityMismatch {
+                            architecture: "tokenizer".to_owned(),
+                            reason: format!("unable to encode character '{ch}' (byte 0x{b:02X})"),
+                        });
+                    }
+                }
+            }
+            Err(other) => return Err(other),
+        }
+        cursor += char_len;
+    }
+
     Ok(())
 }
 
@@ -516,8 +580,10 @@ fn longest_vocab_prefix_len(
 /// Returns [`K3Error::CapabilityMismatch`] if an unmapped byte has neither a `<0xXX>` byte token
 /// nor a fallback `padding_token_id`.
 pub fn encode_text_utf8_safe(tokenizer: &GgufTokenizer, text: &str) -> Result<Vec<u32>, K3Error> {
-    if text.is_ascii() {
-        return tokenizer.encode(text);
+    match tokenizer.encode(text) {
+        Ok(tokens) => return Ok(tokens),
+        Err(K3Error::CapabilityMismatch { .. }) => {}
+        Err(other) => return Err(other),
     }
 
     let mut out = Vec::new();
@@ -525,6 +591,11 @@ pub fn encode_text_utf8_safe(tokenizer: &GgufTokenizer, text: &str) -> Result<Ve
         && let Some(bos) = tokenizer.special_tokens().bos_token_id
     {
         out.push(bos);
+    }
+
+    if text.is_ascii() {
+        encode_chunk_without_bos(tokenizer, text, &mut out)?;
+        return Ok(out);
     }
 
     let mut run_start = 0_usize;

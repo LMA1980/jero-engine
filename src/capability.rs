@@ -39,7 +39,22 @@ pub struct GgufHyperparams {
     /// Trained context window length (`{arch}.context_length`).
     pub context_length: usize,
     /// Optional sliding-window attention span (`{arch}.attention.sliding_window`).
-    pub sliding_window: Option<usize>,
+    pub sliding_window: Option<u32>,
+    /// Optional `RoPE` rotary dimension count (`{arch}.rope.dimension_count`).
+    pub rope_dim_count: Option<u32>,
+    /// Optional `RoPE` scaling type (`{arch}.rope.scaling.type`).
+    pub rope_scaling_type: Option<String>,
+    /// Optional `RoPE` scaling factor (`{arch}.rope.scaling.factor`).
+    pub rope_scaling_factor: Option<f32>,
+    /// Optional `RoPE` original context length (`{arch}.rope.scaling.orig_ctx_len` or
+    /// `{arch}.rope.scaling.original_context_length`).
+    pub rope_orig_ctx_len: Option<u32>,
+    /// Optional explicit per-head value dimension (`{arch}.attention.value_length`).
+    pub value_length: Option<u32>,
+    /// Optional attention score logit softcapping threshold (`{arch}.attn_logit_softcapping`).
+    pub attn_logit_softcapping: Option<f32>,
+    /// Optional final LM-head logit softcapping threshold (`{arch}.final_logit_softcapping`).
+    pub final_logit_softcapping: Option<f32>,
     /// Optional `MoE` total expert count (`{arch}.expert_count`).
     pub expert_count: Option<usize>,
     /// Optional `MoE` active experts per token (`{arch}.expert_used_count`).
@@ -201,44 +216,86 @@ impl GgufHyperparams {
 
         let vocab_size = infer_vocab_rows_from_tensors(tensors);
 
+        let sliding_window = metadata
+            .sliding_window()
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&v| v > 0);
+        let rope_dim_count = metadata
+            .rope_dimension_count()
+            .and_then(|v| u32::try_from(v).ok());
+        let value_length = metadata.value_length().and_then(|v| u32::try_from(v).ok());
+        let explicit_key_length = metadata.key_length().or(tensor_key_len);
+        let key_length = explicit_key_length.unwrap_or(key_length);
+
         Self {
             architecture: arch,
             block_count,
             embedding_length,
-            feed_forward_length,
+            feed_forward_length: metadata
+                .feed_forward_length()
+                .filter(|&v| v > 0)
+                .unwrap_or(feed_forward_length),
             head_count,
             head_count_kv,
             key_length,
-            explicit_key_length: tensor_key_len,
-            rope_freq_base: None,
-            rms_norm_eps: None,
-            vocab_size,
+            explicit_key_length,
+            rope_freq_base: metadata
+                .rope_freq_base()
+                .filter(|v| v.is_finite() && *v > 0.0),
+            rms_norm_eps: metadata
+                .rms_norm_eps()
+                .filter(|v| v.is_finite() && *v > 0.0),
+            vocab_size: metadata
+                .vocab_size()
+                .filter(|&v| v > 0)
+                .unwrap_or(vocab_size),
             context_length: metadata.context_length(),
-            sliding_window: None,
-            expert_count: None,
-            expert_used_count: None,
+            sliding_window,
+            rope_dim_count,
+            rope_scaling_type: None,
+            rope_scaling_factor: None,
+            rope_orig_ctx_len: None,
+            value_length,
+            attn_logit_softcapping: metadata.attn_logit_softcapping(),
+            final_logit_softcapping: metadata.final_logit_softcapping(),
+            expert_count: metadata.expert_count(),
+            expert_used_count: metadata.expert_used_count(),
         }
     }
 
+    fn lookup_arch_value<'a>(
+        gguf: &'a GgufFile<'a>,
+        arch: &str,
+        suffix: &str,
+    ) -> Option<&'a GgufValue<'a>> {
+        gguf.metadata_value(&format!("{arch}.{suffix}"))
+            .or_else(|| {
+                if arch == "phi4" {
+                    gguf.metadata_value(&format!("phi3.{suffix}"))
+                } else {
+                    None
+                }
+            })
+    }
+
     /// Extracts full model hyperparameters directly from a parsed [`GgufFile`] header, combining
-    /// raw GGUF key-value entries (`feed_forward_length`, `attention.key_length`, `rope.freq_base`,
-    /// `attention.layer_norm_rms_epsilon`, `vocab_size`, `sliding_window`, `expert_count`) with
-    /// tensor-shape fallbacks.
+    /// raw GGUF key-value entries (`feed_forward_length`, `attention.key_length`,
+    /// `attention.value_length`, `rope.freq_base`, `rope.dimension_count`, `rope.scaling.*`,
+    /// `attention.layer_norm_rms_epsilon`, `vocab_size`, `sliding_window`, softcapping, and
+    /// `expert_count`) with tensor-shape fallbacks.
     #[must_use]
     pub fn from_gguf(gguf: &GgufFile<'_>) -> Self {
         let mut params = Self::from_metadata(gguf.metadata());
         let arch = params.architecture.clone();
 
-        if let Some(ffn) = gguf
-            .metadata_value(&format!("{arch}.feed_forward_length"))
+        if let Some(ffn) = Self::lookup_arch_value(gguf, &arch, "feed_forward_length")
             .and_then(GgufValue::as_usize)
             .filter(|&v| v > 0)
         {
             params.feed_forward_length = ffn;
         }
 
-        if let Some(kl) = gguf
-            .metadata_value(&format!("{arch}.attention.key_length"))
+        if let Some(kl) = Self::lookup_arch_value(gguf, &arch, "attention.key_length")
             .and_then(GgufValue::as_usize)
             .filter(|&v| v > 0)
         {
@@ -246,20 +303,65 @@ impl GgufHyperparams {
             params.key_length = kl;
         }
 
-        if let Some(freq) = gguf
-            .metadata_value(&format!("{arch}.rope.freq_base"))
+        if let Some(vl) = Self::lookup_arch_value(gguf, &arch, "attention.value_length")
+            .and_then(GgufValue::as_u32)
+        {
+            params.value_length = Some(vl);
+        }
+
+        if let Some(freq) = Self::lookup_arch_value(gguf, &arch, "rope.freq_base")
             .and_then(GgufValue::as_f32)
             .filter(|v| v.is_finite() && *v > 0.0)
         {
             params.rope_freq_base = Some(freq);
         }
 
-        if let Some(eps) = gguf
-            .metadata_value(&format!("{arch}.attention.layer_norm_rms_epsilon"))
+        if let Some(rd) =
+            Self::lookup_arch_value(gguf, &arch, "rope.dimension_count").and_then(GgufValue::as_u32)
+        {
+            params.rope_dim_count = Some(rd);
+        }
+
+        if let Some(st) = Self::lookup_arch_value(gguf, &arch, "rope.scaling.type")
+            .and_then(GgufValue::as_str)
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+        {
+            params.rope_scaling_type = Some(st);
+        }
+
+        if let Some(sf) =
+            Self::lookup_arch_value(gguf, &arch, "rope.scaling.factor").and_then(GgufValue::as_f32)
+        {
+            params.rope_scaling_factor = Some(sf);
+        }
+
+        if let Some(orig) = Self::lookup_arch_value(gguf, &arch, "rope.scaling.orig_ctx_len")
+            .or_else(|| {
+                Self::lookup_arch_value(gguf, &arch, "rope.scaling.original_context_length")
+            })
+            .and_then(GgufValue::as_u32)
+        {
+            params.rope_orig_ctx_len = Some(orig);
+        }
+
+        if let Some(eps) = Self::lookup_arch_value(gguf, &arch, "attention.layer_norm_rms_epsilon")
             .and_then(GgufValue::as_f32)
             .filter(|v| v.is_finite() && *v > 0.0)
         {
             params.rms_norm_eps = Some(eps);
+        }
+
+        if let Some(cap) = Self::lookup_arch_value(gguf, &arch, "attn_logit_softcapping")
+            .and_then(GgufValue::as_f32)
+        {
+            params.attn_logit_softcapping = Some(cap);
+        }
+
+        if let Some(cap) = Self::lookup_arch_value(gguf, &arch, "final_logit_softcapping")
+            .and_then(GgufValue::as_f32)
+        {
+            params.final_logit_softcapping = Some(cap);
         }
 
         if let Some(GgufArray::String(tokens)) = gguf
@@ -270,32 +372,28 @@ impl GgufHyperparams {
             params.vocab_size = params.vocab_size.max(tokens.len());
         }
 
-        if let Some(vs) = gguf
-            .metadata_value(&format!("{arch}.vocab_size"))
+        if let Some(vs) = Self::lookup_arch_value(gguf, &arch, "vocab_size")
             .and_then(GgufValue::as_usize)
             .filter(|&v| v > 0)
         {
             params.vocab_size = vs;
         }
 
-        if let Some(sw) = gguf
-            .metadata_value(&format!("{arch}.attention.sliding_window"))
-            .and_then(GgufValue::as_usize)
+        if let Some(sw) = Self::lookup_arch_value(gguf, &arch, "attention.sliding_window")
+            .and_then(GgufValue::as_u32)
             .filter(|&v| v > 0)
         {
             params.sliding_window = Some(sw);
         }
 
-        if let Some(ec) = gguf
-            .metadata_value(&format!("{arch}.expert_count"))
+        if let Some(ec) = Self::lookup_arch_value(gguf, &arch, "expert_count")
             .and_then(GgufValue::as_usize)
             .filter(|&v| v > 0)
         {
             params.expert_count = Some(ec);
         }
 
-        if let Some(euc) = gguf
-            .metadata_value(&format!("{arch}.expert_used_count"))
+        if let Some(euc) = Self::lookup_arch_value(gguf, &arch, "expert_used_count")
             .and_then(GgufValue::as_usize)
             .filter(|&v| v > 0)
         {
@@ -557,6 +655,35 @@ impl RecipeRegistry {
         if let Some(freq) = params.rope_freq_base {
             recipe.rope_theta = freq;
         }
+        if let Some(rd) = params.rope_dim_count
+            && rd > 0
+        {
+            recipe.rotary_dim = Some(rd as usize);
+        }
+        if let Some(scaling_type) = params.rope_scaling_type.as_deref()
+            && let Some(factor) = params.rope_scaling_factor
+            && factor.is_finite()
+            && factor > 0.0
+        {
+            match scaling_type {
+                "linear" => {
+                    recipe.rope_scaling =
+                        Some(jero_arch_llama::RopeScalingConfig::Linear { factor });
+                }
+                "llama3" => {
+                    recipe.rope_scaling = Some(jero_arch_llama::RopeScalingConfig::Llama3Smooth {
+                        factor,
+                        low_freq_factor: 1.0,
+                        high_freq_factor: 4.0,
+                        original_max_position_embeddings: params
+                            .rope_orig_ctx_len
+                            .filter(|&v| v > 0)
+                            .map_or(8192, |v| v as usize),
+                    });
+                }
+                _ => {}
+            }
+        }
         Some(recipe)
     }
 
@@ -624,7 +751,32 @@ impl RecipeRegistry {
                 recipe.rope_theta = freq;
             }
             if let Some(sw) = params.sliding_window {
-                recipe.sliding_window = Some(sw);
+                recipe.sliding_window = Some(sw as usize);
+            }
+            if let Some(scaling_type) = params.rope_scaling_type.as_deref()
+                && let Some(factor) = params.rope_scaling_factor
+                && factor.is_finite()
+                && factor > 0.0
+            {
+                match scaling_type {
+                    "linear" => {
+                        recipe.rope_scaling =
+                            Some(jero_arch_mistral::RopeScalingConfig::Linear { factor });
+                    }
+                    "llama3" => {
+                        recipe.rope_scaling =
+                            Some(jero_arch_mistral::RopeScalingConfig::Llama3Smooth {
+                                factor,
+                                low_freq_factor: 1.0,
+                                high_freq_factor: 4.0,
+                                original_max_position_embeddings: params
+                                    .rope_orig_ctx_len
+                                    .filter(|&v| v > 0)
+                                    .map_or(8192, |v| v as usize),
+                            });
+                    }
+                    _ => {}
+                }
             }
             if let Some(ec) = params.expert_count {
                 recipe.num_experts = Some(ec);
@@ -669,8 +821,27 @@ impl RecipeRegistry {
             if let Some(freq) = params.rope_freq_base {
                 recipe.rope_theta = freq;
             }
-            if params.context_length > 0 {
+            if let Some(rd) = params.rope_dim_count
+                && rd > 0
+            {
+                recipe.rotary_dim = Some(rd as usize);
+            }
+            if let Some(sw) = params.sliding_window {
+                recipe.sliding_window = Some(sw as usize);
+            }
+            if let Some(orig) = params.rope_orig_ctx_len
+                && orig > 0
+            {
+                recipe.original_max_position_embeddings = orig as usize;
+            } else if params.context_length > 0 {
                 recipe.original_max_position_embeddings = params.context_length;
+            }
+            if params.rope_scaling_type.as_deref() == Some("linear")
+                && let Some(factor) = params.rope_scaling_factor
+                && factor.is_finite()
+                && factor > 0.0
+            {
+                recipe.rope_scaling = jero_arch_phi3::RopeScalingConfig::Linear { factor };
             }
             return Some(Box::new(recipe));
         }
@@ -726,6 +897,31 @@ impl RecipeRegistry {
                         jero_arch_dory::DoryKvCacheMode::LastLoop
                     }
                 };
+                if !dory.layer_pattern().is_empty() {
+                    recipe = recipe.with_layer_pattern_owned(dory.layer_pattern().to_owned());
+                }
+                let profile = dory.rope_profile().trim();
+                if !profile.is_empty() {
+                    recipe = recipe.with_rope_profile(profile.to_owned());
+                }
+                if dory.rope_freq_base_2().is_finite() && dory.rope_freq_base_2() > 0.0 {
+                    recipe.rope_theta_swa = dory.rope_freq_base_2();
+                }
+                if dory.init_std().is_finite() && dory.init_std() > 0.0 {
+                    recipe.init_std = dory.init_std();
+                }
+                if dory.alpha_init().is_finite() {
+                    recipe.alpha_init = dory.alpha_init();
+                }
+                if dory.gate_init().is_finite() {
+                    recipe.gate_init = dory.gate_init();
+                }
+            }
+            if let Some(ls) = metadata
+                .and_then(ModelMetadata::logit_scale)
+                .filter(|v| v.is_finite() && *v > 0.0)
+            {
+                recipe.logit_scale = Some(ls);
             }
             if let Ok(dim) = u32::try_from(params.embedding_length)
                 && dim > 0
@@ -759,13 +955,15 @@ impl RecipeRegistry {
                 recipe.head_dim = kl;
             }
             if let Some(sw) = params.sliding_window
-                && let Ok(sw_u32) = u32::try_from(sw)
-                && sw_u32 > 0
+                && sw > 0
             {
-                recipe.sliding_window = sw_u32;
+                recipe.sliding_window = sw;
             }
             if let Some(freq) = params.rope_freq_base {
                 recipe.rope_theta_full = freq;
+            }
+            if params.vocab_size > 0 {
+                recipe.vocab_size = params.vocab_size;
             }
             return Some(Box::new(recipe));
         }
@@ -814,7 +1012,19 @@ impl RecipeRegistry {
             if let Some(sw) = params.sliding_window
                 && sw > 0
             {
-                recipe.sliding_window = sw;
+                recipe.sliding_window = sw as usize;
+            }
+            if let Some(cap) = params.attn_logit_softcapping
+                && cap.is_finite()
+                && cap > 0.0
+            {
+                recipe.attn_logit_softcap = Some(cap);
+            }
+            if let Some(cap) = params.final_logit_softcapping
+                && cap.is_finite()
+                && cap > 0.0
+            {
+                recipe.final_logit_softcap = Some(cap);
             }
             return Some(Box::new(recipe));
         } else if arch == "gemma4" {
@@ -853,7 +1063,7 @@ impl RecipeRegistry {
             if let Some(sw) = params.sliding_window
                 && sw > 0
             {
-                recipe.sliding_window = sw;
+                recipe.sliding_window = sw as usize;
             }
             if let Some(ec) = params.expert_count {
                 recipe.num_experts = Some(ec);
@@ -961,6 +1171,16 @@ impl RecipeRegistry {
         }
         if let Some(freq) = params.rope_freq_base {
             recipe.rope_theta = freq;
+        }
+        if let Some(rope) = params.rope_dim_count
+            && rope > 0
+        {
+            recipe.mla.qk_rope_head_dim = rope as usize;
+        }
+        if let Some(vl) = params.value_length
+            && vl > 0
+        {
+            recipe.mla.v_head_dim = vl as usize;
         }
         if let Some(meta) = metadata {
             if let Some(rank) = meta.kv_lora_rank() {
@@ -1119,15 +1339,186 @@ impl RecipeRegistry {
     #[must_use]
     pub fn instantiate_recipe_from_gguf(gguf: &GgufFile<'_>) -> Option<Box<dyn ArchRecipe>> {
         let params = GgufHyperparams::from_gguf(gguf);
+        let arch = params.architecture.as_str();
+
+        #[cfg(feature = "jero-arch-phi3")]
+        if (arch == "phi3" || arch == "phi4")
+            && (GgufHyperparams::lookup_arch_value(gguf, arch, "rope.scaling.short_factor")
+                .is_some()
+                || GgufHyperparams::lookup_arch_value(gguf, arch, "rope.scaling.long_factor")
+                    .is_some())
+            && let Ok(recipe) = jero_arch_phi3::Phi3Recipe::from_gguf(gguf)
+        {
+            return Some(Box::new(recipe));
+        }
+
+        #[cfg(feature = "jero-arch-mistral")]
+        if matches!(arch, "mistral" | "mistral3" | "mixtral")
+            && let Ok(recipe) = jero_arch_mistral::MistralRecipe::from_gguf(gguf)
+        {
+            return Some(Box::new(recipe));
+        }
+
         Self::instantiate_from_hyperparams(&params, Some(gguf.metadata()))
     }
 }
 
+fn validate_raw_gguf_hyperparams(gguf: &GgufFile<'_>) -> Result<(), K3Error> {
+    let arch = gguf.metadata().architecture();
+    if let Some(val) = GgufHyperparams::lookup_arch_value(gguf, arch, "rope.dimension_count")
+        && val.as_u32().is_none()
+    {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!(
+                "{arch}.rope.dimension_count must be a non-negative integer, got invalid GGUF value"
+            ),
+        });
+    }
+    if let Some(val) = GgufHyperparams::lookup_arch_value(gguf, arch, "rope.scaling.factor")
+        && val.as_f32().is_none()
+    {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!("{arch}.rope.scaling.factor must be a float"),
+        });
+    }
+    if let Some(val) = GgufHyperparams::lookup_arch_value(gguf, arch, "rope.scaling.orig_ctx_len")
+        .or_else(|| {
+            GgufHyperparams::lookup_arch_value(gguf, arch, "rope.scaling.original_context_length")
+        })
+        && val.as_u32().is_none()
+    {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!("{arch}.rope.scaling.orig_ctx_len must be a non-negative integer"),
+        });
+    }
+    if let Some(val) = GgufHyperparams::lookup_arch_value(gguf, arch, "attention.value_length")
+        && val.as_u32().is_none()
+    {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!("{arch}.attention.value_length must be a non-negative integer"),
+        });
+    }
+    if let Some(val) = GgufHyperparams::lookup_arch_value(gguf, arch, "attn_logit_softcapping")
+        && val.as_f32().is_none()
+    {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!("{arch}.attn_logit_softcapping must be a float"),
+        });
+    }
+    if let Some(val) = GgufHyperparams::lookup_arch_value(gguf, arch, "final_logit_softcapping")
+        && val.as_f32().is_none()
+    {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!("{arch}.final_logit_softcapping must be a float"),
+        });
+    }
+    if arch == "dory"
+        && let Some(val) = gguf.metadata_value("dory.rope.profile")
+    {
+        #[cfg(feature = "jero-arch-dory")]
+        {
+            jero_arch_dory::DoryRecipe::parse_rope_profile(val)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_hyperparams_invariants(
+    params: &GgufHyperparams,
+    metadata: &ModelMetadata,
+) -> Result<(), K3Error> {
+    let arch = params.architecture.as_str();
+    if let Some(rd) = params.rope_dim_count {
+        if rd == 0 || rd % 2 != 0 {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: arch.to_owned(),
+                reason: format!(
+                    "rope.dimension_count ({rd}) for '{arch}' must be positive and even"
+                ),
+            });
+        }
+        if params.key_length > 0 && (rd as usize) > params.key_length {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: arch.to_owned(),
+                reason: format!(
+                    "rope.dimension_count ({rd}) exceeds head_dim ({}) for '{arch}'",
+                    params.key_length
+                ),
+            });
+        }
+    }
+    if let Some(factor) = params.rope_scaling_factor
+        && (!factor.is_finite() || factor <= 0.0)
+    {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!(
+                "rope.scaling.factor ({factor}) for '{arch}' must be finite and greater than 0"
+            ),
+        });
+    }
+    if let Some(orig) = params.rope_orig_ctx_len
+        && orig == 0
+    {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!("rope.scaling.orig_ctx_len for '{arch}' must be greater than 0"),
+        });
+    }
+    if let Some(vl) = params.value_length
+        && vl == 0
+    {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!("attention.value_length for '{arch}' must be greater than 0"),
+        });
+    }
+    if let Some(cap) = params.attn_logit_softcapping
+        && (!cap.is_finite() || cap <= 0.0)
+    {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!(
+                "attn_logit_softcapping ({cap}) for '{arch}' must be finite and greater than 0"
+            ),
+        });
+    }
+    if let Some(cap) = params.final_logit_softcapping
+        && (!cap.is_finite() || cap <= 0.0)
+    {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!(
+                "final_logit_softcapping ({cap}) for '{arch}' must be finite and greater than 0"
+            ),
+        });
+    }
+    if arch == "dory"
+        && let Some(dory) = metadata.dory()
+        && dory.rope_profile().trim().is_empty()
+    {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: "dory.rope.profile must not be empty".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_recipe_against_metadata(
     recipe: &dyn ArchRecipe,
+    params: &GgufHyperparams,
     metadata: &ModelMetadata,
 ) -> Result<(), K3Error> {
     let arch = metadata.architecture();
+    validate_hyperparams_invariants(params, metadata)?;
+
     for tensor in metadata.tensors() {
         if !recipe.supports_quant(tensor.quant()) {
             return Err(K3Error::CapabilityMismatch {
@@ -1159,16 +1550,19 @@ fn validate_recipe_against_metadata(
 }
 
 /// Verifies that the model's architecture recipe is compiled, dynamically hydrates its GGUF
-/// hyperparameters, and validates that every tensor's quantization layout is supported by the
-/// active backend (ADR-023, US-01 Scenario 1).
+/// hyperparameters, and validates that every tensor's quantization layout and structural
+/// `RoPE` / softcapping invariant is valid for the active backend (ADR-023, US-01 Scenario 1).
 ///
 /// # Errors
 ///
 /// Returns [`K3Error::CapabilityMismatch`] if:
 /// - The model's `general.architecture` has no compiled recipe in this binary.
 /// - Any tensor in the model uses a quantization layout unsupported by the matching recipe.
+/// - Any extracted `RoPE`, softcapping, or `value_length` invariant fails validation.
 /// - The trained context window is zero.
 pub fn verify_model_capabilities(model: &GgufFile<'_>) -> Result<Box<dyn ArchRecipe>, K3Error> {
+    validate_raw_gguf_hyperparams(model)?;
+    let params = GgufHyperparams::from_gguf(model);
     let arch = model.metadata().architecture();
     let recipe = RecipeRegistry::instantiate_recipe_from_gguf(model).ok_or_else(|| {
         K3Error::CapabilityMismatch {
@@ -1179,7 +1573,7 @@ pub fn verify_model_capabilities(model: &GgufFile<'_>) -> Result<Box<dyn ArchRec
             ),
         }
     })?;
-    validate_recipe_against_metadata(recipe.as_ref(), model.metadata())?;
+    validate_recipe_against_metadata(recipe.as_ref(), &params, model.metadata())?;
     Ok(recipe)
 }
 
@@ -1193,6 +1587,7 @@ pub fn verify_model_capabilities(model: &GgufFile<'_>) -> Result<Box<dyn ArchRec
 pub fn verify_metadata_capabilities(
     metadata: &ModelMetadata,
 ) -> Result<Box<dyn ArchRecipe>, K3Error> {
+    let params = GgufHyperparams::from_metadata(metadata);
     let arch = metadata.architecture();
     let recipe = RecipeRegistry::instantiate_recipe(metadata).ok_or_else(|| {
         K3Error::CapabilityMismatch {
@@ -1203,7 +1598,7 @@ pub fn verify_metadata_capabilities(
             ),
         }
     })?;
-    validate_recipe_against_metadata(recipe.as_ref(), metadata)?;
+    validate_recipe_against_metadata(recipe.as_ref(), &params, metadata)?;
     Ok(recipe)
 }
 
@@ -1484,5 +1879,367 @@ mod tests {
         assert_eq!(recipe_3b.head_dim, 64);
         assert_eq!(recipe_3b.vocab_size, 128_256);
         assert!((recipe_3b.rope_theta - 500_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_issue_137_rope_value_length_softcap_extraction_and_hydration() {
+        use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
+
+        // 1. Llama 3.2 (llama3 RoPE scaling + explicit rope.dimension_count + orig_ctx_len)
+        #[cfg(feature = "jero-arch-llama")]
+        {
+            let kvs = [
+                ("llama.block_count", GgufValue::Uint32(16)),
+                ("llama.embedding_length", GgufValue::Uint32(2048)),
+                ("llama.attention.head_count", GgufValue::Uint32(32)),
+                ("llama.attention.head_count_kv", GgufValue::Uint32(8)),
+                ("llama.attention.key_length", GgufValue::Uint32(64)),
+                ("llama.rope.dimension_count", GgufValue::Uint32(64)),
+                ("llama.rope.scaling.type", GgufValue::String("llama3")),
+                ("llama.rope.scaling.factor", GgufValue::Float32(32.0)),
+                ("llama.rope.scaling.orig_ctx_len", GgufValue::Uint32(8192)),
+            ];
+            let bytes = create_synthetic_gguf_v3_with_kvs("llama", 32, &kvs, &[]);
+            let gguf = GgufFile::parse(&bytes).expect("parse llama 3.2");
+            let params = GgufHyperparams::from_gguf(&gguf);
+            assert_eq!(params.rope_dim_count, Some(64));
+            assert_eq!(params.rope_scaling_type.as_deref(), Some("llama3"));
+            assert_eq!(params.rope_scaling_factor, Some(32.0));
+            assert_eq!(params.rope_orig_ctx_len, Some(8192));
+
+            let recipe = RecipeRegistry::hydrate_llama_recipe(&params).expect("hydrate llama 3.2");
+            assert_eq!(recipe.rotary_dim, Some(64));
+            assert!(matches!(
+                recipe.rope_scaling,
+                Some(jero_arch_llama::RopeScalingConfig::Llama3Smooth {
+                    factor,
+                    original_max_position_embeddings: 8192,
+                    ..
+                }) if (factor - 32.0).abs() < 1e-6
+            ));
+            verify_model_capabilities(&gguf).expect("llama 3.2 capabilities pass");
+        }
+
+        // 2. Qwen2.5 (rope.dimension_count + yarn scaling + sliding_window)
+        {
+            let kvs = [
+                ("qwen2.block_count", GgufValue::Uint32(24)),
+                ("qwen2.embedding_length", GgufValue::Uint32(896)),
+                ("qwen2.attention.head_count", GgufValue::Uint32(14)),
+                ("qwen2.attention.head_count_kv", GgufValue::Uint32(2)),
+                ("qwen2.rope.dimension_count", GgufValue::Uint32(64)),
+                ("qwen2.rope.scaling.type", GgufValue::String("yarn")),
+                ("qwen2.rope.scaling.factor", GgufValue::Float32(4.0)),
+                ("qwen2.rope.scaling.orig_ctx_len", GgufValue::Uint32(32_768)),
+                ("qwen2.attention.sliding_window", GgufValue::Uint32(32_768)),
+            ];
+            let bytes = create_synthetic_gguf_v3_with_kvs("qwen2", 32, &kvs, &[]);
+            let gguf = GgufFile::parse(&bytes).expect("parse qwen2.5");
+            let params = GgufHyperparams::from_gguf(&gguf);
+            assert_eq!(params.rope_dim_count, Some(64));
+            assert_eq!(params.rope_scaling_type.as_deref(), Some("yarn"));
+            assert_eq!(params.rope_scaling_factor, Some(4.0));
+            assert_eq!(params.rope_orig_ctx_len, Some(32_768));
+            assert_eq!(params.sliding_window, Some(32_768));
+            verify_model_capabilities(&gguf).expect("qwen2.5 capabilities pass");
+        }
+
+        // 3. Phi-3.5 / Phi-4 (partial rope_dim_count + value_length + linear scaling + orig ctx)
+        #[cfg(feature = "jero-arch-phi3")]
+        {
+            for arch in ["phi3", "phi4"] {
+                let k_block = format!("{arch}.block_count");
+                let k_emb = format!("{arch}.embedding_length");
+                let k_hc = format!("{arch}.attention.head_count");
+                let k_hkv = format!("{arch}.attention.head_count_kv");
+                let k_key_len = format!("{arch}.attention.key_length");
+                let k_val_len = format!("{arch}.attention.value_length");
+                let k_rd = format!("{arch}.rope.dimension_count");
+                let k_rope_type = format!("{arch}.rope.scaling.type");
+                let k_rope_factor = format!("{arch}.rope.scaling.factor");
+                let k_rope_orig_ctx = format!("{arch}.rope.scaling.original_context_length");
+                let k_sw = format!("{arch}.attention.sliding_window");
+                let kvs = [
+                    (k_block.as_str(), GgufValue::Uint32(32)),
+                    (k_emb.as_str(), GgufValue::Uint32(3072)),
+                    (k_hc.as_str(), GgufValue::Uint32(32)),
+                    (k_hkv.as_str(), GgufValue::Uint32(8)),
+                    (k_key_len.as_str(), GgufValue::Uint32(96)),
+                    (k_val_len.as_str(), GgufValue::Uint32(96)),
+                    (k_rd.as_str(), GgufValue::Uint32(64)),
+                    (k_rope_type.as_str(), GgufValue::String("linear")),
+                    (k_rope_factor.as_str(), GgufValue::Float32(2.0)),
+                    (k_rope_orig_ctx.as_str(), GgufValue::Uint32(4096)),
+                    (k_sw.as_str(), GgufValue::Uint32(2048)),
+                ];
+                let bytes = create_synthetic_gguf_v3_with_kvs(arch, 32, &kvs, &[]);
+                let gguf = GgufFile::parse(&bytes).expect("parse phi");
+                let params = GgufHyperparams::from_gguf(&gguf);
+                assert_eq!(params.rope_dim_count, Some(64));
+                assert_eq!(params.value_length, Some(96));
+                assert_eq!(params.rope_scaling_type.as_deref(), Some("linear"));
+                assert_eq!(params.rope_scaling_factor, Some(2.0));
+                assert_eq!(params.rope_orig_ctx_len, Some(4096));
+                assert_eq!(params.sliding_window, Some(2048));
+                verify_model_capabilities(&gguf).expect("phi capabilities pass");
+            }
+        }
+
+        // 4. Gemma 2 & Gemma 3 (key_length/value_length + attn/final softcapping + sliding_window)
+        #[cfg(feature = "jero-arch-gemma")]
+        {
+            let gemma2_kvs = [
+                ("gemma2.block_count", GgufValue::Uint32(26)),
+                ("gemma2.embedding_length", GgufValue::Uint32(2304)),
+                ("gemma2.attention.head_count", GgufValue::Uint32(8)),
+                ("gemma2.attention.head_count_kv", GgufValue::Uint32(4)),
+                ("gemma2.attention.key_length", GgufValue::Uint32(256)),
+                ("gemma2.attention.value_length", GgufValue::Uint32(256)),
+                ("gemma2.rope.dimension_count", GgufValue::Uint32(256)),
+                ("gemma2.attn_logit_softcapping", GgufValue::Float32(50.0)),
+                ("gemma2.final_logit_softcapping", GgufValue::Float32(30.0)),
+                ("gemma2.attention.sliding_window", GgufValue::Uint32(4096)),
+            ];
+            let gemma2_bytes = create_synthetic_gguf_v3_with_kvs("gemma2", 32, &gemma2_kvs, &[]);
+            let gemma2_gguf = GgufFile::parse(&gemma2_bytes).expect("parse gemma2");
+            let g2_params = GgufHyperparams::from_gguf(&gemma2_gguf);
+            assert_eq!(g2_params.value_length, Some(256));
+            assert_eq!(g2_params.attn_logit_softcapping, Some(50.0));
+            assert_eq!(g2_params.final_logit_softcapping, Some(30.0));
+            assert_eq!(g2_params.sliding_window, Some(4096));
+            verify_model_capabilities(&gemma2_gguf).expect("gemma2 capabilities pass");
+
+            let gemma3_kvs = [
+                ("gemma3.block_count", GgufValue::Uint32(26)),
+                ("gemma3.embedding_length", GgufValue::Uint32(2304)),
+                ("gemma3.attention.head_count", GgufValue::Uint32(8)),
+                ("gemma3.attention.head_count_kv", GgufValue::Uint32(4)),
+                ("gemma3.attention.key_length", GgufValue::Uint32(256)),
+                ("gemma3.attention.value_length", GgufValue::Uint32(256)),
+                ("gemma3.rope.dimension_count", GgufValue::Uint32(256)),
+                ("gemma3.rope.scaling.type", GgufValue::String("linear")),
+                ("gemma3.rope.scaling.factor", GgufValue::Float32(8.0)),
+                ("gemma3.attention.sliding_window", GgufValue::Uint32(1024)),
+            ];
+            let gemma3_bytes = create_synthetic_gguf_v3_with_kvs("gemma3", 32, &gemma3_kvs, &[]);
+            let gemma3_gguf = GgufFile::parse(&gemma3_bytes).expect("parse gemma3");
+            let g3_params = GgufHyperparams::from_gguf(&gemma3_gguf);
+            assert_eq!(g3_params.rope_dim_count, Some(256));
+            assert_eq!(g3_params.rope_scaling_type.as_deref(), Some("linear"));
+            assert_eq!(g3_params.rope_scaling_factor, Some(8.0));
+            assert_eq!(g3_params.value_length, Some(256));
+            assert_eq!(g3_params.sliding_window, Some(1024));
+            verify_model_capabilities(&gemma3_gguf).expect("gemma3 capabilities pass");
+        }
+
+        // 5. DeepSeek-R1-Distill (deepseek2 MLA + value_length & rope.dimension_count)
+        #[cfg(feature = "jero-kernels-rvv")]
+        {
+            let ds_kvs = [
+                ("deepseek2.block_count", GgufValue::Uint32(4)),
+                ("deepseek2.embedding_length", GgufValue::Uint32(128)),
+                ("deepseek2.attention.head_count", GgufValue::Uint32(4)),
+                ("deepseek2.attention.head_count_kv", GgufValue::Uint32(4)),
+                ("deepseek2.attention.kv_lora_rank", GgufValue::Uint32(16)),
+                ("deepseek2.attention.value_length", GgufValue::Uint32(32)),
+                ("deepseek2.rope.dimension_count", GgufValue::Uint32(8)),
+                ("deepseek2.rope.scaling.type", GgufValue::String("yarn")),
+                ("deepseek2.rope.scaling.factor", GgufValue::Float32(40.0)),
+                (
+                    "deepseek2.rope.scaling.orig_ctx_len",
+                    GgufValue::Uint32(4096),
+                ),
+            ];
+            let ds_bytes = create_synthetic_gguf_v3_with_kvs("deepseek2", 32, &ds_kvs, &[]);
+            let ds_gguf = GgufFile::parse(&ds_bytes).expect("parse deepseek distill");
+            let ds_params = GgufHyperparams::from_gguf(&ds_gguf);
+            assert_eq!(ds_params.value_length, Some(32));
+            assert_eq!(ds_params.rope_dim_count, Some(8));
+            assert_eq!(ds_params.rope_scaling_type.as_deref(), Some("yarn"));
+            assert_eq!(ds_params.rope_scaling_factor, Some(40.0));
+            assert_eq!(ds_params.rope_orig_ctx_len, Some(4096));
+            verify_model_capabilities(&ds_gguf).expect("deepseek2 capabilities pass");
+        }
+    }
+
+    #[test]
+    fn test_issue_137_invalid_rope_softcap_and_value_bounds_rejected() {
+        use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
+
+        // rope.dimension_count > head_dim (256/4 = 64 < 96)
+        let too_wide = create_synthetic_gguf_v3_with_kvs(
+            "llama",
+            32,
+            &[("llama.rope.dimension_count", GgufValue::Uint32(96))],
+            &[],
+        );
+        let gguf = GgufFile::parse(&too_wide).expect("parse header");
+        assert!(matches!(
+            verify_model_capabilities(&gguf),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+
+        // odd rope.dimension_count
+        let odd_rope = create_synthetic_gguf_v3_with_kvs(
+            "llama",
+            32,
+            &[("llama.rope.dimension_count", GgufValue::Uint32(63))],
+            &[],
+        );
+        let gguf = GgufFile::parse(&odd_rope).expect("parse header");
+        assert!(matches!(
+            verify_model_capabilities(&gguf),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+
+        // zero or negative rope.dimension_count
+        for bad_val in [GgufValue::Uint32(0), GgufValue::Int32(-4)] {
+            let bad_rope = create_synthetic_gguf_v3_with_kvs(
+                "llama",
+                32,
+                &[("llama.rope.dimension_count", bad_val)],
+                &[],
+            );
+            let gguf = GgufFile::parse(&bad_rope).expect("parse header");
+            assert!(matches!(
+                verify_model_capabilities(&gguf),
+                Err(K3Error::CapabilityMismatch { .. })
+            ));
+        }
+
+        // non-positive or non-finite rope.scaling.factor
+        for bad_factor in [-2.0_f32, 0.0_f32, f32::NAN, f32::INFINITY] {
+            let bad_scale = create_synthetic_gguf_v3_with_kvs(
+                "llama",
+                32,
+                &[
+                    ("llama.rope.scaling.type", GgufValue::String("linear")),
+                    ("llama.rope.scaling.factor", GgufValue::Float32(bad_factor)),
+                ],
+                &[],
+            );
+            let gguf = GgufFile::parse(&bad_scale).expect("parse header");
+            assert!(matches!(
+                verify_model_capabilities(&gguf),
+                Err(K3Error::CapabilityMismatch { .. })
+            ));
+        }
+
+        // zero value_length / orig_ctx_len / non-positive softcapping
+        for bad_kv in [
+            ("llama.attention.value_length", GgufValue::Uint32(0)),
+            ("llama.rope.scaling.orig_ctx_len", GgufValue::Uint32(0)),
+            ("llama.attn_logit_softcapping", GgufValue::Float32(0.0)),
+            (
+                "llama.final_logit_softcapping",
+                GgufValue::Float32(f32::NAN),
+            ),
+        ] {
+            let bad = create_synthetic_gguf_v3_with_kvs("llama", 32, &[bad_kv], &[]);
+            let gguf = GgufFile::parse(&bad).expect("parse header");
+            assert!(matches!(
+                verify_model_capabilities(&gguf),
+                Err(K3Error::CapabilityMismatch { .. })
+            ));
+        }
+    }
+
+    #[cfg(feature = "jero-arch-dory")]
+    #[test]
+    fn test_issue_133_dory_rope_profile_string_and_integer_admitted() {
+        use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
+
+        assert_eq!(
+            jero_arch_dory::DoryRecipe::parse_rope_profile(&GgufValue::String("neox"))
+                .expect("string profile")
+                .as_ref(),
+            "neox"
+        );
+        assert_eq!(
+            jero_arch_dory::DoryRecipe::parse_rope_profile(&GgufValue::Uint32(1))
+                .expect("u32 profile")
+                .as_ref(),
+            "profile_1"
+        );
+        assert_eq!(
+            jero_arch_dory::DoryRecipe::parse_rope_profile(&GgufValue::Int32(2))
+                .expect("i32 profile")
+                .as_ref(),
+            "profile_2"
+        );
+        for bad_val in [
+            GgufValue::Bool(true),
+            GgufValue::Int32(-1),
+            GgufValue::String("  "),
+        ] {
+            assert!(matches!(
+                jero_arch_dory::DoryRecipe::parse_rope_profile(&bad_val),
+                Err(K3Error::CapabilityMismatch { .. })
+            ));
+        }
+
+        // Verify full GGUF capability admission accepts integer profile on dory metadata.
+        let kvs = [
+            ("dory.block_count", GgufValue::Uint32(0)),
+            ("dory.input_layer_count", GgufValue::Uint32(1)),
+            ("dory.recurrent_layer_count", GgufValue::Uint32(1)),
+            ("dory.output_layer_count", GgufValue::Uint32(1)),
+            ("dory.num_loops", GgufValue::Uint32(1)),
+            (
+                "dory.recurrent_kv_cache_mode",
+                GgufValue::String("per_loop"),
+            ),
+            ("dory.layer_pattern", GgufValue::String("S-*-")),
+            ("dory.rope.freq_base_2", GgufValue::Float32(10_000.0)),
+            ("dory.init_std", GgufValue::Float32(0.02)),
+            ("dory.alpha_init", GgufValue::Float32(0.05)),
+            ("dory.gate_init", GgufValue::Float32(0.0)),
+            ("dory.embedding_length", GgufValue::Uint32(32)),
+            ("dory.attention.head_count", GgufValue::Uint32(2)),
+            ("dory.attention.head_count_kv", GgufValue::Uint32(2)),
+            ("dory.context_length", GgufValue::Uint32(64)),
+            ("dory.rope.profile", GgufValue::Uint32(1)),
+        ];
+        let bytes = create_synthetic_gguf_v3_with_kvs("dory", 16, &kvs, &[]);
+        let gguf = GgufFile::parse(&bytes).expect("parse dory compact");
+        assert_eq!(
+            gguf.metadata()
+                .dory()
+                .expect("dory metadata")
+                .rope_profile(),
+            "profile_1"
+        );
+        let recipe = verify_model_capabilities(&gguf).expect("verify dory compact");
+        assert_eq!(recipe.architecture_id(), "dory");
+    }
+
+    #[test]
+    fn test_issue_120_mixed_quant_admission_phi3_llama_mistral() {
+        let mixed_quants = [
+            QuantType::Q4_0,
+            QuantType::Q4_K_M,
+            QuantType::Q5_K,
+            QuantType::Q6_K,
+            QuantType::Q8_0,
+        ];
+
+        for arch in ["phi3", "phi4", "llama", "mistral", "mistral3", "mixtral"] {
+            let recipe = RecipeRegistry::find_recipe(arch)
+                .unwrap_or_else(|| panic!("recipe registered for {arch}"));
+            for quant in mixed_quants {
+                assert!(
+                    recipe.supports_quant(quant),
+                    "expected {arch} recipe to admit mixed checkpoint quant {quant:?}"
+                );
+            }
+        }
+        for arch in ["phi3", "llama"] {
+            assert!(
+                RecipeRegistry::find_recipe(arch)
+                    .expect("recipe")
+                    .supports_quant(QuantType::Q5_0)
+            );
+        }
     }
 }

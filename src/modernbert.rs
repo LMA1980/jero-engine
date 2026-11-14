@@ -273,11 +273,17 @@ impl ArchRecipe for ModernBertRecipe {
             QuantType::F32
                 | QuantType::F16
                 | QuantType::BF16
+                | QuantType::Q4_0
+                | QuantType::Q4_1
+                | QuantType::Q5_0
+                | QuantType::Q5_1
                 | QuantType::Q8_0
+                | QuantType::Q2_K
+                | QuantType::Q3_K
                 | QuantType::Q4_K_M
                 | QuantType::Q5_K
                 | QuantType::Q6_K
-                | QuantType::Q4_0
+                | QuantType::IQ4_NL
         )
     }
 

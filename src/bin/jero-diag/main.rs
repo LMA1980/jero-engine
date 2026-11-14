@@ -15,7 +15,7 @@
     clippy::missing_errors_doc
 )]
 
-mod bench;
+pub mod bench;
 pub mod eval;
 pub mod parity;
 pub mod serve;
@@ -24,14 +24,17 @@ use eval::EvalSuite;
 
 use std::env;
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use jero_core::{CoordinationProfile, GgufFile, K3Error};
-use jero_engine::affinity::SplitStrategy;
+use jero_core::{CoordinationProfile, GgufFile, K3Error, ModelIdentity, QuantizationInfo};
+use jero_engine::affinity::{SplitStrategy, resolve_affinity_split};
+use jero_engine::forward::MatKernel;
+use jero_engine::memory::calculate_footprint;
 use jero_engine::{
     ClusterPhasePolicy, LockedModelWeights, SinglePromptEngine, SingleSlotKvArena, StreamAction,
-    SystemMemoryInspector, WorkerPool, resolve_affinity,
+    SystemMemoryInspector, WorkerPool, tokenize_prompt_utf8_safe,
 };
 use jero_tokenizer::{DetokenizeStep, GgufTokenizer};
 use serde::{Deserialize, Serialize};
@@ -114,6 +117,8 @@ pub struct DiagConfig {
     pub serve_openai: Option<String>,
     /// Optional request count ceiling after which `--serve-openai` exits cleanly.
     pub max_requests: Option<usize>,
+    /// Explicit synthetic in-memory hardware matrix calibration mode (`--synthetic-matrix`).
+    pub synthetic_matrix: bool,
     /// Path to export deterministic differential parity report JSON (`--dump-parity <path>`).
     pub dump_parity: Option<String>,
 }
@@ -144,6 +149,7 @@ impl Default for DiagConfig {
             recurrent_kv_mode: None,
             serve_openai: None,
             max_requests: None,
+            synthetic_matrix: false,
             dump_parity: None,
         }
     }
@@ -400,6 +406,9 @@ impl DiagConfig {
                     }
                     config.max_requests = Some(n);
                 }
+                "--synthetic-matrix" => {
+                    config.synthetic_matrix = true;
+                }
                 "--dump-parity" => {
                     let path = args.next().ok_or_else(|| {
                         "--dump-parity requires an output JSON file path".to_owned()
@@ -415,6 +424,14 @@ impl DiagConfig {
                     return Err(format!("unknown option '{unknown}'"));
                 }
             }
+        }
+
+        // Prevent silent or ambiguous mixing of real GGUF evaluation with synthetic hardware calibration.
+        if config.synthetic_matrix && config.model_path.is_some() {
+            return Err(
+                "--synthetic-matrix cannot be combined with --model; use --synthetic-matrix alone for hardware calibration or --model <path> for real GGUF execution"
+                    .to_owned(),
+            );
         }
 
         // Cluster-boundary rules (US-03): a mixed-cluster mask is allowed only through an
@@ -445,15 +462,22 @@ impl DiagConfig {
             || self.reference_baseline.is_some()
     }
 
-    /// Returns `true` when the matrix-forward benchmark / hardware ceiling profiling should run.
+    /// Returns `true` ONLY when explicit synthetic hardware matrix calibration (`--synthetic-matrix`) is requested.
     #[must_use]
-    pub fn is_matrix_benchmark(&self) -> bool {
-        self.split.is_some()
+    pub const fn is_matrix_benchmark(&self) -> bool {
+        self.synthetic_matrix
+    }
+
+    /// Returns `true` when real GGUF multi-run / placement / cost-profile benchmarking should run.
+    #[must_use]
+    pub fn is_multi_run_benchmark(&self) -> bool {
+        self.repeat.is_some()
+            || self.split.is_some()
             || self.ime.is_some()
             || self.cluster.as_deref() == Some("both")
             || self.export_profile.is_some()
             || self.summary
-            || (self.cluster.is_some() && self.json)
+            || self.json
             || (self.cluster.is_some() && self.core_mask.is_none())
     }
 }
@@ -528,9 +552,18 @@ pub struct StatisticsSummary {
     pub compute_utilization_ratio: MetricStats,
 }
 
-/// Machine-readable multi-run benchmark report exported via `--json` (US-02 R2, R3).
+/// Machine-readable multi-run real-GGUF benchmark report exported via `--json` (US-02, US-03, US-04).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MultiRunReport {
+    /// Execution mode discriminator (`"real_gguf"`).
+    pub execution_mode: String,
+    /// Model architecture read from GGUF metadata (e.g. `llama`, `bitnet`, `dory`, `synthetic`).
+    pub architecture: String,
+    /// Basename of the evaluated GGUF checkpoint file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_filename: Option<String>,
+    /// Concise summary of GGUF weight quantization types and counts.
+    pub quant_summary: String,
     pub coordination_profile: String,
     pub repeat_count: usize,
     pub threads: usize,
@@ -539,6 +572,9 @@ pub struct MultiRunReport {
     pub prompt: String,
     pub runs: Vec<RunMetric>,
     pub statistics: StatisticsSummary,
+    /// Flattened shared placement, ceiling, cost-profile, and determinism fields.
+    #[serde(flatten)]
+    pub telemetry: bench::BenchmarkTelemetry,
 }
 
 /// Maps domain [`K3Error`] variants to distinct process exit codes per US-01.7.1 and US-02.
@@ -578,13 +614,22 @@ fn print_usage() {
                --serve-openai <addr> Serve ephemeral OpenAI-compatible HTTP API (e.g. 127.0.0.1:0)\n  \
                --max-requests <n> Exit --serve-openai cleanly after handling N HTTP requests\n  \
                --summary          Emit human-readable summary table\n  \
+               --synthetic-matrix Run in-memory synthetic hardware matrix calibration (no --model)\n  \
            -h, --help             Show this help message\n  \
            -v, --version          Show version information"
     );
 }
 
-/// Executes multi-iteration evaluation pipeline for multi-core coordination & jitter measurement (US-02).
+/// Executes multi-iteration evaluation pipeline for real GGUF models with placement, ceiling,
+/// cost-profile, and determinism benchmarking (US-02, US-03, US-04).
 pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Result<(), K3Error> {
+    if config.synthetic_matrix {
+        return Err(bench::cap_err(
+            "cli",
+            "--synthetic-matrix cannot be routed through real-GGUF evaluation".to_owned(),
+        ));
+    }
+
     let model_path = config
         .model_path
         .as_deref()
@@ -594,8 +639,8 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
         })?;
     let prompt_text = config.prompt.as_deref().unwrap_or("hello world");
     let n_ctx = config.n_ctx.unwrap_or(64);
-    let max_tokens = config.max_tokens.unwrap_or(128);
-    let repeat_count = config.repeat.unwrap_or(3);
+    let repeat_count = config.repeat.unwrap_or(1);
+    let ime_on = config.ime == Some(true);
     let profile = config.coord.unwrap_or(if config.phase_policy.is_some() {
         CoordinationProfile::Rayon
     } else {
@@ -605,6 +650,9 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
     let inspector = SystemMemoryInspector::new();
     let (
         worker_pool,
+        affinity,
+        ime_supported,
+        before,
         locked_weights,
         recipe,
         tokenizer_vocab_size,
@@ -617,7 +665,7 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
             LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
         let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
         let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
-        let prompt_tokens = tokenizer.tokenize_prompt(prompt_text, true, n_ctx)?;
+        let prompt_tokens = tokenize_prompt_utf8_safe(&tokenizer, prompt_text, true, n_ctx)?;
         let worker_pool = WorkerPool::for_phase_policy(
             policy,
             locked_weights.metadata(),
@@ -626,13 +674,18 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
             config.threads,
             profile,
         )?;
-        worker_pool.verify_live_affinities()?;
-        let effective_core_mask = format!("0x{:04X}", worker_pool.affinity().effective_mask);
+        let before = worker_pool.verify_live_affinities()?;
+        let affinity = worker_pool.affinity().clone();
+        let ime_supported = bench::probe_cluster_ime(&affinity, config.cluster.as_deref(), ime_on)?;
+        let effective_core_mask = format!("0x{:04X}", affinity.effective_mask);
         let thread_count = worker_pool.thread_count();
         let resolved_policy = worker_pool.phase_policy().unwrap_or(policy);
         let engine = SinglePromptEngine::new().with_phase_policy(resolved_policy);
         (
             worker_pool,
+            affinity,
+            ime_supported,
+            before,
             locked_weights,
             recipe,
             tokenizer.vocab_size(),
@@ -642,14 +695,20 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
             engine,
         )
     } else {
-        // 1. Resolve cluster & core affinity and spawn pinned worker pool with selected coordination profile
-        let resolved_affinity =
-            resolve_affinity(config.cluster.as_deref(), config.core_mask, config.threads)?;
+        // 1. Resolve cluster/split/core affinity and spawn pinned worker pool
+        let resolved_affinity = resolve_affinity_split(
+            config.cluster.as_deref(),
+            config.split.as_ref().map(SplitStrategy::as_str),
+            config.core_mask,
+            config.threads,
+        )?;
         let effective_core_mask = format!("0x{:04X}", resolved_affinity.effective_mask);
         let thread_count = resolved_affinity.threads;
 
-        let worker_pool = WorkerPool::with_coordination(resolved_affinity, profile)?;
-        worker_pool.verify_live_affinities()?;
+        let worker_pool = WorkerPool::with_coordination(resolved_affinity.clone(), profile)?;
+        let before = worker_pool.verify_live_affinities()?;
+        let ime_supported =
+            bench::probe_cluster_ime(&resolved_affinity, config.cluster.as_deref(), ime_on)?;
 
         // 2. Open model with flock(LOCK_SH), GGUF parse, capability filter, pre-flight RAM admission, and mlock
         let (locked_weights, recipe, _footprint) =
@@ -658,115 +717,202 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
         // 3. Extract GGUF vocabulary/template and tokenize prompt in-process
         let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
         let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
-        let prompt_tokens = tokenizer.tokenize_prompt(prompt_text, true, n_ctx)?;
+        let prompt_tokens = tokenize_prompt_utf8_safe(&tokenizer, prompt_text, true, n_ctx)?;
+        let phase_policy = match config.split {
+            Some(SplitStrategy::Row) => ClusterPhasePolicy::RowSplit,
+            _ => ClusterPhasePolicy::Auto,
+        };
         (
             worker_pool,
+            resolved_affinity,
+            ime_supported,
+            before,
             locked_weights,
             recipe,
             tokenizer.vocab_size(),
             prompt_tokens,
             effective_core_mask,
             thread_count,
-            SinglePromptEngine::new(),
+            SinglePromptEngine::new().with_phase_policy(phase_policy),
         )
     };
 
+    let max_tokens = config
+        .max_tokens
+        .unwrap_or(128)
+        .min(n_ctx.saturating_sub(prompt_tokens.len()));
     let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
 
-    // 4. Multi-Run Execution Loop
-    let mut run_metrics: Vec<RunMetric> = Vec::with_capacity(repeat_count);
-    let mut all_tokens: Vec<Vec<u32>> = Vec::with_capacity(repeat_count);
-
-    for run_idx in 0..repeat_count {
-        if is_abort_requested() {
-            break;
-        }
-
-        let mut kv_arena = SingleSlotKvArena::from_gguf(&gguf_view, n_ctx)?;
-        let summary = engine.evaluate_prompt_with_pool(
-            recipe.as_ref(),
-            &locked_weights,
-            &mut kv_arena,
-            Some(&worker_pool),
-            &prompt_tokens,
-            tokenizer_vocab_size,
-            max_tokens,
-            |_tok| {
-                if is_abort_requested() {
-                    Ok(StreamAction::Stop)
-                } else {
-                    Ok(StreamAction::Continue)
-                }
-            },
-        )?;
-
-        let run_metric = RunMetric {
-            run_index: run_idx,
-            ttft_ms: summary.timing.ttft_ms,
-            prefill_ms: summary.timing.prefill_ms,
-            decode_ms: summary.timing.decode_ms,
-            decode_tokens_per_sec: summary.timing.decode_tokens_per_sec,
-            total_wall_time_ms: summary.timing.total_wall_time_ms,
-            cumulative_barrier_wait_ms: summary.timing.cumulative_barrier_wait_ms,
-            barrier_wait_ratio: summary.timing.barrier_wait_ratio,
-            compute_utilization_ratio: summary.timing.compute_utilization_ratio,
-            tokens: Some(summary.generated_tokens.clone()),
-        };
-
-        all_tokens.push(summary.generated_tokens);
-        run_metrics.push(run_metric);
-    }
-
-    // 5. Re-verify worker affinities post-execution to guarantee zero cross-cluster migration
-    worker_pool.verify_live_affinities()?;
-
-    // 6. Assert Output Determinism: Bit-identical tokens across repeat runs at temp 0
-    let mut determinism_verified = true;
-    if all_tokens.len() >= 2 {
-        for i in 1..all_tokens.len() {
-            if all_tokens[i] != all_tokens[0] {
-                determinism_verified = false;
+    let run_gguf_arm = |engine: &mut SinglePromptEngine,
+                        fault: Option<usize>|
+     -> Result<Vec<bench::ArmSample>, K3Error> {
+        let mut samples = Vec::with_capacity(repeat_count);
+        for run_idx in 0..repeat_count {
+            if is_abort_requested() {
                 break;
             }
+            let mut kv_arena = SingleSlotKvArena::from_gguf(&gguf_view, n_ctx)?;
+            let mut summary = engine.evaluate_prompt_with_pool(
+                recipe.as_ref(),
+                &locked_weights,
+                &mut kv_arena,
+                Some(&worker_pool),
+                &prompt_tokens,
+                tokenizer_vocab_size,
+                max_tokens,
+                |_tok| {
+                    if is_abort_requested() {
+                        Ok(StreamAction::Stop)
+                    } else {
+                        Ok(StreamAction::Continue)
+                    }
+                },
+            )?;
+            bench::inject_fault_if_requested(
+                fault,
+                run_idx,
+                tokenizer_vocab_size,
+                &mut summary.generated_tokens,
+            );
+            samples.push(bench::ArmSample {
+                prompt_tokens: summary.prompt_tokens,
+                timing: summary.timing,
+                generated_tokens: summary.generated_tokens,
+                vmadot_issued: 0,
+            });
         }
-    }
-
-    // 7. Calculate Descriptive Statistics
-    let ttft_samples: Vec<f64> = run_metrics.iter().map(|r| r.ttft_ms).collect();
-    let throughput_samples: Vec<f64> = run_metrics
-        .iter()
-        .map(|r| r.decode_tokens_per_sec)
-        .collect();
-    let barrier_samples: Vec<f64> = run_metrics
-        .iter()
-        .map(|r| r.cumulative_barrier_wait_ms)
-        .collect();
-    let wall_time_samples: Vec<f64> = run_metrics.iter().map(|r| r.total_wall_time_ms).collect();
-    let util_samples: Vec<f64> = run_metrics
-        .iter()
-        .map(|r| r.compute_utilization_ratio)
-        .collect();
-
-    let statistics = StatisticsSummary {
-        ttft_ms: MetricStats::calculate(&ttft_samples),
-        decode_tokens_per_sec: MetricStats::calculate(&throughput_samples),
-        cumulative_barrier_wait_ms: MetricStats::calculate(&barrier_samples),
-        total_wall_time_ms: MetricStats::calculate(&wall_time_samples),
-        compute_utilization_ratio: MetricStats::calculate(&util_samples),
+        Ok(samples)
     };
 
-    // 8. Output Formatting: JSON or Table
+    // 4. Multi-Run Execution Loop via SinglePromptEngine (and IME-off baseline when IME is on)
+    let primary_kernel = if ime_on {
+        MatKernel::Ime
+    } else {
+        MatKernel::Vector
+    };
+    let primary_samples = run_gguf_arm(&mut engine, bench::fault_index())?;
+    let baseline_samples = if ime_on {
+        Some((MatKernel::Vector, run_gguf_arm(&mut engine, None)?))
+    } else {
+        None
+    };
+
+    // 5. Re-verify worker affinities post-execution to guarantee zero cross-cluster migration
+    let after = worker_pool.verify_live_affinities()?;
+    let (plan, row_split) =
+        bench::build_plan(&worker_pool, &affinity, primary_kernel, config.phase_policy)?;
+    let observed_all_cores = after
+        .iter()
+        .filter(|w| w.assigned_core < 64)
+        .fold(0_u64, |m, w| m | (1_u64 << w.assigned_core));
+    if (observed_all_cores & !affinity.effective_mask) != 0 {
+        return Err(K3Error::AffinityError {
+            requested_mask: affinity.effective_mask,
+            requested_threads: affinity.threads,
+            reason: format!(
+                "worker executed outside allowed affinity mask (observed 0x{observed_all_cores:04X} vs 0x{:04X})",
+                affinity.effective_mask
+            ),
+        });
+    }
+    let (expected_matmul, expected_vector) = bench::expected_phase_masks(&plan);
+    let observed_matmul = observed_all_cores & expected_matmul;
+    let observed_vector = observed_all_cores & expected_vector;
+    bench::verify_cluster_masks(&affinity, &plan, observed_matmul, observed_vector)?;
+
+    // 6. Real GGUF model metadata, memory footprint & compute/bandwidth cost-profile telemetry
+    let footprint = calculate_footprint(locked_weights.metadata(), n_ctx)?;
+    let total_weight_elems: u64 = locked_weights
+        .metadata()
+        .tensors()
+        .iter()
+        .map(|t| (t.num_elements() as u64).max(1))
+        .sum();
+    let macs_per_token = total_weight_elems.max(footprint.weight_bytes).max(1);
+    let prefill_macs = (prompt_tokens.len() as u64).saturating_mul(macs_per_token);
+    let decode_weight_bytes_per_token = footprint.weight_bytes.max(1);
+
+    let seed = locked_weights
+        .as_bytes()
+        .iter()
+        .take(1 << 20)
+        .fold(0xCBF2_9CE4_8422_2325_u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
+        });
+    let model_name = gguf_view
+        .metadata_value("general.name")
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            Path::new(model_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_owned()
+        });
+    let model_filename = Path::new(model_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(model_path)
+        .to_owned();
+    let architecture = gguf_view.architecture().to_owned();
+    let model_identity = ModelIdentity {
+        name: model_name,
+        architecture: architecture.clone(),
+        file_path: model_path.to_owned(),
+        file_digest: format!("{seed:016x}"),
+    };
+    let quantization_level =
+        QuantizationInfo::from_descriptors(locked_weights.metadata().tensors());
+    let quant_summary = bench::quant_summary_from_info(&quantization_level);
+
+    let (telemetry, run_metrics, statistics) =
+        bench::build_telemetry_and_stats(bench::TelemetryInputs {
+            config,
+            pool: &worker_pool,
+            affinity: &affinity,
+            profile,
+            prompt_tokens: &prompt_tokens,
+            plan: &plan,
+            row_split,
+            kernel: primary_kernel,
+            ime_supported,
+            observed_matmul,
+            observed_vector,
+            before: &before,
+            after: &after,
+            primary_samples: &primary_samples,
+            baseline_samples,
+            prefill_macs,
+            decode_weight_bytes_per_token,
+            weight_bytes: footprint.weight_bytes,
+            kv_bytes: footprint.kv_bytes,
+            total_required_bytes: footprint.total_required_bytes,
+            model_identity,
+            quantization_level,
+        })?;
+
+    let determinism_verified = telemetry.determinism.verified;
+    let first_divergent = telemetry.determinism.first_divergent_run;
+
+    let report = MultiRunReport {
+        execution_mode: "real_gguf".to_owned(),
+        architecture,
+        model_filename: Some(model_filename),
+        quant_summary,
+        coordination_profile: profile.as_str().to_owned(),
+        repeat_count: run_metrics.len(),
+        threads: thread_count,
+        effective_core_mask,
+        determinism_verified,
+        prompt: prompt_text.to_owned(),
+        runs: run_metrics,
+        statistics,
+        telemetry,
+    };
+
+    // 7. Output Formatting: JSON or unified human-readable table
     if config.json {
-        let report = MultiRunReport {
-            coordination_profile: profile.as_str().to_owned(),
-            repeat_count: run_metrics.len(),
-            threads: thread_count,
-            effective_core_mask,
-            determinism_verified,
-            prompt: prompt_text.to_owned(),
-            runs: run_metrics,
-            statistics,
-        };
         let json_str =
             serde_json::to_string_pretty(&report).map_err(|e| K3Error::CapabilityMismatch {
                 architecture: "json".to_owned(),
@@ -774,106 +920,35 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
             })?;
         let _ = writeln!(out, "{json_str}");
     } else {
-        let _ = writeln!(
-            out,
-            "=========================================================="
-        );
-        let _ = writeln!(
-            out,
-            " k3-diag: Multi-Core Synchronization & Jitter Benchmark"
-        );
-        let _ = writeln!(
-            out,
-            "=========================================================="
-        );
-        let _ = writeln!(out, "Coordination Profile : {}", profile.as_str());
-        let _ = writeln!(out, "Repeat Iterations    : {}", run_metrics.len());
-        let _ = writeln!(out, "Worker Threads       : {thread_count}");
-        let _ = writeln!(out, "Effective Core Mask  : {effective_core_mask}");
-        let _ = writeln!(
-            out,
-            "Output Determinism   : {}",
-            if determinism_verified {
-                "verified (bit-identical across all runs at temp 0)"
-            } else {
-                "MISMATCH"
-            }
-        );
-        let _ = writeln!(
-            out,
-            "----------------------------------------------------------"
-        );
-        let _ = writeln!(out, "Iteration Breakdown:");
-        let _ = writeln!(
-            out,
-            "  Run | TTFT (ms) | Decode (tokens/s) | Barrier Wait (ms) | Total Wall (ms)"
-        );
-        for r in &run_metrics {
-            let _ = writeln!(
-                out,
-                "  {:3} | {:9.2} | {:17.2} | {:17.2} | {:15.2}",
-                r.run_index + 1,
-                r.ttft_ms,
-                r.decode_tokens_per_sec,
-                r.cumulative_barrier_wait_ms,
-                r.total_wall_time_ms
-            );
-        }
-        let _ = writeln!(
-            out,
-            "----------------------------------------------------------"
-        );
-        let _ = writeln!(out, "Statistical Jitter Summary (Mean, Min, Max, StdDev):");
-        let _ = writeln!(
-            out,
-            "  Metric                      |      Mean |       Min |       Max |    StdDev"
-        );
-        let _ = writeln!(
-            out,
-            "  TTFT (Time to First Token)  | {:9.2} | {:9.2} | {:9.2} | {:9.2}",
-            statistics.ttft_ms.mean,
-            statistics.ttft_ms.min,
-            statistics.ttft_ms.max,
-            statistics.ttft_ms.stddev
-        );
-        let _ = writeln!(
-            out,
-            "  Decode Throughput (tokens/s)| {:9.2} | {:9.2} | {:9.2} | {:9.2}",
-            statistics.decode_tokens_per_sec.mean,
-            statistics.decode_tokens_per_sec.min,
-            statistics.decode_tokens_per_sec.max,
-            statistics.decode_tokens_per_sec.stddev
-        );
-        let _ = writeln!(
-            out,
-            "  Barrier Wait Overhead (ms)  | {:9.2} | {:9.2} | {:9.2} | {:9.2}",
-            statistics.cumulative_barrier_wait_ms.mean,
-            statistics.cumulative_barrier_wait_ms.min,
-            statistics.cumulative_barrier_wait_ms.max,
-            statistics.cumulative_barrier_wait_ms.stddev
-        );
-        let _ = writeln!(
-            out,
-            "  Total Wall Time (ms)        | {:9.2} | {:9.2} | {:9.2} | {:9.2}",
-            statistics.total_wall_time_ms.mean,
-            statistics.total_wall_time_ms.min,
-            statistics.total_wall_time_ms.max,
-            statistics.total_wall_time_ms.stddev
-        );
-        let _ = writeln!(
-            out,
-            "  Compute Utilization Ratio   | {:9.4} | {:9.4} | {:9.4} | {:9.4}",
-            statistics.compute_utilization_ratio.mean,
-            statistics.compute_utilization_ratio.min,
-            statistics.compute_utilization_ratio.max,
-            statistics.compute_utilization_ratio.stddev
-        );
-        let _ = writeln!(
-            out,
-            "=========================================================="
+        bench::write_benchmark_table(
+            &mut out,
+            bench::TableHeader {
+                execution_mode: &report.execution_mode,
+                architecture: &report.architecture,
+                model_filename: report.model_filename.as_deref(),
+                quant_summary: &report.quant_summary,
+                coordination_profile: &report.coordination_profile,
+                repeat_count: report.repeat_count,
+                threads: report.threads,
+                effective_core_mask: &report.effective_core_mask,
+                determinism_verified: report.determinism_verified,
+            },
+            &report.runs,
+            &report.statistics,
+            &report.telemetry,
         );
     }
     let _ = out.flush();
+
+    if let Some(run) = first_divergent {
+        return Err(bench::cap_err(
+            "determinism",
+            format!(
+                "determinism violation: run {} produced a different token sequence than run 0 at temperature 0 (repeat {repeat_count})",
+                run + 1
+            ),
+        ));
+    }
 
     Ok(())
 }
@@ -897,48 +972,61 @@ pub fn run_single_eval_session<W: Write>(config: &DiagConfig, mut out: W) -> Res
     });
 
     let inspector = SystemMemoryInspector::new();
-    let (worker_pool, locked_weights, recipe, mut engine) =
-        if let Some(policy) = config.phase_policy {
-            let (locked_weights, recipe, _footprint) =
-                LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
-            let gguf_probe = GgufFile::parse(locked_weights.as_bytes())?;
-            let tokenizer_probe = GgufTokenizer::from_gguf(&gguf_probe)?;
-            let probe_tokens = tokenizer_probe.tokenize_prompt(prompt_text, true, n_ctx)?;
-            let worker_pool = WorkerPool::for_phase_policy(
-                policy,
-                locked_weights.metadata(),
-                probe_tokens.len(),
-                config.core_mask,
-                config.threads,
-                profile,
-            )?;
-            worker_pool.verify_live_affinities()?;
-            let resolved_policy = worker_pool.phase_policy().unwrap_or(policy);
-            let engine = SinglePromptEngine::new().with_phase_policy(resolved_policy);
-            (worker_pool, locked_weights, recipe, engine)
-        } else {
-            // 1. Resolve cluster & core affinity and spawn pinned worker pool (US-01.5, Scenario 2)
-            let resolved_affinity =
-                resolve_affinity(config.cluster.as_deref(), config.core_mask, config.threads)?;
-            let worker_pool = WorkerPool::with_coordination(resolved_affinity, profile)?;
-            worker_pool.verify_live_affinities()?;
+    let ime_on = config.ime == Some(true);
+    let (worker_pool, locked_weights, recipe, mut engine) = if let Some(policy) =
+        config.phase_policy
+    {
+        let (locked_weights, recipe, _footprint) =
+            LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
+        let gguf_probe = GgufFile::parse(locked_weights.as_bytes())?;
+        let tokenizer_probe = GgufTokenizer::from_gguf(&gguf_probe)?;
+        let probe_tokens = tokenize_prompt_utf8_safe(&tokenizer_probe, prompt_text, true, n_ctx)?;
+        let worker_pool = WorkerPool::for_phase_policy(
+            policy,
+            locked_weights.metadata(),
+            probe_tokens.len(),
+            config.core_mask,
+            config.threads,
+            profile,
+        )?;
+        worker_pool.verify_live_affinities()?;
+        let _ =
+            bench::probe_cluster_ime(worker_pool.affinity(), config.cluster.as_deref(), ime_on)?;
+        let resolved_policy = worker_pool.phase_policy().unwrap_or(policy);
+        let engine = SinglePromptEngine::new().with_phase_policy(resolved_policy);
+        (worker_pool, locked_weights, recipe, engine)
+    } else {
+        // 1. Resolve cluster, split & core affinity and spawn pinned worker pool (US-01.5, US-03)
+        let resolved_affinity = resolve_affinity_split(
+            config.cluster.as_deref(),
+            config.split.as_ref().map(SplitStrategy::as_str),
+            config.core_mask,
+            config.threads,
+        )?;
+        let worker_pool = WorkerPool::with_coordination(resolved_affinity.clone(), profile)?;
+        worker_pool.verify_live_affinities()?;
+        let _ = bench::probe_cluster_ime(&resolved_affinity, config.cluster.as_deref(), ime_on)?;
 
-            // 2. Open model with flock(LOCK_SH), GGUF parse, capability filter, pre-flight RAM admission, and mlock (US-01.2, US-01.3, Scenario 1 & 3)
-            let (locked_weights, recipe, _footprint) =
-                LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
-            (
-                worker_pool,
-                locked_weights,
-                recipe,
-                SinglePromptEngine::new(),
-            )
+        // 2. Open model with flock(LOCK_SH), GGUF parse, capability filter, pre-flight RAM admission, and mlock (US-01.2, US-01.3, Scenario 1 & 3)
+        let (locked_weights, recipe, _footprint) =
+            LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
+        let phase_policy = match config.split {
+            Some(SplitStrategy::Row) => ClusterPhasePolicy::RowSplit,
+            _ => ClusterPhasePolicy::Auto,
         };
+        (
+            worker_pool,
+            locked_weights,
+            recipe,
+            SinglePromptEngine::new().with_phase_policy(phase_policy),
+        )
+    };
 
     // 3. Extract GGUF view/vocabulary/template, allocate 16-token paged KV cache arena, and tokenize prompt in-process
     let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
     let mut kv_arena = SingleSlotKvArena::from_gguf(&gguf_view, n_ctx)?;
     let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
-    let prompt_tokens = tokenizer.tokenize_prompt(prompt_text, true, n_ctx)?;
+    let prompt_tokens = tokenize_prompt_utf8_safe(&tokenizer, prompt_text, true, n_ctx)?;
 
     // 5. Execute isolated single-prompt forward pass and stream tokens unbuffered (US-01.6, US-01.7.2)
     let mut detokenizer = tokenizer.streaming_detokenizer();
@@ -995,8 +1083,8 @@ pub fn run_single_eval_session<W: Write>(config: &DiagConfig, mut out: W) -> Res
 
 /// Executes diagnostic session dispatcher: routes to differential parity exporter if
 /// `--dump-parity` is specified, ephemeral OpenAI HTTP server if `--serve-openai` is specified,
-/// open-source capability benchmark if `--eval-suite` is specified, matrix-forward benchmark,
-/// multi-run benchmark if `--repeat` is specified, or single-eval streaming pipeline.
+/// open-source capability benchmark if `--eval-suite` is specified, synthetic matrix calibration if
+/// `--synthetic-matrix` is specified, multi-run/placement GGUF benchmarking, or single-eval streaming.
 pub fn run_diagnostic_session<W: Write>(config: &DiagConfig, out: W) -> Result<(), K3Error> {
     if config.dump_parity.is_some() {
         let _ = parity::run_parity_dump(config, out)?;
@@ -1007,7 +1095,7 @@ pub fn run_diagnostic_session<W: Write>(config: &DiagConfig, out: W) -> Result<(
         eval::run_public_eval_benchmark(config, out)
     } else if config.is_matrix_benchmark() {
         bench::run_matrix_benchmark(config, out)
-    } else if config.repeat.is_some() {
+    } else if config.is_multi_run_benchmark() {
         run_multi_run_benchmark(config, out)
     } else {
         run_single_eval_session(config, out)
@@ -1028,8 +1116,8 @@ fn main() -> ExitCode {
         }
     };
 
-    if config.model_path.is_none() {
-        eprintln!("[error] missing required argument: --model <path>");
+    if !config.synthetic_matrix && config.model_path.is_none() {
+        eprintln!("[error] missing required argument: --model <path> (or --synthetic-matrix)");
         eprintln!("Run 'k3-diag --help' for usage instructions.");
         return ExitCode::from(2);
     }
@@ -1221,6 +1309,7 @@ mod tests {
             recurrent_kv_mode: None,
             serve_openai: None,
             max_requests: None,
+            synthetic_matrix: false,
             dump_parity: None,
         };
 
@@ -1271,6 +1360,7 @@ mod tests {
             recurrent_kv_mode: None,
             serve_openai: None,
             max_requests: None,
+            synthetic_matrix: false,
             dump_parity: None,
         };
 
@@ -1280,6 +1370,10 @@ mod tests {
         let report: MultiRunReport =
             serde_json::from_str(&output_str).expect("parse multi-run report JSON");
 
+        assert_eq!(report.execution_mode, "real_gguf");
+        assert_eq!(report.architecture, "synthetic");
+        assert!(report.model_filename.is_some());
+        assert!(report.quant_summary.contains("Q4_K_M"));
         assert_eq!(report.coordination_profile, "spin");
         assert_eq!(report.repeat_count, 3);
         assert_eq!(report.threads, 1);
@@ -1288,6 +1382,193 @@ mod tests {
         assert!(report.statistics.ttft_ms.mean >= 0.0);
 
         let _ = std::fs::remove_file(&temp_path);
+    }
+
+    #[test]
+    fn test_parse_synthetic_matrix_and_real_gguf_routing_separation() {
+        // 1. Hardware flags with --model MUST NOT trigger synthetic matrix calibration.
+        let real_args = vec![
+            "k3-diag".to_owned(),
+            "--model".to_owned(),
+            "foo.gguf".to_owned(),
+            "--cluster".to_owned(),
+            "both".to_owned(),
+            "--split".to_owned(),
+            "phase".to_owned(),
+            "--ime".to_owned(),
+            "on".to_owned(),
+            "--json".to_owned(),
+        ];
+        let real_cfg = DiagConfig::parse_args(real_args.into_iter())
+            .expect("real gguf flags with topology parse cleanly")
+            .expect("config present");
+        assert!(!real_cfg.synthetic_matrix);
+        assert!(!real_cfg.is_matrix_benchmark());
+        assert!(real_cfg.is_multi_run_benchmark());
+
+        // 2. Explicit --synthetic-matrix routes cleanly to matrix calibration without --model.
+        let syn_args = vec![
+            "k3-diag".to_owned(),
+            "--synthetic-matrix".to_owned(),
+            "--cluster".to_owned(),
+            "both".to_owned(),
+            "--split".to_owned(),
+            "phase".to_owned(),
+            "--ime".to_owned(),
+            "on".to_owned(),
+            "--json".to_owned(),
+        ];
+        let syn_cfg = DiagConfig::parse_args(syn_args.into_iter())
+            .expect("--synthetic-matrix parses cleanly without --model")
+            .expect("config present");
+        assert!(syn_cfg.synthetic_matrix);
+        assert!(syn_cfg.is_matrix_benchmark());
+        assert!(syn_cfg.model_path.is_none());
+
+        // 3. Reject conflicting --model + --synthetic-matrix.
+        let conflict_args = vec![
+            "k3-diag".to_owned(),
+            "--model".to_owned(),
+            "foo.gguf".to_owned(),
+            "--synthetic-matrix".to_owned(),
+        ];
+        let err = DiagConfig::parse_args(conflict_args.into_iter())
+            .expect_err("must reject ambiguous --model + --synthetic-matrix");
+        assert!(err.contains("--synthetic-matrix"));
+        assert!(err.contains("--model"));
+    }
+
+    #[test]
+    fn test_real_gguf_vs_synthetic_matrix_provenance_json_and_headers() {
+        use jero_core::GgufValue;
+        use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
+
+        // Real GGUF checkpoint execution routes through LlamaRecipe + SinglePromptEngine and
+        // emits execution_mode = "real_gguf" in JSON & headers.
+        let extra_kvs = [
+            ("llama.block_count", GgufValue::Uint32(1)),
+            ("llama.embedding_length", GgufValue::Uint32(4)),
+            ("llama.attention.head_count", GgufValue::Uint32(1)),
+            ("llama.attention.head_count_kv", GgufValue::Uint32(1)),
+            ("llama.feed_forward_length", GgufValue::Uint32(8)),
+        ];
+        let tensor_specs = [
+            ("token_embd.weight", QuantType::F32, &[4, 16][..]),
+            ("blk.0.attn_norm.weight", QuantType::F32, &[4][..]),
+            ("blk.0.attn_q.weight", QuantType::F32, &[4, 4][..]),
+            ("blk.0.attn_k.weight", QuantType::F32, &[4, 4][..]),
+            ("blk.0.attn_v.weight", QuantType::F32, &[4, 4][..]),
+            ("blk.0.attn_output.weight", QuantType::F32, &[4, 4][..]),
+            ("blk.0.ffn_norm.weight", QuantType::F32, &[4][..]),
+            ("blk.0.ffn_gate.weight", QuantType::F32, &[4, 8][..]),
+            ("blk.0.ffn_up.weight", QuantType::F32, &[4, 8][..]),
+            ("blk.0.ffn_down.weight", QuantType::F32, &[8, 4][..]),
+            ("output_norm.weight", QuantType::F32, &[4][..]),
+            ("output.weight", QuantType::F32, &[4, 16][..]),
+        ];
+        let bytes = create_synthetic_gguf_v3_with_kvs("llama", 32, &extra_kvs, &tensor_specs);
+        let temp_path = env::temp_dir().join(format!(
+            "k3_diag_provenance_llama_{}.gguf",
+            std::process::id()
+        ));
+        {
+            let mut f = File::create(&temp_path).expect("create temp gguf");
+            f.write_all(&bytes).expect("write gguf");
+            f.sync_all().expect("sync gguf");
+        }
+
+        let path_str = temp_path.to_string_lossy().into_owned();
+        let json_cfg = DiagConfig::parse_args(
+            [
+                "k3-diag",
+                "--model",
+                &path_str,
+                "--cluster",
+                "x100",
+                "--cores",
+                "0x0001",
+                "--ime",
+                "off",
+                "--max-tokens",
+                "2",
+                "--json",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!json_cfg.is_matrix_benchmark());
+        assert!(json_cfg.is_multi_run_benchmark());
+
+        let mut json_buf = Vec::new();
+        run_diagnostic_session(&json_cfg, &mut json_buf).expect("real gguf json session");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&json_buf).expect("valid JSON output");
+        assert_eq!(parsed["execution_mode"].as_str(), Some("real_gguf"));
+        assert_eq!(parsed["architecture"].as_str(), Some("llama"));
+        assert!(
+            parsed["model_filename"]
+                .as_str()
+                .is_some_and(|s| s.contains("k3_diag_provenance_llama_"))
+        );
+        assert!(
+            parsed["quant_summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("F32"))
+        );
+
+        let mut text_cfg = json_cfg.clone();
+        text_cfg.json = false;
+        text_cfg.summary = true;
+        let mut text_buf = Vec::new();
+        run_diagnostic_session(&text_cfg, &mut text_buf).expect("real gguf table session");
+        let text_out = String::from_utf8(text_buf).expect("utf8 table");
+        assert!(text_out.contains("Execution Mode       : real_gguf"));
+        assert!(text_out.contains("Architecture         : llama"));
+        assert!(text_out.contains("Model File           : k3_diag_provenance_llama_"));
+        assert!(text_out.contains("Quant Summary        : F32"));
+
+        let _ = std::fs::remove_file(&temp_path);
+
+        // Synthetic matrix mode without --model emits execution_mode = "synthetic_matrix".
+        let syn_json_cfg = DiagConfig::parse_args(
+            [
+                "k3-diag",
+                "--synthetic-matrix",
+                "--cluster",
+                "x100",
+                "--cores",
+                "0x0001",
+                "--max-tokens",
+                "2",
+                "--json",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(syn_json_cfg.is_matrix_benchmark());
+
+        let mut syn_buf = Vec::new();
+        run_diagnostic_session(&syn_json_cfg, &mut syn_buf).expect("synthetic matrix json session");
+        let syn_report: bench::MatrixBenchReport =
+            serde_json::from_slice(&syn_buf).expect("parse MatrixBenchReport");
+        assert_eq!(syn_report.execution_mode, "synthetic_matrix");
+        assert_eq!(syn_report.architecture, "synthetic");
+        assert!(syn_report.model_filename.is_none());
+        assert_eq!(syn_report.quant_summary, bench::SYNTHETIC_QUANT_SUMMARY);
+
+        let mut syn_text_cfg = syn_json_cfg;
+        syn_text_cfg.json = false;
+        let mut syn_text_buf = Vec::new();
+        run_diagnostic_session(&syn_text_cfg, &mut syn_text_buf)
+            .expect("synthetic matrix table session");
+        let syn_text = String::from_utf8(syn_text_buf).expect("utf8 synthetic table");
+        assert!(syn_text.contains("Execution Mode       : synthetic_matrix"));
+        assert!(syn_text.contains("Architecture         : synthetic"));
+        assert!(!syn_text.contains("Model File           :"));
     }
 
     #[test]
