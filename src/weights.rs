@@ -12,7 +12,6 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-#[cfg(feature = "jero-kernels-rvv")]
 use jero_core::QuantType;
 use jero_core::ipc::shm::DEFAULT_LIMIT_MEMLOCK_BYTES;
 use jero_core::{
@@ -23,8 +22,6 @@ use jero_kernels_rvv::repack::{
     Aligned128, BlockScaledTileLayout, PackedNibbleMatrix, RepackedWeight, repack_into_tile_range,
     repack_nibble_into_tile_range,
 };
-#[cfg(feature = "jero-kernels-rvv")]
-use rayon::prelude::*;
 
 use crate::affinity::WorkerPool;
 use crate::capability::verify_model_capabilities;
@@ -87,6 +84,7 @@ pub(crate) fn matrix_dims_for_repack(shape: &[usize], quant: QuantType) -> Optio
 }
 
 /// Returns whether a tensor descriptor should be included in model repack estimation/preparation.
+#[cfg(feature = "jero-kernels-rvv")]
 #[must_use]
 pub(crate) fn is_repackable_tensor_spec(name: &str, shape: &[usize], quant: QuantType) -> bool {
     if shape.len() != 2 {
@@ -890,20 +888,18 @@ fn is_repackable_matrix_descriptor(desc: &TensorDescriptor) -> bool {
 }
 
 #[cfg(feature = "jero-kernels-rvv")]
-fn run_on_pool<OP, R>(pool: Option<&WorkerPool>, op: OP) -> R
+fn try_for_each_work<W, F>(pool: Option<&WorkerPool>, work: &mut [W], f: F) -> Result<(), K3Error>
 where
-    OP: FnOnce() -> R + Send,
-    R: Send,
+    W: Send,
+    F: Fn(&mut W) -> Result<(), K3Error> + Sync,
 {
-    match pool {
-        Some(p) => {
-            if let Some(a100) = p.a100_pool() {
-                a100.install(op)
-            } else {
-                p.install(op)
-            }
+    let target_pool = pool.map(|p| p.a100_pool().unwrap_or(p));
+    match target_pool {
+        Some(p) if p.thread_count() > 1 && work.len() > 1 => {
+            p.try_par_chunks_mut(work, 1, |_, chunk| f(&mut chunk[0]))
         }
-        None => op(),
+        Some(p) => p.install(|| work.iter_mut().try_for_each(&f)),
+        None => work.iter_mut().try_for_each(&f),
     }
 }
 
@@ -977,7 +973,7 @@ fn repack_nibble_scale_f16_parallel(
     let mut nibble_tiles = vec![Aligned128::zeroed(); n_tiles * k_blocks32];
     let mut scales_f16 = vec![0_u16; n_tiles * k_blocks32 * TILE_N];
 
-    let work: Vec<(usize, usize, &mut [Aligned128], &mut [u16])> = nibble_tiles
+    let mut work: Vec<(usize, usize, &mut [Aligned128], &mut [u16])> = nibble_tiles
         .chunks_mut(chunk_tiles * k_blocks32)
         .zip(scales_f16.chunks_mut(chunk_tiles * k_blocks32 * TILE_N))
         .enumerate()
@@ -988,20 +984,8 @@ fn repack_nibble_scale_f16_parallel(
         })
         .collect();
 
-    run_on_pool(pool, || {
-        work.into_par_iter()
-            .try_for_each(|(t0, t1, tile_sub, scale_sub)| {
-                repack_nibble_into_tile_range(
-                    view,
-                    rows,
-                    cols,
-                    t0..t1,
-                    tile_sub,
-                    scale_sub,
-                    None,
-                    None,
-                )
-            })
+    try_for_each_work(pool, &mut work, |(t0, t1, tile_sub, scale_sub)| {
+        repack_nibble_into_tile_range(view, rows, cols, *t0..*t1, tile_sub, scale_sub, None, None)
     })?;
 
     PackedNibbleMatrix::from_scale_f16_buffers(view.quant(), rows, cols, nibble_tiles, scales_f16)
@@ -1030,7 +1014,7 @@ fn repack_nibble_q4_k_m_parallel(
     let mut nibble_tiles = vec![Aligned128::zeroed(); n_tiles * k_blocks32];
     let mut headers = vec![[0_u8; 16]; n_tiles * n_sblks * TILE_N];
 
-    let work: Vec<NibbleChunkWork<'_>> = nibble_tiles
+    let mut work: Vec<NibbleChunkWork<'_>> = nibble_tiles
         .chunks_mut(chunk_tiles * k_blocks32)
         .zip(headers.chunks_mut(chunk_tiles * n_sblks * TILE_N))
         .enumerate()
@@ -1041,20 +1025,17 @@ fn repack_nibble_q4_k_m_parallel(
         })
         .collect();
 
-    run_on_pool(pool, || {
-        work.into_par_iter()
-            .try_for_each(|(t0, t1, tile_sub, hdr_sub)| {
-                repack_nibble_into_tile_range(
-                    view,
-                    rows,
-                    cols,
-                    t0..t1,
-                    tile_sub,
-                    &mut [],
-                    None,
-                    Some(hdr_sub),
-                )
-            })
+    try_for_each_work(pool, &mut work, |(t0, t1, tile_sub, hdr_sub)| {
+        repack_nibble_into_tile_range(
+            view,
+            rows,
+            cols,
+            *t0..*t1,
+            tile_sub,
+            &mut [],
+            None,
+            Some(hdr_sub),
+        )
     })?;
 
     PackedNibbleMatrix::from_q4_k_buffers(rows, cols, nibble_tiles, headers)
@@ -1097,11 +1078,16 @@ fn repack_block_scaled_parallel(
         idx += 1;
     }
 
-    run_on_pool(pool, || {
-        work.into_par_iter()
-            .try_for_each(|(t0, t1, tile_sub, scale_sub, min_sub)| {
-                repack_into_tile_range(view, rows, cols, t0..t1, tile_sub, scale_sub, min_sub)
-            })
+    try_for_each_work(pool, &mut work, |(t0, t1, tile_sub, scale_sub, min_sub)| {
+        repack_into_tile_range(
+            view,
+            rows,
+            cols,
+            *t0..*t1,
+            tile_sub,
+            scale_sub,
+            min_sub.as_deref_mut(),
+        )
     })?;
 
     RepackedWeight::from_tile_buffers(layout, tiles, scales, mins)

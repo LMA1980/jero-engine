@@ -18,8 +18,8 @@ use jero_engine::affinity::{ClusterPreset, ResolvedAffinity, SplitStrategy, Work
 use jero_engine::engine::PassTiming;
 use jero_engine::forward::{
     CalibrationShape, ForwardModel, ForwardSummary, Lane, MatKernel, PhaseLayout, PlacementPlan,
-    calibrate_matmul_rate, measure_memory_bandwidth, measure_peak_macs, probe_ime_on_core,
-    row_split_share,
+    calibrate_bandwidth_split_ratio, calibrate_matmul_rate, measure_memory_bandwidth,
+    measure_peak_macs, probe_ime_on_core, row_split_share,
 };
 use jero_engine::{A100_CLUSTER_MASK, ClusterPhasePolicy, WorkerPool, X100_CLUSTER_MASK};
 use serde::{Deserialize, Serialize};
@@ -507,7 +507,9 @@ fn calibrate_row_plan(
         })
     };
     let prefill = calibrate(CalibrationShape::Prefill)?;
-    let decode = calibrate(CalibrationShape::Decode)?;
+    let mut decode = calibrate(CalibrationShape::Decode)?;
+    let (_, _, bw_share) = calibrate_bandwidth_split_ratio(pool)?;
+    decode.x100_share = bw_share;
     Ok((
         PlacementPlan::row(prefill.x100_share, decode.x100_share),
         Some(RowSplitReport { prefill, decode }),

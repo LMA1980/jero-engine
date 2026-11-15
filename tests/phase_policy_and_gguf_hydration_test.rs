@@ -37,7 +37,23 @@ fn test_issue_113_qwen25_15b_1536_151936_untied_lm_head_forward_pass() {
         ("output.weight", QuantType::Q4_K_M, output_shape.as_slice()),
     ];
 
-    let bytes = create_synthetic_gguf_v3_with_kvs("qwen2", 32, &extra_kvs, &tensor_specs);
+    let mut bytes = create_synthetic_gguf_v3_with_kvs("qwen2", 32, &extra_kvs, &tensor_specs);
+    // Replace synthetic byte pattern in F32 `output_norm.weight` with finite 1.0 weights
+    // so `7.4e+37` byte patterns do not overflow LM-head Q4_K_M dot products to all-NaN.
+    let total_tensor_bytes: usize = tensor_specs
+        .iter()
+        .map(|&(name, quant, shape)| {
+            let elems: usize = shape.iter().product();
+            quant.storage_bytes(name, elems).expect("valid tensor size")
+        })
+        .sum();
+    let norm_bytes = QuantType::F32
+        .storage_bytes("output_norm.weight", 1536)
+        .expect("norm bytes");
+    let norm_start = bytes.len() - total_tensor_bytes;
+    for slot in bytes[norm_start..norm_start + norm_bytes].chunks_exact_mut(4) {
+        slot.copy_from_slice(&1.0_f32.to_le_bytes());
+    }
     let gguf = GgufFile::parse(&bytes).expect("parse Qwen2.5-1.5B synthetic GGUF");
     let recipe =
         verify_model_capabilities(&gguf).expect("verify and hydrate Qwen2.5-1.5B capabilities");

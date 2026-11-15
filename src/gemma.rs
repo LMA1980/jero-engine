@@ -17,6 +17,7 @@ use jero_kernels_rvv::{
     vec_dot_q6_k, vec_dot_q8_0,
 };
 
+use crate::affinity::WorkerPool;
 use crate::engine::EnginePhase;
 use crate::forward::Lane;
 use crate::kv::write_and_slice_sliding_kv;
@@ -116,20 +117,22 @@ pub(crate) fn matvec_any(
         && weights.shape()[1] == out.len()
         && weights.shape()[0] == input.len()
         && weights.quant() != QuantType::I2_S
-    {
-        let n_threads = rayon::current_num_threads();
-        if n_threads > 1 {
-            use rayon::prelude::*;
-
+        && let Some(parallel_res) = WorkerPool::with_current(|pool| {
+            let n_threads = pool.thread_count();
+            if n_threads <= 1 {
+                return Ok(false);
+            }
             let chunk_rows = out.len().div_ceil(n_threads).clamp(16, 2048);
-            return out.par_chunks_mut(chunk_rows).enumerate().try_for_each(
-                |(chunk_idx, out_chunk)| {
-                    let row_start = chunk_idx * chunk_rows;
-                    let chunk_view = weights.slice_rows(row_start, out_chunk.len())?;
-                    matvec_any_slice(out_chunk, &chunk_view, input)
-                },
-            );
-        }
+            pool.try_par_chunks_mut(out, chunk_rows, |chunk_idx, out_chunk| {
+                let row_start = chunk_idx * chunk_rows;
+                let chunk_view = weights.slice_rows(row_start, out_chunk.len())?;
+                matvec_any_slice(out_chunk, &chunk_view, input)
+            })?;
+            Ok::<bool, K3Error>(true)
+        })
+        && parallel_res?
+    {
+        return Ok(());
     }
     matvec_any_slice(out, weights, input)
 }
