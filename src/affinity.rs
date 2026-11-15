@@ -341,9 +341,9 @@ impl ClusterSelection {
     }
 }
 
-/// Minimum prompt token count at which `X100` `OoO` prompt prefill amortizes switching
-/// into `A100` `VLEN=1024` / `IME` single-token decode on dual-cluster `SpacemiT` K3.
-pub const PHASE_SPLIT_MIN_PROMPT_TOKENS: usize = 4;
+/// Minimum prompt token count at which compute-bound batched prefill saturates `A100` `VLEN=1024`
+/// `XSMTVDotII` matrix acceleration on heterogeneous `SpacemiT` K3 hardware (`#160`).
+pub const PHASE_SPLIT_MIN_PROMPT_TOKENS: usize = 8;
 
 /// Execution-phase cluster scheduling policy for heterogeneous `SpacemiT` K3 hardware.
 ///
@@ -354,28 +354,34 @@ pub const PHASE_SPLIT_MIN_PROMPT_TOKENS: usize = 4;
 #[serde(rename_all = "kebab-case")]
 pub enum ClusterPhasePolicy {
     /// Automatically select the cluster phase policy from model architecture, prompt length,
-    /// and online CPU topology (`X100PrefillA100Decode` for dense/MoE prompts `>= 4` tokens on
-    /// dual-cluster K3, `A100Only` for `bitnet*` or micro-prompts, single-cluster fallback on
-    /// homogeneous hosts).
+    /// online CPU topology, and `XSMTVDotII` (`IME`) availability (`A100Only` when `A100`
+    /// `VLEN=1024` + `IME` is online, or `X100Only` fallback when `A100`/`IME` is unavailable).
     #[default]
     Auto,
     /// Execute prompt prefill on `X100` (`0x00FF`) and single-token decode on `A100` (`0xFF00`).
     X100PrefillA100Decode,
+    /// Execute prompt prefill on `A100` (`0xFF00`) and single-token decode on `X100` (`0x00FF`).
+    A100PrefillX100Decode,
+    /// Execute prompt prefill on `A100` (`0xFF00`) and single-token decode on `A100` (`0xFF00`).
+    A100PrefillA100Decode,
     /// Execute both prompt prefill and decode exclusively on `A100` (`0xFF00`).
     A100Only,
     /// Execute both prompt prefill and decode exclusively on `X100` (`0x00FF`).
     X100Only,
-    /// Dual-cluster row-split configuration (`X100` prefill + `A100` decode in `SinglePromptEngine`).
+    /// Dual-cluster row-split configuration (`A100` prefill/decode when `Dual` pool is used in
+    /// `SinglePromptEngine`).
     RowSplit,
 }
 
 impl ClusterPhasePolicy {
     /// Returns all supported [`ClusterPhasePolicy`] variants in canonical order.
     #[must_use]
-    pub const fn all() -> [Self; 5] {
+    pub const fn all() -> [Self; 7] {
         [
             Self::Auto,
             Self::X100PrefillA100Decode,
+            Self::A100PrefillX100Decode,
+            Self::A100PrefillA100Decode,
             Self::A100Only,
             Self::X100Only,
             Self::RowSplit,
@@ -388,6 +394,8 @@ impl ClusterPhasePolicy {
         match self {
             Self::Auto => "auto",
             Self::X100PrefillA100Decode => "x100-prefill-a100-decode",
+            Self::A100PrefillX100Decode => "a100-prefill-x100-decode",
+            Self::A100PrefillA100Decode => "a100-prefill-a100-decode",
             Self::A100Only => "a100-only",
             Self::X100Only => "x100-only",
             Self::RowSplit => "row-split",
@@ -398,12 +406,13 @@ impl ClusterPhasePolicy {
     ///
     /// # Errors
     ///
-    /// Returns [`K3Error::AffinityError`] if `name` is not one of `"auto"`,
-    /// `"x100-prefill-a100-decode"`, `"a100-only"`, `"x100-only"`, or `"row-split"`.
+    /// Returns [`K3Error::AffinityError`] if `name` does not match one of the supported policy names.
     pub fn parse(name: &str) -> Result<Self, K3Error> {
         match name.trim().to_ascii_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
             "x100-prefill-a100-decode" => Ok(Self::X100PrefillA100Decode),
+            "a100-prefill-x100-decode" => Ok(Self::A100PrefillX100Decode),
+            "a100-prefill-a100-decode" => Ok(Self::A100PrefillA100Decode),
             "a100-only" => Ok(Self::A100Only),
             "x100-only" => Ok(Self::X100Only),
             "row-split" => Ok(Self::RowSplit),
@@ -411,7 +420,7 @@ impl ClusterPhasePolicy {
                 requested_mask: 0,
                 requested_threads: 0,
                 reason: format!(
-                    "unknown cluster phase policy '{other}'; expected 'auto', 'x100-prefill-a100-decode', 'a100-only', 'x100-only', or 'row-split'"
+                    "unknown cluster phase policy '{other}'; expected 'auto', 'x100-prefill-a100-decode', 'a100-prefill-x100-decode', 'a100-prefill-a100-decode', 'a100-only', 'x100-only', or 'row-split'"
                 ),
             }),
         }
@@ -432,6 +441,43 @@ impl std::str::FromStr for ClusterPhasePolicy {
     }
 }
 
+/// Reports whether `A100` cores (`0xFF00`) in `online_cpu_mask` support `SpacemiT` `XSMTVDotII`
+/// (`IME`) matrix execution.
+#[must_use]
+pub fn has_a100_ime_for_mask(online_cpu_mask: u64) -> bool {
+    let a100_mask = online_cpu_mask & A100_CLUSTER_MASK;
+    if a100_mask == 0 {
+        return false;
+    }
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "riscv64",
+        not(miri),
+        feature = "jero-kernels-rvv"
+    ))]
+    {
+        if std::env::var_os("K3_CPU_ONLINE_MASK").is_some()
+            || std::env::var_os("K3_SIMULATE_A100").is_some()
+        {
+            return true;
+        }
+        static CACHED_A100_IME: OnceLock<bool> = OnceLock::new();
+        *CACHED_A100_IME.get_or_init(|| {
+            let core = a100_mask.trailing_zeros() as usize;
+            crate::forward::probe_ime_on_core(core)
+        })
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        target_arch = "riscv64",
+        not(miri),
+        feature = "jero-kernels-rvv"
+    )))]
+    {
+        true
+    }
+}
+
 /// Selects the deterministic cluster phase scheduling policy for `metadata`, `prompt_tokens`,
 /// and `online_cpu_mask`.
 #[must_use]
@@ -443,6 +489,23 @@ pub fn select_phase_policy(
     select_phase_policy_for_arch(metadata.architecture(), prompt_tokens, online_cpu_mask)
 }
 
+/// Selects the deterministic cluster phase scheduling policy for `metadata`, `prompt_tokens`,
+/// `online_cpu_mask`, and explicit `has_ime` capability flag (`#160`).
+#[must_use]
+pub fn select_phase_policy_with_ime(
+    metadata: &ModelMetadata,
+    prompt_tokens: usize,
+    online_cpu_mask: u64,
+    has_ime: bool,
+) -> ClusterPhasePolicy {
+    select_phase_policy_for_arch_with_ime(
+        metadata.architecture(),
+        prompt_tokens,
+        online_cpu_mask,
+        has_ime,
+    )
+}
+
 /// Selects the deterministic cluster phase scheduling policy for `architecture`, `prompt_tokens`,
 /// and `online_cpu_mask`.
 #[must_use]
@@ -450,6 +513,19 @@ pub fn select_phase_policy_for_arch(
     architecture: &str,
     prompt_tokens: usize,
     online_cpu_mask: u64,
+) -> ClusterPhasePolicy {
+    let has_ime = has_a100_ime_for_mask(online_cpu_mask);
+    select_phase_policy_for_arch_with_ime(architecture, prompt_tokens, online_cpu_mask, has_ime)
+}
+
+/// Selects the deterministic cluster phase scheduling policy for `architecture`, `prompt_tokens`,
+/// `online_cpu_mask`, and explicit `XSMTVDotII` (`has_ime`) availability (`#160`).
+#[must_use]
+pub fn select_phase_policy_for_arch_with_ime(
+    architecture: &str,
+    prompt_tokens: usize,
+    online_cpu_mask: u64,
+    has_ime: bool,
 ) -> ClusterPhasePolicy {
     let x100_present = (online_cpu_mask & X100_CLUSTER_MASK) != 0;
     let matrix_present = (online_cpu_mask & A100_CLUSTER_MASK) != 0;
@@ -465,14 +541,15 @@ pub fn select_phase_policy_for_arch(
     ) {
         return ClusterPhasePolicy::X100Only;
     }
-    if architecture.starts_with("bitnet") {
-        return ClusterPhasePolicy::A100Only;
+    if !has_ime {
+        // Fall back cleanly to the OoO X100 cluster when XSMTVDotII matrix acceleration is absent.
+        return ClusterPhasePolicy::X100Only;
     }
-    if prompt_tokens >= PHASE_SPLIT_MIN_PROMPT_TOKENS {
-        ClusterPhasePolicy::X100PrefillA100Decode
-    } else {
-        ClusterPhasePolicy::A100Only
-    }
+    // Both micro-prompts (`< PHASE_SPLIT_MIN_PROMPT_TOKENS`) and compute-bound batched prefill
+    // (`>= PHASE_SPLIT_MIN_PROMPT_TOKENS`) as well as BitNet models execute on A100 + XSMTVDotII
+    // whenever A100 IME cores are online.
+    let _ = (prompt_tokens, PHASE_SPLIT_MIN_PROMPT_TOKENS);
+    ClusterPhasePolicy::A100Only
 }
 
 /// Resolves `policy` into a concrete (non-[`ClusterPhasePolicy::Auto`]) policy for `architecture`,
@@ -484,10 +561,33 @@ pub fn resolve_phase_policy(
     prompt_tokens: usize,
     online_cpu_mask: u64,
 ) -> ClusterPhasePolicy {
+    let has_ime = has_a100_ime_for_mask(online_cpu_mask);
+    resolve_phase_policy_with_ime(
+        policy,
+        architecture,
+        prompt_tokens,
+        online_cpu_mask,
+        has_ime,
+    )
+}
+
+/// Resolves `policy` into a concrete (non-[`ClusterPhasePolicy::Auto`]) policy with explicit
+/// `XSMTVDotII` (`has_ime`) availability.
+#[must_use]
+pub fn resolve_phase_policy_with_ime(
+    policy: ClusterPhasePolicy,
+    architecture: &str,
+    prompt_tokens: usize,
+    online_cpu_mask: u64,
+    has_ime: bool,
+) -> ClusterPhasePolicy {
     match policy {
-        ClusterPhasePolicy::Auto => {
-            select_phase_policy_for_arch(architecture, prompt_tokens, online_cpu_mask)
-        }
+        ClusterPhasePolicy::Auto => select_phase_policy_for_arch_with_ime(
+            architecture,
+            prompt_tokens,
+            online_cpu_mask,
+            has_ime,
+        ),
         concrete => concrete,
     }
 }
@@ -1704,10 +1804,9 @@ impl WorkerPool {
 
     /// Spawns a phase-aware [`WorkerPool`] for `policy` against a provided [`CpuTopologyInspector`].
     ///
-    /// Under [`ClusterPhasePolicy::Auto`], selects [`ClusterPhasePolicy::X100PrefillA100Decode`]
-    /// on dual-cluster `SpacemiT` K3 (`0xFFFF`) for dense/MoE prompts `>= 4` tokens,
-    /// [`ClusterPhasePolicy::A100Only`] for `bitnet*` or micro-prompts, and falls back cleanly to
-    /// [`ClusterPhasePolicy::X100Only`] on single-cluster hosts or `cpuset`-restricted CI containers.
+    /// Under [`ClusterPhasePolicy::Auto`], selects [`ClusterPhasePolicy::A100Only`] when `A100`
+    /// (`VLEN=1024`) with `XSMTVDotII` matrix support is online (or [`ClusterPhasePolicy::X100Only`]
+    /// for guardrail architectures / non-IME or single-cluster `cpuset`-restricted CI hosts).
     ///
     /// # Errors
     ///
@@ -1724,21 +1823,25 @@ impl WorkerPool {
     ) -> Result<Self, K3Error> {
         let online_mask = topology.online_cpu_mask()?;
         let mask_for_selection = explicit_mask.map_or(online_mask, |m| online_mask & m);
-        let mut resolved_policy = resolve_phase_policy(
+        let has_ime = has_a100_ime_for_mask(mask_for_selection);
+        let mut resolved_policy = resolve_phase_policy_with_ime(
             policy,
             metadata.architecture(),
             prompt_tokens,
             mask_for_selection,
+            has_ime,
         );
 
         if policy == ClusterPhasePolicy::Auto
             && requested_threads == Some(1)
             && matches!(
                 resolved_policy,
-                ClusterPhasePolicy::X100PrefillA100Decode | ClusterPhasePolicy::RowSplit
+                ClusterPhasePolicy::X100PrefillA100Decode
+                    | ClusterPhasePolicy::A100PrefillX100Decode
+                    | ClusterPhasePolicy::RowSplit
             )
         {
-            resolved_policy = if (mask_for_selection & A100_CLUSTER_MASK) != 0 {
+            resolved_policy = if (mask_for_selection & A100_CLUSTER_MASK) != 0 && has_ime {
                 ClusterPhasePolicy::A100Only
             } else {
                 ClusterPhasePolicy::X100Only
@@ -1747,13 +1850,16 @@ impl WorkerPool {
 
         let build_for_concrete = |concrete: ClusterPhasePolicy| -> Result<Self, K3Error> {
             let selection = match concrete {
-                ClusterPhasePolicy::X100PrefillA100Decode => Some(ClusterSelection::Both {
+                ClusterPhasePolicy::X100PrefillA100Decode
+                | ClusterPhasePolicy::A100PrefillX100Decode => Some(ClusterSelection::Both {
                     split: SplitStrategy::Phase,
                 }),
                 ClusterPhasePolicy::RowSplit => Some(ClusterSelection::Both {
                     split: SplitStrategy::Row,
                 }),
-                ClusterPhasePolicy::A100Only => Some(ClusterSelection::Single(ClusterPreset::A100)),
+                ClusterPhasePolicy::A100Only | ClusterPhasePolicy::A100PrefillA100Decode => {
+                    Some(ClusterSelection::Single(ClusterPreset::A100))
+                }
                 ClusterPhasePolicy::X100Only | ClusterPhasePolicy::Auto => {
                     Some(ClusterSelection::Single(ClusterPreset::X100))
                 }
@@ -2208,11 +2314,19 @@ impl WorkerPool {
 
     /// Executes `op` inside the cluster sub-pool dictated by `(phase, policy)`.
     ///
-    /// When `self` is a dual-cluster composite pool (`X100` + `A100`),
-    /// [`crate::engine::EnginePhase::Prefill`] executes on `x100_pool` (`zvl256b`) and
-    /// [`crate::engine::EnginePhase::Decode`] executes on `a100_pool` (`zvl1024b` + `IME`) under
-    /// [`ClusterPhasePolicy::X100PrefillA100Decode`], [`ClusterPhasePolicy::Auto`], and
-    /// [`ClusterPhasePolicy::RowSplit`]. Single-cluster pools execute `op` on their own threads.
+    /// When `self` is a dual-cluster composite pool (`X100` + `A100`):
+    /// - [`ClusterPhasePolicy::A100Only`], [`ClusterPhasePolicy::A100PrefillA100Decode`], and
+    ///   [`ClusterPhasePolicy::RowSplit`] execute prefill and decode on `a100_pool`
+    ///   (`zvl1024b` + `XSMTVDotII`);
+    /// - [`ClusterPhasePolicy::Auto`] executes prefill and decode on `a100_pool` whenever
+    ///   `A100` `XSMTVDotII` is online, falling back to `x100_pool` when unavailable;
+    /// - [`ClusterPhasePolicy::A100PrefillX100Decode`] executes prefill on `a100_pool` and decode
+    ///   on `x100_pool`;
+    /// - [`ClusterPhasePolicy::X100PrefillA100Decode`] executes prefill on `x100_pool` and decode
+    ///   on `a100_pool`;
+    /// - [`ClusterPhasePolicy::X100Only`] executes both phases on `x100_pool`.
+    ///
+    /// Single-cluster pools execute `op` on their own threads.
     pub fn install_for_phase<OP, R>(
         &self,
         phase: crate::engine::EnginePhase,
@@ -2234,15 +2348,25 @@ impl WorkerPool {
                 x100_pool,
                 a100_pool,
             } => match (policy, phase) {
-                (ClusterPhasePolicy::X100Only, _)
+                (
+                    ClusterPhasePolicy::A100PrefillX100Decode,
+                    crate::engine::EnginePhase::Prefill,
+                ) => a100_pool.install(op),
+                (ClusterPhasePolicy::X100Only | ClusterPhasePolicy::A100PrefillX100Decode, _)
                 | (
-                    ClusterPhasePolicy::X100PrefillA100Decode
-                    | ClusterPhasePolicy::Auto
-                    | ClusterPhasePolicy::RowSplit,
+                    ClusterPhasePolicy::X100PrefillA100Decode,
                     crate::engine::EnginePhase::Prefill,
                 ) => x100_pool.install(op),
+                (ClusterPhasePolicy::Auto, crate::engine::EnginePhase::Prefill) => {
+                    if has_a100_ime_for_mask(a100_pool.affinity().effective_mask) {
+                        a100_pool.install(op)
+                    } else {
+                        x100_pool.install(op)
+                    }
+                }
                 (
                     ClusterPhasePolicy::A100Only
+                    | ClusterPhasePolicy::A100PrefillA100Decode
                     | ClusterPhasePolicy::X100PrefillA100Decode
                     | ClusterPhasePolicy::Auto
                     | ClusterPhasePolicy::RowSplit,
@@ -2846,10 +2970,19 @@ mod tests {
                 ClusterPhasePolicy::X100PrefillA100Decode,
                 "x100-prefill-a100-decode",
             ),
+            (
+                ClusterPhasePolicy::A100PrefillX100Decode,
+                "a100-prefill-x100-decode",
+            ),
+            (
+                ClusterPhasePolicy::A100PrefillA100Decode,
+                "a100-prefill-a100-decode",
+            ),
             (ClusterPhasePolicy::A100Only, "a100-only"),
             (ClusterPhasePolicy::X100Only, "x100-only"),
             (ClusterPhasePolicy::RowSplit, "row-split"),
         ];
+        assert_eq!(ClusterPhasePolicy::all().len(), expected.len());
 
         for (variant, text) in expected {
             assert_eq!(variant.as_str(), text);
@@ -2889,64 +3022,215 @@ mod tests {
         );
         let bitnet_gguf = GgufFile::parse(&bitnet_bytes).expect("parse bitnet gguf");
 
-        // 1. Dual-cluster SpacemiT K3 (0xFFFF) with dense/MoE prompt >= 4 tokens -> X100PrefillA100Decode
+        // 1. Dual-cluster SpacemiT K3 (0xFFFF) with A100 IME online routes dense/MoE
+        // models to A100Only (A100 prefill + A100 decode) regardless of prompt length >= 8 or < 8.
+        assert_eq!(PHASE_SPLIT_MIN_PROMPT_TOKENS, 8);
         assert_eq!(
-            select_phase_policy(llama_gguf.metadata(), 4, 0xFFFF),
-            ClusterPhasePolicy::X100PrefillA100Decode
+            select_phase_policy_with_ime(llama_gguf.metadata(), 8, 0xFFFF, true),
+            ClusterPhasePolicy::A100Only
         );
         assert_eq!(
-            select_phase_policy_for_arch("qwen2", 32, 0xFFFF),
-            ClusterPhasePolicy::X100PrefillA100Decode
+            select_phase_policy_for_arch_with_ime("qwen2", 32, 0xFFFF, true),
+            ClusterPhasePolicy::A100Only
         );
         assert_eq!(
-            select_phase_policy_for_arch("mixtral", 16, 0xFFFF),
-            ClusterPhasePolicy::X100PrefillA100Decode
+            select_phase_policy_for_arch_with_ime("mixtral", 16, 0xFFFF, true),
+            ClusterPhasePolicy::A100Only
+        );
+        assert_eq!(
+            select_phase_policy_with_ime(llama_gguf.metadata(), 7, 0xFFFF, true),
+            ClusterPhasePolicy::A100Only
+        );
+        assert_eq!(
+            select_phase_policy_with_ime(llama_gguf.metadata(), 1, 0xFFFF, true),
+            ClusterPhasePolicy::A100Only
+        );
+        assert_eq!(
+            select_phase_policy_with_ime(bitnet_gguf.metadata(), 64, 0xFFFF, true),
+            ClusterPhasePolicy::A100Only
+        );
+        assert_eq!(
+            select_phase_policy_for_arch_with_ime("bitnet", 128, 0xFFFF, true),
+            ClusterPhasePolicy::A100Only
         );
 
-        // 2. Micro-prompts (< 4 tokens) and ternary BitNet stay on A100Only on 0xFFFF
+        // 2. Dual-cluster (0xFFFF) when A100 IME is unavailable falls back to X100Only,
+        // and guardrail architectures always remain pinned to X100Only.
         assert_eq!(
-            select_phase_policy(llama_gguf.metadata(), 3, 0xFFFF),
-            ClusterPhasePolicy::A100Only
+            select_phase_policy_with_ime(llama_gguf.metadata(), 8, 0xFFFF, false),
+            ClusterPhasePolicy::X100Only
         );
         assert_eq!(
-            select_phase_policy(llama_gguf.metadata(), 1, 0xFFFF),
-            ClusterPhasePolicy::A100Only
-        );
-        assert_eq!(
-            select_phase_policy(bitnet_gguf.metadata(), 64, 0xFFFF),
-            ClusterPhasePolicy::A100Only
-        );
-        assert_eq!(
-            select_phase_policy_for_arch("bitnet", 128, 0xFFFF),
-            ClusterPhasePolicy::A100Only
+            select_phase_policy_for_arch_with_ime("qwen2", 32, 0xFFFF, false),
+            ClusterPhasePolicy::X100Only
         );
         for guardrail_arch in ["deberta-v3", "shieldgemma", "granite", "llama-guard"] {
             assert_eq!(
-                select_phase_policy_for_arch(guardrail_arch, 32, 0xFFFF),
+                select_phase_policy_for_arch_with_ime(guardrail_arch, 32, 0xFFFF, true),
                 ClusterPhasePolicy::X100Only,
                 "guardrail architecture {guardrail_arch} must stay pinned to X100Only on 0xFFFF"
             );
+            assert_eq!(
+                select_phase_policy_for_arch_with_ime(guardrail_arch, 32, 0xFFFF, false),
+                ClusterPhasePolicy::X100Only,
+                "guardrail architecture {guardrail_arch} must stay pinned to X100Only without IME"
+            );
         }
 
-        // 3. Single-cluster fallbacks (CI hosts with 0x00FF or A100-only mask 0xFF00)
+        // 3. Single-cluster fallbacks (CI / symmetric hosts with 0x00FF / 0x000F, or A100-only 0xFF00)
         assert_eq!(
-            select_phase_policy(llama_gguf.metadata(), 32, 0x00FF),
+            select_phase_policy_with_ime(llama_gguf.metadata(), 32, 0x00FF, true),
             ClusterPhasePolicy::X100Only
         );
         assert_eq!(
-            select_phase_policy(bitnet_gguf.metadata(), 32, 0x000F),
+            select_phase_policy_with_ime(bitnet_gguf.metadata(), 32, 0x000F, true),
             ClusterPhasePolicy::X100Only
         );
         assert_eq!(
-            select_phase_policy(llama_gguf.metadata(), 32, 0xFF00),
+            select_phase_policy_with_ime(llama_gguf.metadata(), 32, 0xFF00, true),
             ClusterPhasePolicy::A100Only
         );
-
-        // 4. Explicit policies pass through resolve_phase_policy unchanged
         assert_eq!(
-            resolve_phase_policy(ClusterPhasePolicy::RowSplit, "llama", 32, 0x00FF),
+            select_phase_policy_with_ime(llama_gguf.metadata(), 32, 0xFF00, false),
+            ClusterPhasePolicy::A100Only
+        );
+    }
+
+    #[test]
+    fn test_resolve_phase_policy_with_ime_explicit_and_auto() {
+        assert_eq!(
+            resolve_phase_policy_with_ime(ClusterPhasePolicy::RowSplit, "llama", 32, 0x00FF, false),
             ClusterPhasePolicy::RowSplit
         );
+        assert_eq!(
+            resolve_phase_policy_with_ime(
+                ClusterPhasePolicy::A100PrefillX100Decode,
+                "llama",
+                32,
+                0xFFFF,
+                true
+            ),
+            ClusterPhasePolicy::A100PrefillX100Decode
+        );
+        assert_eq!(
+            resolve_phase_policy_with_ime(
+                ClusterPhasePolicy::A100PrefillA100Decode,
+                "llama",
+                32,
+                0xFFFF,
+                true
+            ),
+            ClusterPhasePolicy::A100PrefillA100Decode
+        );
+        assert_eq!(
+            resolve_phase_policy_with_ime(ClusterPhasePolicy::Auto, "llama", 32, 0xFFFF, true),
+            ClusterPhasePolicy::A100Only
+        );
+        assert_eq!(
+            resolve_phase_policy_with_ime(ClusterPhasePolicy::Auto, "llama", 32, 0xFFFF, false),
+            ClusterPhasePolicy::X100Only
+        );
+    }
+
+    fn verify_dual_pool_phase_cluster_isolation(dual_pool: &WorkerPool) {
+        use crate::engine::EnginePhase;
+        assert!(dual_pool.is_dual());
+
+        let a100_prefill_core = dual_pool
+            .install_for_phase(
+                EnginePhase::Prefill,
+                ClusterPhasePolicy::A100PrefillX100Decode,
+                get_current_thread_core,
+            )
+            .expect("A100PrefillX100Decode prefill thread core");
+        assert!(
+            (8..16).contains(&a100_prefill_core),
+            "A100PrefillX100Decode Prefill must execute on A100 (8..15), got {a100_prefill_core}"
+        );
+
+        let x100_decode_core = dual_pool
+            .install_for_phase(
+                EnginePhase::Decode,
+                ClusterPhasePolicy::A100PrefillX100Decode,
+                get_current_thread_core,
+            )
+            .expect("A100PrefillX100Decode decode thread core");
+        assert!(
+            x100_decode_core < 8,
+            "A100PrefillX100Decode Decode must execute on X100 (0..7), got {x100_decode_core}"
+        );
+
+        let a100_both_prefill = dual_pool
+            .install_for_phase(
+                EnginePhase::Prefill,
+                ClusterPhasePolicy::A100PrefillA100Decode,
+                get_current_thread_core,
+            )
+            .expect("A100PrefillA100Decode prefill core");
+        assert!((8..16).contains(&a100_both_prefill));
+
+        let a100_both_decode = dual_pool
+            .install_for_phase(
+                EnginePhase::Decode,
+                ClusterPhasePolicy::A100PrefillA100Decode,
+                get_current_thread_core,
+            )
+            .expect("A100PrefillA100Decode decode core");
+        assert!((8..16).contains(&a100_both_decode));
+
+        let x100_prefill_core = dual_pool
+            .install_for_phase(
+                EnginePhase::Prefill,
+                ClusterPhasePolicy::X100PrefillA100Decode,
+                get_current_thread_core,
+            )
+            .expect("X100PrefillA100Decode prefill thread core");
+        assert!(
+            x100_prefill_core < 8,
+            "X100PrefillA100Decode Prefill must execute on X100 (0..7), got core {x100_prefill_core}"
+        );
+
+        let a100_decode_core = dual_pool
+            .install_for_phase(
+                EnginePhase::Decode,
+                ClusterPhasePolicy::X100PrefillA100Decode,
+                get_current_thread_core,
+            )
+            .expect("X100PrefillA100Decode decode thread core");
+        assert!(
+            (8..16).contains(&a100_decode_core),
+            "X100PrefillA100Decode Decode must execute on A100 (8..15), got core {a100_decode_core}"
+        );
+
+        let row_split_prefill = dual_pool
+            .install_for_phase(
+                EnginePhase::Prefill,
+                ClusterPhasePolicy::RowSplit,
+                get_current_thread_core,
+            )
+            .expect("RowSplit prefill thread core");
+        assert!(
+            (8..16).contains(&row_split_prefill),
+            "RowSplit Prefill must execute on A100 (8..15), got core {row_split_prefill}"
+        );
+
+        let pinned_matrix_core = dual_pool
+            .install_for_phase(
+                EnginePhase::Prefill,
+                ClusterPhasePolicy::A100Only,
+                get_current_thread_core,
+            )
+            .expect("A100Only core");
+        assert!((8..16).contains(&pinned_matrix_core));
+
+        let pinned_ooo_core = dual_pool
+            .install_for_phase(
+                EnginePhase::Decode,
+                ClusterPhasePolicy::X100Only,
+                get_current_thread_core,
+            )
+            .expect("X100Only core");
+        assert!(pinned_ooo_core < 8);
     }
 
     #[test]
@@ -2981,8 +3265,8 @@ mod tests {
         );
         assert_eq!(core_in_x100, Some(0));
 
-        // 2. Verify Auto policy succeeds on simulated 0xFFFF topology (either spawning Dual on
-        // 16-core K3 / macOS, or cleanly falling back to X100Only on <16-core Linux CI hosts).
+        // 2. Verify Auto policy succeeds on simulated 0xFFFF topology (spawning A100Only on IME
+        // K3 systems or cleanly falling back to X100Only on <16-core / non-IME CI hosts).
         let auto_pool = WorkerPool::for_phase_policy_with(
             ClusterPhasePolicy::Auto,
             llama_gguf.metadata(),
@@ -2995,13 +3279,14 @@ mod tests {
         .expect("Auto phase policy must succeed on all hosts");
         assert!(matches!(
             auto_pool.phase_policy(),
-            Some(ClusterPhasePolicy::X100PrefillA100Decode | ClusterPhasePolicy::X100Only)
+            Some(ClusterPhasePolicy::A100Only | ClusterPhasePolicy::X100Only)
         ));
 
         // 3. When dual-cluster pinning is permitted by the kernel (16-core K3 or non-Linux),
-        // verify Prefill executes exclusively on X100 (0..8) and Decode on A100 (8..16).
+        // verify explicit A100PrefillX100Decode, A100PrefillA100Decode, X100PrefillA100Decode,
+        // and RowSplit phase-to-cluster routing.
         if let Ok(dual_pool) = WorkerPool::for_phase_policy_with(
-            ClusterPhasePolicy::X100PrefillA100Decode,
+            ClusterPhasePolicy::A100PrefillX100Decode,
             llama_gguf.metadata(),
             8,
             None,
@@ -3009,48 +3294,7 @@ mod tests {
             CoordinationProfile::Rayon,
             &k3_topo,
         ) {
-            assert!(dual_pool.is_dual());
-            let prefill_core = dual_pool
-                .install_for_phase(
-                    EnginePhase::Prefill,
-                    ClusterPhasePolicy::X100PrefillA100Decode,
-                    get_current_thread_core,
-                )
-                .expect("prefill thread core");
-            assert!(
-                prefill_core < 8,
-                "Prefill must execute on X100 cluster (0..7), got core {prefill_core}"
-            );
-
-            let decode_core = dual_pool
-                .install_for_phase(
-                    EnginePhase::Decode,
-                    ClusterPhasePolicy::X100PrefillA100Decode,
-                    get_current_thread_core,
-                )
-                .expect("decode thread core");
-            assert!(
-                (8..16).contains(&decode_core),
-                "Decode must execute on A100 cluster (8..15), got core {decode_core}"
-            );
-
-            let pinned_matrix_core = dual_pool
-                .install_for_phase(
-                    EnginePhase::Prefill,
-                    ClusterPhasePolicy::A100Only,
-                    get_current_thread_core,
-                )
-                .expect("A100Only core");
-            assert!((8..16).contains(&pinned_matrix_core));
-
-            let pinned_ooo_core = dual_pool
-                .install_for_phase(
-                    EnginePhase::Decode,
-                    ClusterPhasePolicy::X100Only,
-                    get_current_thread_core,
-                )
-                .expect("X100Only core");
-            assert!(pinned_ooo_core < 8);
+            verify_dual_pool_phase_cluster_isolation(&dual_pool);
         }
     }
 }

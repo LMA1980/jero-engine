@@ -139,6 +139,17 @@ pub struct PassTiming {
     pub ttft_ms: f64,
     /// Wall-clock duration of the prompt prefill phase in milliseconds.
     pub prefill_ms: f64,
+    /// Number of prompt tokens processed during the prefill phase.
+    #[serde(default)]
+    pub prompt_tokens: usize,
+    /// Wall-clock duration of the prompt prefill phase in nanoseconds.
+    #[serde(default)]
+    pub prefill_ns: u64,
+    /// Prefill prompt-processing throughput in tokens per second (`pp tok/s`).
+    /// Calculated as `prompt_tokens / (prefill_ns * 1e-9)`.
+    /// Evaluates to `0.0` if `prefill_ns == 0` or `prompt_tokens == 0`.
+    #[serde(default)]
+    pub prefill_tokens_per_sec: f64,
     /// Wall-clock duration of the autoregressive decode phase in milliseconds.
     pub decode_ms: f64,
     /// Decode generation throughput in tokens per second.
@@ -175,6 +186,9 @@ impl PassTiming {
         Self {
             ttft_ms: 0.0,
             prefill_ms: 0.0,
+            prompt_tokens: 0,
+            prefill_ns: 0,
+            prefill_tokens_per_sec: 0.0,
             decode_ms: 0.0,
             decode_tokens_per_sec: 0.0,
             total_wall_time_ms: 0.0,
@@ -184,6 +198,18 @@ impl PassTiming {
             decode_steps: 0,
             stop_reason: StopReason::MaxTokens,
         }
+    }
+
+    /// Computes prefill prompt-processing throughput in tokens per second (`pp tok/s`).
+    ///
+    /// Returns `0.0` when `prefill_ns == 0` or `prompt_tokens == 0`.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn prefill_tokens_per_sec(&self) -> f64 {
+        if self.prefill_ns == 0 || self.prompt_tokens == 0 {
+            return 0.0;
+        }
+        (self.prompt_tokens as f64) / ((self.prefill_ns as f64) * 1e-9)
     }
 }
 
@@ -636,6 +662,7 @@ impl SinglePromptEngine {
         let mut generated_tokens = Vec::with_capacity(max_tokens);
         if max_tokens == 0 {
             let prefill_elapsed = prefill_start.elapsed();
+            let prefill_nanos = u64::try_from(prefill_elapsed.as_nanos()).unwrap_or(u64::MAX);
             let ttft_ms = prefill_elapsed.as_secs_f64() * 1000.0;
             let prefill_ms = ttft_ms;
             self.phase = EnginePhase::Completed;
@@ -646,6 +673,8 @@ impl SinglePromptEngine {
                 final_phase: self.phase,
                 timing: compute_pass_timing(
                     pass_start,
+                    prompt_tokens.len(),
+                    prefill_nanos,
                     ttft_ms,
                     prefill_ms,
                     0.0,
@@ -666,6 +695,7 @@ impl SinglePromptEngine {
                 }
             })?;
         let prefill_elapsed = prefill_start.elapsed();
+        let prefill_nanos = u64::try_from(prefill_elapsed.as_nanos()).unwrap_or(u64::MAX);
         let ttft_ms = prefill_elapsed.as_secs_f64() * 1000.0;
         let prefill_ms = ttft_ms;
 
@@ -679,6 +709,8 @@ impl SinglePromptEngine {
                 final_phase: self.phase,
                 timing: compute_pass_timing_with_reason(
                     pass_start,
+                    prompt_tokens.len(),
+                    prefill_nanos,
                     ttft_ms,
                     prefill_ms,
                     0.0,
@@ -701,6 +733,8 @@ impl SinglePromptEngine {
                 final_phase: self.phase,
                 timing: compute_pass_timing(
                     pass_start,
+                    prompt_tokens.len(),
+                    prefill_nanos,
                     ttft_ms,
                     prefill_ms,
                     0.0,
@@ -763,6 +797,8 @@ impl SinglePromptEngine {
             final_phase: self.phase,
             timing: compute_pass_timing_with_reason(
                 pass_start,
+                prompt_tokens.len(),
+                prefill_nanos,
                 ttft_ms,
                 prefill_ms,
                 decode_ms,
@@ -813,7 +849,9 @@ impl SinglePromptEngine {
         self.phase = EnginePhase::Prefill;
         recipe.forward_classify(&mut ctx, weights)?;
 
-        let prefill_ms = pass_start.elapsed().as_secs_f64() * 1000.0;
+        let prefill_elapsed = pass_start.elapsed();
+        let prefill_nanos = u64::try_from(prefill_elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let prefill_ms = prefill_elapsed.as_secs_f64() * 1000.0;
         let winning_label = sample_greedy_argmax(ctx.logits()).unwrap_or(0);
         let final_position = ctx.position();
         self.phase = EnginePhase::Completed;
@@ -825,7 +863,17 @@ impl SinglePromptEngine {
                 generated_tokens: vec![winning_label],
                 final_position,
                 final_phase: self.phase,
-                timing: compute_pass_timing(pass_start, prefill_ms, prefill_ms, 0.0, 0, 0.0, None),
+                timing: compute_pass_timing(
+                    pass_start,
+                    prompt_tokens.len(),
+                    prefill_nanos,
+                    prefill_ms,
+                    prefill_ms,
+                    0.0,
+                    0,
+                    0.0,
+                    None,
+                ),
             },
         ))
     }
@@ -877,7 +925,9 @@ impl SinglePromptEngine {
         } else {
             recipe.forward_classify(&mut ctx, weights)?;
         }
-        let prefill_ms = pass_start.elapsed().as_secs_f64() * 1000.0;
+        let prefill_elapsed = pass_start.elapsed();
+        let prefill_nanos = u64::try_from(prefill_elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let prefill_ms = prefill_elapsed.as_secs_f64() * 1000.0;
         let final_position = ctx.position();
 
         let score = compute_calibrated_binary_risk(
@@ -899,7 +949,17 @@ impl SinglePromptEngine {
                 generated_tokens: vec![winning_token],
                 final_position,
                 final_phase: self.phase,
-                timing: compute_pass_timing(pass_start, prefill_ms, prefill_ms, 0.0, 0, 0.0, None),
+                timing: compute_pass_timing(
+                    pass_start,
+                    prompt_tokens.len(),
+                    prefill_nanos,
+                    prefill_ms,
+                    prefill_ms,
+                    0.0,
+                    0,
+                    0.0,
+                    None,
+                ),
             },
         ))
     }
@@ -1375,9 +1435,11 @@ pub fn infer_logits_buffer_len(weights: &dyn ModelWeights, vocab_size: usize) ->
     vocab_size
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
 pub(crate) fn compute_pass_timing(
     pass_start: Instant,
+    prompt_tokens: usize,
+    prefill_nanos: u64,
     ttft_ms: f64,
     prefill_ms: f64,
     decode_ms: f64,
@@ -1387,6 +1449,8 @@ pub(crate) fn compute_pass_timing(
 ) -> PassTiming {
     compute_pass_timing_with_reason(
         pass_start,
+        prompt_tokens,
+        prefill_nanos,
         ttft_ms,
         prefill_ms,
         decode_ms,
@@ -1400,6 +1464,8 @@ pub(crate) fn compute_pass_timing(
 #[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
 pub(crate) fn compute_pass_timing_with_reason(
     pass_start: Instant,
+    prompt_tokens: usize,
+    prefill_nanos: u64,
     ttft_ms: f64,
     prefill_ms: f64,
     decode_ms: f64,
@@ -1419,10 +1485,18 @@ pub(crate) fn compute_pass_timing_with_reason(
         0.0
     };
     let compute_utilization_ratio = (1.0 - barrier_wait_ratio).clamp(0.0, 1.0);
+    let prefill_tokens_per_sec = if prefill_nanos == 0 || prompt_tokens == 0 {
+        0.0
+    } else {
+        (prompt_tokens as f64) / ((prefill_nanos as f64) * 1e-9)
+    };
 
     PassTiming {
         ttft_ms,
         prefill_ms,
+        prompt_tokens,
+        prefill_ns: prefill_nanos,
+        prefill_tokens_per_sec,
         decode_ms,
         decode_tokens_per_sec,
         total_wall_time_ms,
@@ -2187,5 +2261,49 @@ mod tests {
         let json_eos = serde_json::to_string(&summary.timing).expect("serialize timing");
         let parsed: PassTiming = serde_json::from_str(&json_eos).expect("deserialize timing");
         assert_eq!(parsed.stop_reason, StopReason::EosToken { token_id: 11 });
+    }
+
+    #[test]
+    fn test_pass_timing_prefill_tokens_per_sec_and_zero_ns_guard() {
+        let timing = PassTiming {
+            prompt_tokens: 16,
+            prefill_ns: 2_000_000,
+            prefill_ms: 2.0,
+            prefill_tokens_per_sec: 8000.0,
+            ..PassTiming::zero()
+        };
+        assert!((timing.prefill_tokens_per_sec() - 8000.0).abs() < 1e-6);
+
+        let zero_ns = PassTiming {
+            prompt_tokens: 16,
+            prefill_ns: 0,
+            prefill_tokens_per_sec: 999.0,
+            ..PassTiming::zero()
+        };
+        assert_eq!(zero_ns.prefill_tokens_per_sec(), 0.0);
+
+        let zero_prompt = PassTiming {
+            prompt_tokens: 0,
+            prefill_ns: 1_000_000,
+            ..PassTiming::zero()
+        };
+        assert_eq!(zero_prompt.prefill_tokens_per_sec(), 0.0);
+
+        let legacy_json = r#"{
+            "ttft_ms": 1.0,
+            "prefill_ms": 1.0,
+            "decode_ms": 2.0,
+            "decode_tokens_per_sec": 500.0,
+            "total_wall_time_ms": 3.0,
+            "cumulative_barrier_wait_ms": 0.0,
+            "barrier_wait_ratio": 0.0,
+            "compute_utilization_ratio": 1.0,
+            "decode_steps": 1
+        }"#;
+        let legacy: PassTiming =
+            serde_json::from_str(legacy_json).expect("deserialize legacy PassTiming JSON");
+        assert_eq!(legacy.prompt_tokens, 0);
+        assert_eq!(legacy.prefill_ns, 0);
+        assert_eq!(legacy.prefill_tokens_per_sec(), 0.0);
     }
 }

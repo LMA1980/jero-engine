@@ -466,19 +466,22 @@ impl DiagConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricStats {
     pub mean: f64,
+    #[serde(default)]
+    pub median: f64,
     pub min: f64,
     pub max: f64,
     pub stddev: f64,
 }
 
 impl MetricStats {
-    /// Computes sample mean, min, max, and sample standard deviation with Bessel's correction ($N-1$).
+    /// Computes sample mean, median, min, max, and sample standard deviation with Bessel's correction ($N-1$).
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn calculate(samples: &[f64]) -> Self {
         if samples.is_empty() {
             return Self {
                 mean: 0.0,
+                median: 0.0,
                 min: 0.0,
                 max: 0.0,
                 stddev: 0.0,
@@ -488,6 +491,15 @@ impl MetricStats {
         let mean = samples.iter().sum::<f64>() / n;
         let min = samples.iter().copied().fold(f64::INFINITY, f64::min);
         let max = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let mid = sorted.len() / 2;
+        let median = if sorted.len() % 2 == 1 {
+            sorted[mid]
+        } else {
+            0.5 * (sorted[mid - 1] + sorted[mid])
+        };
 
         let stddev = if samples.len() < 2 {
             0.0
@@ -499,6 +511,7 @@ impl MetricStats {
 
         Self {
             mean,
+            median,
             min,
             max,
             stddev,
@@ -516,6 +529,8 @@ pub struct RunMetric {
     pub run_index: usize,
     pub ttft_ms: f64,
     pub prefill_ms: f64,
+    #[serde(default)]
+    pub prefill_tokens_per_sec: f64,
     pub decode_ms: f64,
     pub decode_tokens_per_sec: f64,
     pub total_wall_time_ms: f64,
@@ -534,10 +549,16 @@ pub struct RunMetric {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatisticsSummary {
     pub ttft_ms: MetricStats,
+    #[serde(default = "zero_metric_stats")]
+    pub prefill_tokens_per_sec: MetricStats,
     pub decode_tokens_per_sec: MetricStats,
     pub cumulative_barrier_wait_ms: MetricStats,
     pub total_wall_time_ms: MetricStats,
     pub compute_utilization_ratio: MetricStats,
+}
+
+fn zero_metric_stats() -> MetricStats {
+    MetricStats::calculate(&[])
 }
 
 /// Machine-readable multi-run real-GGUF benchmark report exported via `--json` (US-02, US-03, US-04).
@@ -767,6 +788,8 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
         .unwrap_or(128)
         .min(n_ctx.saturating_sub(prompt_tokens.len()));
     let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
+    let _repack_summary = locked_weights.prepare_repacked_weights(Some(&worker_pool))?;
+    let model_view = locked_weights.model_view();
 
     struct GgufArmOutcome {
         samples: Vec<bench::ArmSample>,
@@ -790,7 +813,7 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
             let ime_before = ime_vmadot_count();
             let mut summary = engine.evaluate_prompt_with_pool(
                 recipe.as_ref(),
-                &locked_weights,
+                &model_view,
                 &mut kv_arena,
                 Some(&worker_pool),
                 &prompt_tokens,
@@ -870,10 +893,18 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
         });
     }
     let (expected_prefill_mask, expected_decode_mask) = match engine.phase_policy() {
-        ClusterPhasePolicy::A100Only => (A100_CLUSTER_MASK, A100_CLUSTER_MASK),
+        ClusterPhasePolicy::A100Only | ClusterPhasePolicy::A100PrefillA100Decode => {
+            (A100_CLUSTER_MASK, A100_CLUSTER_MASK)
+        }
+        ClusterPhasePolicy::A100PrefillX100Decode => (A100_CLUSTER_MASK, X100_CLUSTER_MASK),
         ClusterPhasePolicy::X100Only => (X100_CLUSTER_MASK, X100_CLUSTER_MASK),
-        ClusterPhasePolicy::X100PrefillA100Decode | ClusterPhasePolicy::RowSplit => {
-            (X100_CLUSTER_MASK, A100_CLUSTER_MASK)
+        ClusterPhasePolicy::X100PrefillA100Decode => (X100_CLUSTER_MASK, A100_CLUSTER_MASK),
+        ClusterPhasePolicy::RowSplit => {
+            if !affinity.a100_cores.is_empty() {
+                (A100_CLUSTER_MASK, A100_CLUSTER_MASK)
+            } else {
+                (X100_CLUSTER_MASK, X100_CLUSTER_MASK)
+            }
         }
         ClusterPhasePolicy::Auto => (
             X100_CLUSTER_MASK | A100_CLUSTER_MASK,
@@ -1337,13 +1368,20 @@ mod tests {
         let samples = [10.0, 12.0, 14.0];
         let stats = MetricStats::calculate(&samples);
         assert!((stats.mean - 12.0).abs() < 1e-9);
+        assert!((stats.median - 12.0).abs() < 1e-9);
         assert_eq!(stats.min, 10.0);
         assert_eq!(stats.max, 14.0);
         assert!((stats.stddev - 2.0).abs() < 1e-9);
 
+        let even_samples = [40.0, 10.0, 20.0, 30.0];
+        let even_stats = MetricStats::calculate(&even_samples);
+        assert!((even_stats.mean - 25.0).abs() < 1e-9);
+        assert!((even_stats.median - 25.0).abs() < 1e-9);
+
         let identical = [5.0, 5.0, 5.0];
         let stats_id = MetricStats::calculate(&identical);
         assert_eq!(stats_id.mean, 5.0);
+        assert_eq!(stats_id.median, 5.0);
         assert_eq!(stats_id.min, 5.0);
         assert_eq!(stats_id.max, 5.0);
         assert_eq!(stats_id.stddev, 0.0);
@@ -1502,6 +1540,9 @@ mod tests {
         assert!(report.determinism_verified);
         assert_eq!(report.runs.len(), 3);
         assert!(report.statistics.ttft_ms.mean >= 0.0);
+        assert!(report.statistics.prefill_tokens_per_sec.mean > 0.0);
+        assert!(report.statistics.prefill_tokens_per_sec.median > 0.0);
+        assert!(report.runs.iter().all(|r| r.prefill_tokens_per_sec > 0.0));
 
         let _ = std::fs::remove_file(&temp_path);
     }
@@ -1785,6 +1826,7 @@ mod tests {
             run_index: 0,
             ttft_ms: 1.0,
             prefill_ms: 0.5,
+            prefill_tokens_per_sec: 16_000.0,
             decode_ms: 0.5,
             decode_tokens_per_sec: 100.0,
             total_wall_time_ms: 1.0,
@@ -1798,5 +1840,6 @@ mod tests {
         let v = serde_json::to_value(&metric).expect("json");
         assert_eq!(v["stop_reason"], "eos_token");
         assert_eq!(v["stop_token_id"], 128_009);
+        assert_eq!(v["prefill_tokens_per_sec"], 16_000.0);
     }
 }

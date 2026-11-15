@@ -13,11 +13,12 @@ use std::path::Path;
 use jero_core::ipc::shm::DEFAULT_LIMIT_MEMLOCK_BYTES;
 use jero_core::{ArchRecipe, GgufFile, K3Error, ModelMetadata, ModelWeights, TensorView};
 
+use crate::affinity::WorkerPool;
 use crate::kv::SingleSlotKvArena;
 use crate::memory::{
     MemoryFootprint, MemoryInspector, SystemMemoryInspector, check_memory_admission_with,
 };
-use crate::weights::LockedModelWeights;
+use crate::weights::{LockedModelWeights, ModelView, RepackSummary};
 
 use super::error::WorkerError;
 
@@ -215,6 +216,29 @@ impl LockedWeights {
     #[must_use]
     pub const fn footprint(&self) -> &MemoryFootprint {
         &self.footprint
+    }
+
+    /// Returns a lifetime-bound [`ModelView`] pairing these locked weights with their repacked store.
+    #[must_use]
+    pub const fn model_view(&self) -> ModelView<'_> {
+        self.inner.model_view()
+    }
+
+    /// Eagerly builds and caches repacked 2D weight tensors in parallel across `pool` once per model.
+    ///
+    /// # Errors
+    /// Returns [`K3Error`] converted into [`WorkerError`] if repacking fails bounds verification.
+    pub fn prepare_repacked_weights(
+        &self,
+        pool: Option<&WorkerPool>,
+    ) -> Result<RepackSummary, WorkerError> {
+        Ok(self.inner.prepare_repacked_weights(pool)?)
+    }
+
+    /// Returns the current [`RepackSummary`] residency and reuse telemetry.
+    #[must_use]
+    pub fn repack_summary(&self) -> RepackSummary {
+        self.inner.repack_summary()
     }
 }
 

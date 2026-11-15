@@ -1658,13 +1658,15 @@ fn test_issue_188_phase_placement_reports_concrete_resolved_policy_and_real_clus
         "--json",
     ]);
 
+    // Wave 3 (#160): Auto / `--cluster both --split phase` routes dense Llama models onto
+    // A100Only when A100 + XSMTVDotII is online.
     assert_eq!(
         llama_report["placement_prefill"]["matmul"][0]["cluster"].as_str(),
-        Some("x100")
+        Some("a100")
     );
     assert_eq!(
         llama_report["placement_prefill"]["vector"].as_str(),
-        Some("x100")
+        Some("a100")
     );
     assert_eq!(
         llama_report["placement_decode"]["matmul"][0]["cluster"].as_str(),
@@ -1677,16 +1679,65 @@ fn test_issue_188_phase_placement_reports_concrete_resolved_policy_and_real_clus
     let llama_mask = llama_report["matmul_cpu_mask"]
         .as_u64()
         .expect("llama matmul_cpu_mask");
-    assert_ne!(
+    assert_eq!(
         llama_mask & 0x00FF,
         0,
-        "llama phase split must observe X100 prefill core bits (mask={llama_mask:#x})"
+        "llama auto/phase on A100+IME must not execute on X100 cores (mask={llama_mask:#x})"
     );
     assert_ne!(
         llama_mask & 0xFF00,
         0,
-        "llama phase split must observe A100 decode core bits (mask={llama_mask:#x})"
+        "llama auto/phase on A100+IME must observe A100 core bits (mask={llama_mask:#x})"
     );
+
+    // Explicit cross-cluster phase policies still split prefill & decode across X100 and A100
+    for (policy, expected_prefill, expected_decode) in [
+        ("x100-prefill-a100-decode", "x100", "a100"),
+        ("a100-prefill-x100-decode", "a100", "x100"),
+    ] {
+        let split_report = run_jero_diag_json(&[
+            "--model",
+            llama_file.as_str(),
+            "--phase-policy",
+            policy,
+            "--prompt",
+            "t3 t4 t5 t6 t7",
+            "--max-tokens",
+            "2",
+            "--json",
+        ]);
+        assert_eq!(
+            split_report["placement_prefill"]["matmul"][0]["cluster"].as_str(),
+            Some(expected_prefill),
+            "{policy} prefill placement mismatch"
+        );
+        assert_eq!(
+            split_report["placement_prefill"]["vector"].as_str(),
+            Some(expected_prefill)
+        );
+        assert_eq!(
+            split_report["placement_decode"]["matmul"][0]["cluster"].as_str(),
+            Some(expected_decode),
+            "{policy} decode placement mismatch"
+        );
+        assert_eq!(
+            split_report["placement_decode"]["vector"].as_str(),
+            Some(expected_decode)
+        );
+        let split_mask = split_report["matmul_cpu_mask"]
+            .as_u64()
+            .expect("split matmul_cpu_mask");
+        assert_ne!(
+            split_mask & 0x00FF,
+            0,
+            "{policy} must observe X100 core bits (mask={split_mask:#x})"
+        );
+        assert_ne!(
+            split_mask & 0xFF00,
+            0,
+            "{policy} must observe A100 core bits (mask={split_mask:#x})"
+        );
+    }
 
     let bitnet_file = TempGgufFile::write("issue188_bitnet", &build_bitnet_i2_s_test_gguf());
     for mode_args in [

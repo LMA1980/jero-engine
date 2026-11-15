@@ -7,7 +7,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
 
-use jero_core::{DoryKvCacheMode, K3Error, ModelMetadata, align_up};
+use jero_core::{DoryKvCacheMode, K3Error, ModelMetadata, QuantType, align_up};
 
 /// Default sliding-window attention span (`dory.attention.sliding_window`) for `Dory1.0-4B`.
 pub const DORY_DEFAULT_SLIDING_WINDOW: usize = 1024;
@@ -796,21 +796,52 @@ pub struct MemoryFootprint {
     pub weight_bytes: u64,
     /// Exact page-aligned bytes required for the single-slot KV cache arena.
     pub kv_bytes: u64,
-    /// Total page-aligned bytes required (`weight_bytes + kv_bytes`).
+    /// Total base page-aligned bytes required for weights and KV cache (`weight_bytes + kv_bytes`).
     pub total_required_bytes: u64,
     /// Number of 16-token blocks allocated for the KV cache.
     pub kv_block_count: usize,
     /// Total token capacity allocated for the KV cache (`kv_block_count * 16`).
     pub kv_allocated_tokens: usize,
+    /// Estimated page-aligned bytes required for the load-time repacked weight arena.
+    /// Downgraded to `0` when base footprint fits but optional repack arena exceeds memory limits.
+    pub repack_arena_bytes: usize,
+    /// Estimated page-aligned bytes required for bounded chunked prefill scratch buffers.
+    pub prefill_scratch_bytes: usize,
+    /// Whether eager load-time weight repacking is permitted within active memory/memlock headroom.
+    pub eager_repack_enabled: bool,
 }
 
-/// Computes the exact page-aligned memory footprint required for model weights
-/// and a standalone single-slot KV cache arena sized to `n_ctx` tokens (ADR-027, ADR-037).
+impl MemoryFootprint {
+    /// Returns the non-optional locked base footprint (`weight_bytes + kv_bytes + prefill_scratch_bytes`).
+    #[must_use]
+    pub const fn base_required_bytes(&self) -> u64 {
+        self.weight_bytes
+            .saturating_add(self.kv_bytes)
+            .saturating_add(self.prefill_scratch_bytes as u64)
+    }
+
+    /// Returns the total resident footprint including the optional eager repack arena.
+    #[must_use]
+    pub const fn total_with_repack_bytes(&self) -> u64 {
+        self.base_required_bytes()
+            .saturating_add(self.repack_arena_bytes as u64)
+    }
+}
+
+/// Computes the exact page-aligned memory footprint required for model weights, KV cache,
+/// prefill scratch, and optional repack working-set arena sized to `n_ctx` tokens.
 ///
 /// # Errors
 ///
 /// Returns [`K3Error::ContextLengthExceeded`] if `n_ctx` exceeds the model's trained context limit.
 /// Returns [`K3Error::CapabilityMismatch`] if `n_ctx` is zero or if required architecture dimensions are zero.
+pub fn estimate_footprint(
+    metadata: &ModelMetadata,
+    n_ctx: usize,
+) -> Result<MemoryFootprint, K3Error> {
+    calculate_footprint(metadata, n_ctx)
+}
+
 /// Computes the exact page-aligned memory footprint required for model weights
 /// and a standalone single-slot KV cache arena sized to `n_ctx` tokens (ADR-027, ADR-037).
 ///
@@ -1136,6 +1167,91 @@ pub fn calculate_footprint_with_slots(
     calculate_footprint_inner(metadata, metadata.total_weight_bytes(), n_ctx, active_slots)
 }
 
+fn estimate_repack_and_scratch_bytes(
+    metadata: &ModelMetadata,
+    n_ctx: usize,
+    page_size: usize,
+) -> Result<(usize, usize), K3Error> {
+    let mut raw_repack_bytes = 0_usize;
+    let mut max_proj_dim = 0_usize;
+
+    for tensor in metadata.tensors() {
+        let dims = tensor.shape();
+        if dims.len() < 2 {
+            continue;
+        }
+
+        let name = tensor.name();
+        if name.contains("token_embd")
+            || name.contains("position_embd")
+            || name.ends_with("norm.weight")
+        {
+            continue;
+        }
+
+        let elems = tensor.num_elements();
+        let tensor_repack = match tensor.quant() {
+            // Compact 4-bit nibble layout (`smt.vpack.vv` / `PackedNibbleMatrix`):
+            // 0.5 bytes/element payload + f16 block scale per 32 weights (~0.5625x elems).
+            QuantType::Q4_0 | QuantType::Q4_1 | QuantType::Q4_K_M | QuantType::IQ4_NL => {
+                align_up(elems.div_ceil(2) + elems.div_ceil(32) * 2, 64)
+            }
+            // Expanded i8 block-scaled tile layout (`RepackedWeight`):
+            // 1 byte/element i8 payload + f32 scale & min per 32 weights (~1.25x elems).
+            QuantType::Q8_0
+            | QuantType::Q5_0
+            | QuantType::Q5_1
+            | QuantType::Q2_K
+            | QuantType::Q3_K
+            | QuantType::Q5_K
+            | QuantType::Q6_K
+            | QuantType::TQ1_0
+            | QuantType::TQ2_0
+            | QuantType::I2_S => align_up(elems + elems.div_ceil(32) * 8, 64),
+            QuantType::F32
+            | QuantType::F16
+            | QuantType::BF16
+            | QuantType::Q8_1
+            | QuantType::MXFP4 => 0,
+        };
+        if tensor_repack > 0 {
+            for &d in dims {
+                max_proj_dim = max_proj_dim.max(d);
+            }
+        }
+        raw_repack_bytes = raw_repack_bytes.checked_add(tensor_repack).ok_or_else(|| {
+            K3Error::TensorBoundsError {
+                tensor_name: name.to_owned(),
+                offset: 0,
+                byte_len: tensor_repack,
+                buffer_len: usize::MAX,
+                reason: "repack arena size overflowed usize".to_owned(),
+            }
+        })?;
+    }
+
+    let repack_arena_bytes = if raw_repack_bytes == 0 {
+        0
+    } else {
+        align_up(raw_repack_bytes, page_size)
+    };
+
+    let prefill_scratch_bytes = if raw_repack_bytes > 0 {
+        // Bounded chunked prefill activation + accumulator buffers (capped at 32-token tile chunks).
+        let chunk_tokens = n_ctx.clamp(1, 32);
+        let hidden = metadata.embedding_dim().max(1);
+        let proj = max_proj_dim
+            .min(hidden.saturating_mul(8).max(hidden))
+            .max(hidden);
+        let raw_scratch = chunk_tokens * (hidden + proj) * size_of::<f32>() + chunk_tokens * hidden;
+        align_up(raw_scratch, page_size)
+    } else {
+        0
+    };
+
+    Ok((repack_arena_bytes, prefill_scratch_bytes))
+}
+
 fn calculate_footprint_inner(
     metadata: &ModelMetadata,
     weight_bytes_raw: usize,
@@ -1157,6 +1273,9 @@ fn calculate_footprint_inner(
     }
 
     let page_size = system_page_size();
+    let (repack_arena_bytes, prefill_scratch_bytes) =
+        estimate_repack_and_scratch_bytes(metadata, n_ctx, page_size)?;
+    let eager_repack_enabled = repack_arena_bytes > 0;
 
     // 1. Model weights footprint (page-aligned)
     let weight_bytes_aligned = align_up(weight_bytes_raw, page_size);
@@ -1176,6 +1295,9 @@ fn calculate_footprint_inner(
             total_required_bytes: weight_bytes,
             kv_block_count: 0,
             kv_allocated_tokens: 0,
+            repack_arena_bytes,
+            prefill_scratch_bytes,
+            eager_repack_enabled,
         });
     }
 
@@ -1235,6 +1357,9 @@ fn calculate_footprint_inner(
         total_required_bytes,
         kv_block_count,
         kv_allocated_tokens,
+        repack_arena_bytes,
+        prefill_scratch_bytes,
+        eager_repack_enabled,
     })
 }
 
@@ -1412,22 +1537,31 @@ pub fn check_memory_admission_with<I: MemoryInspector>(
 }
 
 fn check_footprint_against_inspector<I: MemoryInspector>(
-    footprint: MemoryFootprint,
+    mut footprint: MemoryFootprint,
     inspector: &I,
 ) -> Result<MemoryFootprint, K3Error> {
     let available_bytes = inspector.available_memory_bytes()?;
     let rlimit_memlock_bytes = inspector.rlimit_memlock_bytes()?;
+    let budget = available_bytes.min(rlimit_memlock_bytes);
 
-    if footprint.total_required_bytes > available_bytes
-        || footprint.total_required_bytes > rlimit_memlock_bytes
-    {
+    let base_required_bytes = footprint.base_required_bytes();
+    if base_required_bytes > budget {
         return Err(K3Error::InsufficientLockableMemory {
-            required_bytes: footprint.total_required_bytes,
+            required_bytes: if footprint.prefill_scratch_bytes == 0 {
+                footprint.total_required_bytes
+            } else {
+                base_required_bytes
+            },
             weight_bytes: footprint.weight_bytes,
             kv_bytes: footprint.kv_bytes,
             available_bytes,
             rlimit_memlock_bytes,
         });
+    }
+
+    if footprint.total_with_repack_bytes() > budget && footprint.repack_arena_bytes > 0 {
+        footprint.repack_arena_bytes = 0;
+        footprint.eager_repack_enabled = false;
     }
 
     Ok(footprint)
@@ -1872,5 +2006,77 @@ mod tests {
             assert_eq!(fp_small.total_required_bytes, fp_large.total_required_bytes);
             assert!(fp_small.kv_bytes > 0);
         }
+    }
+
+    #[test]
+    fn test_estimate_footprint_compact_nibble_vs_i8_and_budget_downgrade() {
+        let q4_specs = [
+            ("blk.0.attn_q.weight", QuantType::Q4_K_M, &[64, 64][..]),
+            ("blk.0.attn_k.weight", QuantType::Q4_K_M, &[64, 64][..]),
+            ("output_norm.weight", QuantType::F32, &[64][..]),
+        ];
+        let q8_specs = [
+            ("blk.0.attn_q.weight", QuantType::Q8_0, &[64, 64][..]),
+            ("blk.0.attn_k.weight", QuantType::Q8_0, &[64, 64][..]),
+            ("output_norm.weight", QuantType::F32, &[64][..]),
+        ];
+        let q4_bytes = create_synthetic_gguf_v3("llama", 32, &q4_specs);
+        let q8_bytes = create_synthetic_gguf_v3("llama", 32, &q8_specs);
+        let q4_gguf = GgufFile::parse(&q4_bytes).expect("parse q4 gguf");
+        let q8_gguf = GgufFile::parse(&q8_bytes).expect("parse q8 gguf");
+
+        let q4_fp = estimate_footprint(q4_gguf.metadata(), 64).expect("q4 footprint");
+        let q8_fp = estimate_footprint(q8_gguf.metadata(), 64).expect("q8 footprint");
+        assert!(q4_fp.repack_arena_bytes > 0);
+        assert!(q8_fp.repack_arena_bytes > 0);
+        assert!(
+            q4_fp.repack_arena_bytes <= q8_fp.repack_arena_bytes,
+            "compact 4-bit nibble arena ({}) must not exceed i8 arena ({})",
+            q4_fp.repack_arena_bytes,
+            q8_fp.repack_arena_bytes
+        );
+        assert!(q4_fp.prefill_scratch_bytes > 0);
+        assert!(q4_fp.eager_repack_enabled);
+        assert_eq!(
+            q4_fp.total_required_bytes,
+            q4_fp.weight_bytes + q4_fp.kv_bytes
+        );
+
+        // Path A: weight_bytes + kv_bytes + prefill_scratch_bytes > budget -> hard Err(InsufficientLockableMemory)
+        let too_small_for_base = q4_fp.base_required_bytes().saturating_sub(1);
+        let err_inspector = MockMemoryInspector::new(too_small_for_base, too_small_for_base);
+        let err = check_memory_admission_with(q4_gguf.metadata(), 64, &err_inspector)
+            .expect_err("must refuse when base + prefill_scratch exceeds budget");
+        assert!(matches!(err, K3Error::InsufficientLockableMemory { .. }));
+
+        // Path B: base fits, optional repack_arena_bytes exceeds budget -> clean downgrade without abort
+        // Use a larger Q8 matrix whose repack arena spans multiple pages (> page_size).
+        let big_specs = [
+            ("blk.0.attn_q.weight", QuantType::Q8_0, &[256, 256][..]),
+            ("blk.0.attn_k.weight", QuantType::Q8_0, &[256, 256][..]),
+            ("output_norm.weight", QuantType::F32, &[256][..]),
+        ];
+        let big_bytes = create_synthetic_gguf_v3("llama", 32, &big_specs);
+        let big_gguf = GgufFile::parse(&big_bytes).expect("parse big gguf");
+        let big_fp = estimate_footprint(big_gguf.metadata(), 64).expect("big footprint");
+        assert!(big_fp.repack_arena_bytes > 0);
+        let exact_base_budget = big_fp.base_required_bytes();
+        assert!(exact_base_budget < big_fp.total_with_repack_bytes());
+
+        let downgrade_inspector = MockMemoryInspector::new(exact_base_budget, exact_base_budget);
+        let admitted = check_memory_admission_with(big_gguf.metadata(), 64, &downgrade_inspector)
+            .expect("must admit base footprint and downgrade optional repack arena");
+        assert!(!admitted.eager_repack_enabled);
+        assert_eq!(admitted.repack_arena_bytes, 0);
+
+        // Path C: generous budget keeps eager repacking enabled with full arena size
+        let ample = MockMemoryInspector::new(
+            big_fp.total_with_repack_bytes() + 4096,
+            big_fp.total_with_repack_bytes() + 4096,
+        );
+        let full = check_memory_admission_with(big_gguf.metadata(), 64, &ample)
+            .expect("must admit eager repack with ample budget");
+        assert!(full.eager_repack_enabled);
+        assert_eq!(full.repack_arena_bytes, big_fp.repack_arena_bytes);
     }
 }
