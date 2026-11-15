@@ -8,10 +8,10 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use jero_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights};
+use jero_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, ScratchWorkspace};
 
 use crate::affinity::{
-    ClusterPhasePolicy, WorkerPool, X100_CLUSTER_MASK, select_phase_policy_for_arch,
+    ClusterPhasePolicy, PhaseSession, WorkerPool, X100_CLUSTER_MASK, select_phase_policy_for_arch,
 };
 use crate::kv::SingleSlotKvArena;
 
@@ -237,6 +237,9 @@ pub struct SinglePromptEngine {
     generation_config: GenerationConfig,
     last_prefill_cpu_mask: u64,
     last_decode_cpu_mask: u64,
+    logits_buf: Vec<f32>,
+    scratch_workspace: Option<ScratchWorkspace>,
+    configured_scratch_bytes: usize,
 }
 
 impl Default for SinglePromptEngine {
@@ -281,7 +284,62 @@ impl SinglePromptEngine {
             generation_config: GenerationConfig::new(),
             last_prefill_cpu_mask: 0,
             last_decode_cpu_mask: 0,
+            logits_buf: Vec::new(),
+            scratch_workspace: None,
+            configured_scratch_bytes: 0,
         }
+    }
+
+    /// Configures a minimum byte capacity for the reusable per-pass [`ScratchWorkspace`].
+    #[must_use]
+    pub const fn with_decode_scratch_bytes(mut self, scratch_bytes: usize) -> Self {
+        self.configured_scratch_bytes = scratch_bytes;
+        self
+    }
+
+    /// Updates the minimum byte capacity for the reusable per-pass [`ScratchWorkspace`].
+    pub fn set_decode_scratch_bytes(&mut self, scratch_bytes: usize) {
+        self.configured_scratch_bytes = scratch_bytes;
+    }
+
+    /// Returns the allocated float capacity of the engine's reusable logits buffer.
+    #[must_use]
+    pub fn logits_buf_capacity(&self) -> usize {
+        self.logits_buf.capacity()
+    }
+
+    /// Returns the allocated byte capacity of the engine's reusable [`ScratchWorkspace`].
+    #[must_use]
+    pub fn scratch_capacity_bytes(&self) -> usize {
+        self.scratch_workspace
+            .as_ref()
+            .map_or(0, ScratchWorkspace::capacity_bytes)
+    }
+
+    /// Pre-allocates or grows the reusable logits buffer and [`ScratchWorkspace`] for `weights`,
+    /// `kv_arena`, `n_ctx`, and `logits_len`.
+    ///
+    /// Existing buffers are reused in place without heap allocation when capacities already meet
+    /// or exceed the requested bounds.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::InsufficientLockableMemory`] if allocating or growing the scratch arena fails.
+    pub fn ensure_decode_buffers(
+        &mut self,
+        weights: &dyn ModelWeights,
+        layer_count: usize,
+        n_ctx: usize,
+        logits_len: usize,
+    ) -> Result<(), K3Error> {
+        prepare_reusable_buffers(
+            &mut self.logits_buf,
+            &mut self.scratch_workspace,
+            self.configured_scratch_bytes,
+            weights,
+            layer_count,
+            n_ctx,
+            logits_len,
+        )
     }
 
     /// Configures autoregressive stopping rules (`stop_token_ids` and `ignore_eos`).
@@ -438,18 +496,34 @@ impl SinglePromptEngine {
 
         let n_ctx = kv_arena.n_ctx();
         let logits_len = infer_logits_buffer_len(weights, vocab_size);
-        let mut logits = vec![0.0_f32; logits_len];
+        let effective_policy =
+            self.resolve_effective_policy(recipe, prompt_tokens.len(), worker_pool);
+        prepare_reusable_buffers(
+            &mut self.logits_buf,
+            &mut self.scratch_workspace,
+            self.configured_scratch_bytes,
+            weights,
+            kv_arena.layer_count(),
+            n_ctx,
+            logits_len,
+        )?;
+        let ws = self
+            .scratch_workspace
+            .as_mut()
+            .ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: recipe.architecture_id().to_owned(),
+                reason: "reusable scratch workspace unavailable".to_owned(),
+            })?;
         let mut ctx = ExecutionContext::new_prefill_chunk(
             prompt_tokens,
             n_ctx,
             start_position,
             true,
-            &mut logits,
+            &mut self.logits_buf[..logits_len],
             kv_arena.as_mut_slice(),
-        )?;
+        )?
+        .with_scratch(ws);
 
-        let effective_policy =
-            self.resolve_effective_policy(recipe, prompt_tokens.len(), worker_pool);
         if let Some(pool) = worker_pool {
             pool.reset_barrier_wait();
         }
@@ -460,6 +534,7 @@ impl SinglePromptEngine {
         let requires_kv = recipe.requires_kv_cache();
         self.last_prefill_cpu_mask =
             Self::run_step_on_pool(worker_pool, EnginePhase::Prefill, effective_policy, || {
+                ctx.reset_scratch();
                 if requires_kv {
                     recipe.prefill_step(&mut ctx, weights)
                 } else {
@@ -472,7 +547,7 @@ impl SinglePromptEngine {
         let next_token = sample_greedy_argmax(&ctx.logits()[..sample_len]).ok_or_else(|| {
             K3Error::CapabilityMismatch {
                 architecture: recipe.architecture_id().to_owned(),
-                reason: "empty logits buffer after prefill step".to_owned(),
+                reason: "empty logits buffer after prefill step (or all-NaN)".to_owned(),
             }
         })?;
         let out_logits = ctx.logits()[..sample_len].to_vec();
@@ -515,19 +590,35 @@ impl SinglePromptEngine {
 
         let n_ctx = kv_arena.n_ctx();
         let logits_len = infer_logits_buffer_len(weights, vocab_size);
-        let mut logits = vec![0.0_f32; logits_len];
+        let effective_policy = self.resolve_effective_policy(recipe, 1, worker_pool);
+        prepare_reusable_buffers(
+            &mut self.logits_buf,
+            &mut self.scratch_workspace,
+            self.configured_scratch_bytes,
+            weights,
+            kv_arena.layer_count(),
+            n_ctx,
+            logits_len,
+        )?;
+        let ws = self
+            .scratch_workspace
+            .as_mut()
+            .ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: recipe.architecture_id().to_owned(),
+                reason: "reusable scratch workspace unavailable".to_owned(),
+            })?;
         let tok_slice = [token_id];
         let mut ctx = ExecutionContext::new_prefill_chunk(
             &tok_slice,
             n_ctx,
             position,
             true,
-            &mut logits,
+            &mut self.logits_buf[..logits_len],
             kv_arena.as_mut_slice(),
-        )?;
+        )?
+        .with_scratch(ws);
         ctx.prepare_decode(token_id)?;
 
-        let effective_policy = self.resolve_effective_policy(recipe, 1, worker_pool);
         if let Some(pool) = worker_pool {
             pool.reset_barrier_wait();
         }
@@ -537,6 +628,7 @@ impl SinglePromptEngine {
         self.phase = EnginePhase::Decode;
         self.last_decode_cpu_mask =
             Self::run_step_on_pool(worker_pool, EnginePhase::Decode, effective_policy, || {
+                ctx.reset_scratch();
                 recipe.decode_step(&mut ctx, weights)
             })?;
 
@@ -545,7 +637,7 @@ impl SinglePromptEngine {
         let next_token = sample_greedy_argmax(&ctx.logits()[..sample_len]).ok_or_else(|| {
             K3Error::CapabilityMismatch {
                 architecture: recipe.architecture_id().to_owned(),
-                reason: "empty logits buffer after decode step".to_owned(),
+                reason: "empty logits buffer after decode step (or all-NaN)".to_owned(),
             }
         })?;
         let out_logits = ctx.logits()[..sample_len].to_vec();
@@ -631,13 +723,38 @@ impl SinglePromptEngine {
         }
 
         let n_ctx = kv_arena.n_ctx();
+        if n_ctx == 0 || prompt_tokens.len() > n_ctx {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: prompt_tokens.len(),
+                max_context_tokens: n_ctx,
+            });
+        }
         let logits_len = infer_logits_buffer_len(weights, vocab_size);
-        let mut logits = vec![0.0_f32; logits_len];
-        let mut ctx =
-            ExecutionContext::new(prompt_tokens, n_ctx, &mut logits, kv_arena.as_mut_slice())?;
-
         let effective_policy =
             self.resolve_effective_policy(recipe, prompt_tokens.len(), worker_pool);
+        prepare_reusable_buffers(
+            &mut self.logits_buf,
+            &mut self.scratch_workspace,
+            self.configured_scratch_bytes,
+            weights,
+            kv_arena.layer_count(),
+            n_ctx,
+            logits_len,
+        )?;
+        let ws = self
+            .scratch_workspace
+            .as_mut()
+            .ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: recipe.architecture_id().to_owned(),
+                reason: "reusable scratch workspace unavailable".to_owned(),
+            })?;
+        let mut ctx = ExecutionContext::new(
+            prompt_tokens,
+            n_ctx,
+            &mut self.logits_buf[..logits_len],
+            kv_arena.as_mut_slice(),
+        )?
+        .with_scratch(ws);
 
         let pass_start = Instant::now();
         if let Some(pool) = worker_pool {
@@ -652,6 +769,7 @@ impl SinglePromptEngine {
         let requires_kv = recipe.requires_kv_cache();
         self.last_prefill_cpu_mask =
             Self::run_step_on_pool(worker_pool, EnginePhase::Prefill, effective_policy, || {
+                ctx.reset_scratch();
                 if requires_kv {
                     recipe.prefill_step(&mut ctx, weights)
                 } else {
@@ -691,7 +809,7 @@ impl SinglePromptEngine {
             sample_greedy_argmax(&ctx.logits()[..sample_len]).ok_or_else(|| {
                 K3Error::CapabilityMismatch {
                     architecture: recipe.architecture_id().to_owned(),
-                    reason: "empty logits buffer after prefill step".to_owned(),
+                    reason: "empty logits buffer after prefill step (or all-NaN)".to_owned(),
                 }
             })?;
         let prefill_elapsed = prefill_start.elapsed();
@@ -745,38 +863,37 @@ impl SinglePromptEngine {
             });
         }
 
-        // 2. Transition Prefill -> Decode
+        // 2. Transition Prefill -> Decode (hoist pool phase installation once around loop)
         self.phase = EnginePhase::Decode;
         let decode_start = Instant::now();
         let mut decode_steps = 0usize;
         let mut stop_reason = StopReason::MaxTokens;
 
-        while generated_tokens.len() < max_tokens && ctx.position() < n_ctx {
-            ctx.prepare_decode(current_token)?;
-            self.last_decode_cpu_mask |=
-                Self::run_step_on_pool(worker_pool, EnginePhase::Decode, effective_policy, || {
-                    recipe.decode_step(&mut ctx, weights)
+        if generated_tokens.len() < max_tokens && ctx.position() < n_ctx {
+            let mut step_state = DecodeLoopState {
+                ctx: &mut ctx,
+                generated_tokens: &mut generated_tokens,
+                current_token: &mut current_token,
+                decode_steps: &mut decode_steps,
+                stop_reason: &mut stop_reason,
+                last_decode_cpu_mask: &mut self.last_decode_cpu_mask,
+                generation_config: &self.generation_config,
+                vocab_size,
+                max_tokens,
+                n_ctx,
+            };
+            if let Some(pool) = worker_pool {
+                pool.with_phase_session(EnginePhase::Decode, effective_policy, |session| {
+                    run_decode_loop(
+                        &mut step_state,
+                        recipe,
+                        weights,
+                        &mut on_token,
+                        Some(session),
+                    )
                 })?;
-
-            let step_sample_len = vocab_size.min(ctx.logits().len());
-            current_token =
-                sample_greedy_argmax(&ctx.logits()[..step_sample_len]).ok_or_else(|| {
-                    K3Error::CapabilityMismatch {
-                        architecture: recipe.architecture_id().to_owned(),
-                        reason: "empty logits buffer after decode step".to_owned(),
-                    }
-                })?;
-
-            generated_tokens.push(current_token);
-            decode_steps += 1;
-            if self.generation_config.is_stop_token(current_token) {
-                stop_reason = StopReason::EosToken {
-                    token_id: current_token,
-                };
-                break;
-            }
-            if on_token(current_token)? == StreamAction::Stop {
-                break;
+            } else {
+                run_decode_loop(&mut step_state, recipe, weights, &mut on_token, None)?;
             }
         }
 
@@ -840,13 +957,41 @@ impl SinglePromptEngine {
                 reason: "classification num_labels must be greater than zero".to_owned(),
             });
         }
+        if n_ctx == 0 || prompt_tokens.len() > n_ctx {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: prompt_tokens.len(),
+                max_context_tokens: n_ctx,
+            });
+        }
 
-        let mut logits = vec![0.0_f32; num_labels];
-        let mut ctx = ExecutionContext::new(prompt_tokens, n_ctx, &mut logits, &mut [])?;
+        prepare_reusable_buffers(
+            &mut self.logits_buf,
+            &mut self.scratch_workspace,
+            self.configured_scratch_bytes,
+            weights,
+            1,
+            n_ctx,
+            num_labels,
+        )?;
+        let ws = self
+            .scratch_workspace
+            .as_mut()
+            .ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: recipe.architecture_id().to_owned(),
+                reason: "reusable scratch workspace unavailable".to_owned(),
+            })?;
+        let mut ctx = ExecutionContext::new(
+            prompt_tokens,
+            n_ctx,
+            &mut self.logits_buf[..num_labels],
+            &mut [],
+        )?
+        .with_scratch(ws);
         let pass_start = Instant::now();
         self.last_prefill_cpu_mask = crate::affinity::current_execution_cpu_mask();
         self.last_decode_cpu_mask = 0;
         self.phase = EnginePhase::Prefill;
+        ctx.reset_scratch();
         recipe.forward_classify(&mut ctx, weights)?;
 
         let prefill_elapsed = pass_start.elapsed();
@@ -854,10 +999,11 @@ impl SinglePromptEngine {
         let prefill_ms = prefill_elapsed.as_secs_f64() * 1000.0;
         let winning_label = sample_greedy_argmax(ctx.logits()).unwrap_or(0);
         let final_position = ctx.position();
+        let out_logits = ctx.logits().to_vec();
         self.phase = EnginePhase::Completed;
 
         Ok((
-            logits,
+            out_logits,
             EvaluationSummary {
                 prompt_tokens: prompt_tokens.len(),
                 generated_tokens: vec![winning_label],
@@ -907,19 +1053,43 @@ impl SinglePromptEngine {
             });
         }
 
+        let n_ctx = kv_arena.n_ctx();
+        if n_ctx == 0 || prompt_tokens.len() > n_ctx {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: prompt_tokens.len(),
+                max_context_tokens: n_ctx,
+            });
+        }
         let logits_len = infer_logits_buffer_len(weights, vocab_size);
-        let mut logits = vec![0.0_f32; logits_len];
+        prepare_reusable_buffers(
+            &mut self.logits_buf,
+            &mut self.scratch_workspace,
+            self.configured_scratch_bytes,
+            weights,
+            kv_arena.layer_count(),
+            n_ctx,
+            logits_len,
+        )?;
+        let ws = self
+            .scratch_workspace
+            .as_mut()
+            .ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: recipe.architecture_id().to_owned(),
+                reason: "reusable scratch workspace unavailable".to_owned(),
+            })?;
         let mut ctx = ExecutionContext::new(
             prompt_tokens,
-            kv_arena.n_ctx(),
-            &mut logits,
+            n_ctx,
+            &mut self.logits_buf[..logits_len],
             kv_arena.as_mut_slice(),
-        )?;
+        )?
+        .with_scratch(ws);
 
         let pass_start = Instant::now();
         self.last_prefill_cpu_mask = crate::affinity::current_execution_cpu_mask();
         self.last_decode_cpu_mask = 0;
         self.phase = EnginePhase::Prefill;
+        ctx.reset_scratch();
         if recipe.requires_kv_cache() {
             recipe.prefill_step(&mut ctx, weights)?;
         } else {
@@ -930,8 +1100,9 @@ impl SinglePromptEngine {
         let prefill_ms = prefill_elapsed.as_secs_f64() * 1000.0;
         let final_position = ctx.position();
 
+        let sample_len = vocab_size.min(ctx.logits().len());
         let score = compute_calibrated_binary_risk(
-            &logits[..vocab_size.min(logits.len())],
+            &ctx.logits()[..sample_len],
             affirmative_token_id,
             negative_token_id,
         )?;
@@ -963,6 +1134,191 @@ impl SinglePromptEngine {
             },
         ))
     }
+}
+
+struct DecodeLoopState<'a, 'b> {
+    ctx: &'a mut ExecutionContext<'b>,
+    generated_tokens: &'a mut Vec<u32>,
+    current_token: &'a mut u32,
+    decode_steps: &'a mut usize,
+    stop_reason: &'a mut StopReason,
+    last_decode_cpu_mask: &'a mut u64,
+    generation_config: &'a GenerationConfig,
+    vocab_size: usize,
+    max_tokens: usize,
+    n_ctx: usize,
+}
+
+fn run_single_decode_step(
+    ctx: &mut ExecutionContext<'_>,
+    recipe: &dyn ArchRecipe,
+    weights: &dyn ModelWeights,
+    vocab_size: usize,
+    token_in: u32,
+) -> Result<(u32, u64), K3Error> {
+    ctx.reset_scratch();
+    ctx.prepare_decode(token_in)?;
+    let cpu_mask = crate::affinity::current_execution_cpu_mask();
+    recipe.decode_step(ctx, weights)?;
+    let step_sample_len = vocab_size.min(ctx.logits().len());
+    let next_token = sample_greedy_argmax(&ctx.logits()[..step_sample_len]).ok_or_else(|| {
+        K3Error::CapabilityMismatch {
+            architecture: recipe.architecture_id().to_owned(),
+            reason: "empty logits buffer after decode step (or all-NaN)".to_owned(),
+        }
+    })?;
+    Ok((next_token, cpu_mask))
+}
+
+fn run_decode_loop<F>(
+    state: &mut DecodeLoopState<'_, '_>,
+    recipe: &dyn ArchRecipe,
+    weights: &dyn ModelWeights,
+    on_token: &mut F,
+    mut session: Option<&mut PhaseSession<'_>>,
+) -> Result<(), K3Error>
+where
+    F: FnMut(u32) -> Result<StreamAction, K3Error>,
+{
+    while state.generated_tokens.len() < state.max_tokens && state.ctx.position() < state.n_ctx {
+        let token_in = *state.current_token;
+        let ctx_ref = &mut *state.ctx;
+        let vocab_size = state.vocab_size;
+        let (next_token, cpu_mask) = if let Some(active_session) = session.as_deref_mut() {
+            active_session
+                .run(|| run_single_decode_step(ctx_ref, recipe, weights, vocab_size, token_in))?
+        } else {
+            run_single_decode_step(ctx_ref, recipe, weights, vocab_size, token_in)?
+        };
+
+        *state.last_decode_cpu_mask |= cpu_mask;
+        *state.current_token = next_token;
+        state.generated_tokens.push(next_token);
+        *state.decode_steps += 1;
+        if state.generation_config.is_stop_token(next_token) {
+            *state.stop_reason = StopReason::EosToken {
+                token_id: next_token,
+            };
+            break;
+        }
+        if on_token(next_token)? == StreamAction::Stop {
+            break;
+        }
+    }
+    Ok(())
+}
+
+const MIN_DECODE_SCRATCH_BYTES: usize = 16 * 1024;
+
+fn tensor_dim_or(weights: &dyn ModelWeights, name: &str, axis: usize) -> Option<usize> {
+    weights
+        .tensor(name)
+        .ok()
+        .and_then(|view| view.shape().get(axis).copied())
+        .filter(|&dim| dim > 0)
+}
+
+fn infer_weight_layer_count(weights: &dyn ModelWeights, min_layers: usize) -> usize {
+    let start = min_layers.max(1);
+    let mut count = start;
+    for idx in start..256 {
+        let probe = format!("blk.{idx}.attn_norm.weight");
+        if weights.contains_tensor(&probe) {
+            count = idx + 1;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
+const fn act_view_scratch_bytes(cols: usize) -> usize {
+    let min_cols = if cols > 32 { cols } else { 32 };
+    min_cols
+        .saturating_mul(2)
+        .saturating_add(512)
+        .next_multiple_of(128)
+}
+
+fn estimate_decode_scratch_bytes(
+    weights: &dyn ModelWeights,
+    layer_count: usize,
+    n_ctx: usize,
+) -> usize {
+    let hidden_dim = tensor_dim_or(weights, "output_norm.weight", 0)
+        .or_else(|| tensor_dim_or(weights, "token_embd.weight", 0))
+        .or_else(|| tensor_dim_or(weights, "blk.0.attn_q.weight", 0))
+        .unwrap_or(64)
+        .max(16);
+    let total_q = tensor_dim_or(weights, "blk.0.attn_q.weight", 1)
+        .or_else(|| tensor_dim_or(weights, "blk.0.attn_qkv.weight", 1))
+        .unwrap_or(hidden_dim)
+        .max(16);
+    let total_kv = tensor_dim_or(weights, "blk.0.attn_k.weight", 1)
+        .unwrap_or(hidden_dim)
+        .max(16);
+    let ffn_dim = tensor_dim_or(weights, "blk.0.ffn_gate.weight", 1)
+        .or_else(|| tensor_dim_or(weights, "blk.0.ffn_up.weight", 1))
+        .unwrap_or_else(|| hidden_dim.saturating_mul(4))
+        .max(16);
+    let n_experts = tensor_dim_or(weights, "blk.0.ffn_gate_exps.weight", 2).unwrap_or(0);
+
+    let per_layer_views = act_view_scratch_bytes(hidden_dim)
+        .saturating_mul(6)
+        .saturating_add(act_view_scratch_bytes(total_q).saturating_mul(2))
+        .saturating_add(act_view_scratch_bytes(total_kv))
+        .saturating_add(act_view_scratch_bytes(ffn_dim).saturating_mul(2));
+    let per_layer_f32 = hidden_dim
+        .saturating_mul(8)
+        .saturating_add(total_q.saturating_mul(4))
+        .saturating_add(total_kv.saturating_mul(2))
+        .saturating_add(ffn_dim.saturating_mul(3))
+        .saturating_add(n_ctx.max(1))
+        .saturating_add(n_experts)
+        .saturating_mul(size_of::<f32>())
+        .saturating_add(24 * 128);
+
+    // Virtual-layer recipes (such as `dory`) may hold up to 2x layer count scopes per pass.
+    let effective_layers = layer_count.max(1).saturating_mul(2);
+    let layered = per_layer_views
+        .saturating_add(per_layer_f32)
+        .saturating_mul(effective_layers);
+    let partitioned_fallback = 32_usize
+        .saturating_mul(hidden_dim.max(total_q).max(ffn_dim))
+        .saturating_mul(8);
+    layered
+        .max(partitioned_fallback)
+        .max(MIN_DECODE_SCRATCH_BYTES)
+        .next_multiple_of(128)
+}
+
+fn prepare_reusable_buffers(
+    logits_buf: &mut Vec<f32>,
+    scratch_workspace: &mut Option<ScratchWorkspace>,
+    configured_scratch_bytes: usize,
+    weights: &dyn ModelWeights,
+    min_layers: usize,
+    n_ctx: usize,
+    logits_len: usize,
+) -> Result<(), K3Error> {
+    if logits_buf.len() < logits_len {
+        logits_buf.resize(logits_len, 0.0);
+    }
+    logits_buf[..logits_len].fill(0.0);
+
+    let layer_count = infer_weight_layer_count(weights, min_layers);
+    let required_scratch =
+        configured_scratch_bytes.max(estimate_decode_scratch_bytes(weights, layer_count, n_ctx));
+    let needs_alloc = scratch_workspace
+        .as_ref()
+        .is_none_or(|ws| ws.capacity_bytes() < required_scratch);
+    if needs_alloc {
+        *scratch_workspace = Some(ScratchWorkspace::new(required_scratch)?);
+    }
+    if let Some(ws) = scratch_workspace.as_mut() {
+        ws.reset();
+    }
+    Ok(())
 }
 
 /// Calibrated binary risk score extracted from single-prefill affirmative vs negative token logits
@@ -1509,23 +1865,33 @@ pub(crate) fn compute_pass_timing_with_reason(
 }
 
 /// Deterministic greedy (temperature `0.0`) argmax token sampler with lowest-token-ID tie-breaking.
+///
+/// Dispatches to [`jero_kernels_rvv::argmax_f32`] when `jero-kernels-rvv` is enabled (which uses
+/// RVV 1.0 `vfredmax.vs`/`vmfeq.vf`/`vfirst.m` on `riscv64`) and skips `NaN` logits uniformly,
+/// returning `None` for empty or all-`NaN` slices.
 #[must_use]
 pub fn sample_greedy_argmax(logits: &[f32]) -> Option<u32> {
-    if logits.is_empty() {
-        return None;
+    #[cfg(feature = "jero-kernels-rvv")]
+    {
+        jero_kernels_rvv::argmax_f32(logits).and_then(|idx| u32::try_from(idx).ok())
     }
+    #[cfg(not(feature = "jero-kernels-rvv"))]
+    {
+        let mut best_id: Option<usize> = None;
+        let mut best_score = f32::NEG_INFINITY;
 
-    let mut best_id = 0_usize;
-    let mut best_score = logits[0];
-
-    for (i, &score) in logits.iter().enumerate().skip(1) {
-        if score > best_score {
-            best_score = score;
-            best_id = i;
+        for (i, &score) in logits.iter().enumerate() {
+            if score.is_nan() {
+                continue;
+            }
+            if best_id.is_none() || score > best_score {
+                best_score = score;
+                best_id = Some(i);
+            }
         }
-    }
 
-    u32::try_from(best_id).ok()
+        best_id.and_then(|idx| u32::try_from(idx).ok())
+    }
 }
 
 #[cfg(test)]
@@ -2305,5 +2671,191 @@ mod tests {
         assert_eq!(legacy.prompt_tokens, 0);
         assert_eq!(legacy.prefill_ns, 0);
         assert_eq!(legacy.prefill_tokens_per_sec(), 0.0);
+    }
+
+    #[test]
+    fn test_sample_greedy_argmax_large_vocab_parity_ties_nan_and_inf() {
+        assert_eq!(sample_greedy_argmax(&[]), None);
+        assert_eq!(sample_greedy_argmax(&[f32::NAN; 1024]), None);
+        assert_eq!(
+            sample_greedy_argmax(&[f32::NAN, 3.5, f32::NAN, 2.0]),
+            Some(1)
+        );
+        assert_eq!(
+            sample_greedy_argmax(&[f32::NEG_INFINITY, f32::NEG_INFINITY]),
+            Some(0)
+        );
+
+        for vocab_len in [32_768_usize, 65_537, 256_000] {
+            let mut all_neg: Vec<f32> = (0..vocab_len)
+                .map(|i| {
+                    #[expect(clippy::cast_precision_loss, reason = "bounded test vocab index")]
+                    let val = -100.0 - ((i % 97) as f32);
+                    val
+                })
+                .collect();
+            let peak_idx = vocab_len - 17;
+            all_neg[peak_idx] = -0.25;
+            all_neg[0] = f32::NEG_INFINITY;
+            assert_eq!(
+                sample_greedy_argmax(&all_neg),
+                u32::try_from(peak_idx).ok(),
+                "negative logit peak mismatch for vocab={vocab_len}"
+            );
+
+            // Lowest-index tie-breaking even with interior NaNs.
+            let mut ties = vec![1.25_f32; vocab_len];
+            let first_tie = 103_usize;
+            let second_tie = vocab_len / 2 + 11;
+            ties[0] = f32::NAN;
+            ties[first_tie] = 42.5;
+            ties[second_tie] = 42.5;
+            ties[vocab_len - 1] = f32::NAN;
+            assert_eq!(
+                sample_greedy_argmax(&ties),
+                u32::try_from(first_tie).ok(),
+                "tie-break lowest ID mismatch for vocab={vocab_len}"
+            );
+
+            #[cfg(feature = "jero-kernels-rvv")]
+            assert_eq!(
+                sample_greedy_argmax(&ties),
+                jero_kernels_rvv::argmax_f32_scalar(&ties).and_then(|id| u32::try_from(id).ok())
+            );
+        }
+    }
+
+    #[test]
+    fn test_engine_fails_closed_on_all_nan_logits() {
+        use jero_core::{GgufFile, QuantType, test_helpers::create_synthetic_gguf_v3};
+
+        #[derive(Debug)]
+        struct AllNanDecodeRecipe;
+
+        impl ArchRecipe for AllNanDecodeRecipe {
+            fn architecture_id(&self) -> &'static str {
+                "all-nan-stub"
+            }
+
+            fn supports_quant(&self, _quant: QuantType) -> bool {
+                true
+            }
+
+            fn prefill_step(
+                &self,
+                ctx: &mut ExecutionContext<'_>,
+                _weights: &dyn ModelWeights,
+            ) -> Result<(), K3Error> {
+                ctx.advance_position(ctx.prompt_tokens().len())?;
+                ctx.logits_mut().fill(0.0);
+                ctx.logits_mut()[2] = 5.0;
+                Ok(())
+            }
+
+            fn decode_step(
+                &self,
+                ctx: &mut ExecutionContext<'_>,
+                _weights: &dyn ModelWeights,
+            ) -> Result<(), K3Error> {
+                ctx.advance_position(1)?;
+                ctx.logits_mut().fill(f32::NAN);
+                Ok(())
+            }
+        }
+
+        let bytes = create_synthetic_gguf_v3(
+            "all-nan-stub",
+            64,
+            &[("output_norm.weight", QuantType::F32, &[16][..])],
+        );
+        let gguf = GgufFile::parse(&bytes).expect("parse gguf");
+        let mut kv = SingleSlotKvArena::new(gguf.metadata(), 64).expect("kv");
+        let mut engine = SinglePromptEngine::new();
+        let err = engine
+            .evaluate_prompt(&AllNanDecodeRecipe, &gguf, &mut kv, &[1, 2], 16, 4, |_| {
+                Ok(StreamAction::Continue)
+            })
+            .expect_err("all-NaN decode logits must fail closed");
+        assert!(matches!(err, K3Error::CapabilityMismatch { .. }));
+    }
+
+    #[cfg(feature = "jero-arch-synthetic")]
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_engine_hoisted_decode_session_determinism_and_buffer_reuse_n_ctx_64() {
+        use jero_arch_synthetic::SyntheticRecipe;
+        use jero_core::CoordinationProfile;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let tensor_specs = [
+            ("blk.0.attn_q.weight", QuantType::Q4_K_M, &[256, 2][..]),
+            ("output_norm.weight", QuantType::F32, &[16][..]),
+        ];
+        let bytes = create_synthetic_gguf_v3("synthetic", 64, &tensor_specs);
+        let gguf = GgufFile::parse(&bytes).expect("parse gguf");
+        let recipe = SyntheticRecipe::new();
+
+        let mut kv_ref = SingleSlotKvArena::new(gguf.metadata(), 64).expect("kv ref");
+        let mut engine_ref = SinglePromptEngine::new();
+        let ref_summary = engine_ref
+            .evaluate_prompt(&recipe, &gguf, &mut kv_ref, &[1, 3, 5], 16, 8, |_| {
+                Ok(StreamAction::Continue)
+            })
+            .expect("baseline evaluate_prompt");
+        let logits_cap_after_first = engine_ref.logits_buf_capacity();
+        let scratch_cap_after_first = engine_ref.scratch_capacity_bytes();
+        assert!(logits_cap_after_first >= 16);
+        assert!(scratch_cap_after_first >= MIN_DECODE_SCRATCH_BYTES);
+
+        // Second pass with identical bounds reuses allocations in place (capacities stay equal).
+        let mut kv_ref2 = SingleSlotKvArena::new(gguf.metadata(), 64).expect("kv ref2");
+        let ref_summary2 = engine_ref
+            .evaluate_prompt(&recipe, &gguf, &mut kv_ref2, &[1, 3, 5], 16, 8, |_| {
+                Ok(StreamAction::Continue)
+            })
+            .expect("second pass reuse");
+        assert_eq!(ref_summary.generated_tokens, ref_summary2.generated_tokens);
+        assert_eq!(engine_ref.logits_buf_capacity(), logits_cap_after_first);
+        assert_eq!(engine_ref.scratch_capacity_bytes(), scratch_cap_after_first);
+
+        for profile in [
+            CoordinationProfile::Spin,
+            CoordinationProfile::Futex,
+            CoordinationProfile::Rayon,
+        ] {
+            let pool = WorkerPool::for_phase_policy(
+                ClusterPhasePolicy::X100Only,
+                gguf.metadata(),
+                8,
+                None,
+                Some(2),
+                profile,
+            )
+            .expect("2-thread pool");
+            let mut kv_pool = SingleSlotKvArena::new(gguf.metadata(), 64).expect("kv pool");
+            let mut engine = SinglePromptEngine::new();
+            // Verify `!Send` streaming callback remains supported with `with_phase_session`.
+            let non_send_log = Rc::new(RefCell::new(Vec::new()));
+            let log_ref = Rc::clone(&non_send_log);
+            let summary = engine
+                .evaluate_prompt_with_pool(
+                    &recipe,
+                    &gguf,
+                    &mut kv_pool,
+                    Some(&pool),
+                    &[1, 3, 5],
+                    16,
+                    8,
+                    move |tok| {
+                        log_ref.borrow_mut().push(tok);
+                        Ok(StreamAction::Continue)
+                    },
+                )
+                .expect("evaluate_prompt_with_pool");
+            assert_eq!(summary.generated_tokens, ref_summary.generated_tokens);
+            assert_eq!(*non_send_log.borrow(), ref_summary.generated_tokens);
+            assert_eq!(summary.final_position, ref_summary.final_position);
+        }
     }
 }

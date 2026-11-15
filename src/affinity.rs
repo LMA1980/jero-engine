@@ -4,10 +4,20 @@
 //! (`x100` or `a100`), core bitmask, and worker concurrency bound while preventing cross-cluster
 //! VLEN migration (ADR-007, ADR-008, `core-affinity.md`, US-01 Scenario 2).
 
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::fs;
+use std::marker::PhantomData;
+use std::ops::Range;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "riscv64",
+    not(miri),
+    feature = "jero-kernels-rvv"
+))]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -16,6 +26,58 @@ use serde::{Deserialize, Serialize};
 
 thread_local! {
     static CURRENT_ASSIGNED_CORE: Cell<Option<usize>> = const { Cell::new(None) };
+    static CURRENT_WORKER_POOL: Cell<Option<*const WorkerPool>> = const { Cell::new(None) };
+    static CURRENT_DEDICATED_WORKER: Cell<Option<DedicatedWorkerCtx>> = const { Cell::new(None) };
+}
+
+#[derive(Clone, Copy)]
+struct DedicatedWorkerCtx {
+    shared_ptr: *const DedicatedShared,
+    worker_index: usize,
+    in_nested: bool,
+}
+
+struct TlsPoolGuard<'a> {
+    prev: Option<*const WorkerPool>,
+    _marker: PhantomData<&'a WorkerPool>,
+}
+
+impl<'a> TlsPoolGuard<'a> {
+    fn enter(pool: &'a WorkerPool) -> Self {
+        let prev = CURRENT_WORKER_POOL.with(|c| c.replace(Some(std::ptr::from_ref(pool))));
+        Self {
+            prev,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl Drop for TlsPoolGuard<'_> {
+    fn drop(&mut self) {
+        CURRENT_WORKER_POOL.with(|c| c.set(self.prev));
+    }
+}
+
+struct TlsDedicatedWorkerGuard {
+    prev: Option<DedicatedWorkerCtx>,
+}
+
+impl TlsDedicatedWorkerGuard {
+    fn enter(shared_ptr: *const DedicatedShared, worker_index: usize, in_nested: bool) -> Self {
+        let ctx = DedicatedWorkerCtx {
+            shared_ptr,
+            worker_index,
+            in_nested,
+        };
+        let prev = CURRENT_DEDICATED_WORKER.with(|c| c.replace(Some(ctx)));
+        Self { prev }
+    }
+}
+
+impl Drop for TlsDedicatedWorkerGuard {
+    fn drop(&mut self) {
+        CURRENT_DEDICATED_WORKER.with(|c| c.set(self.prev));
+    }
 }
 
 #[allow(dead_code)]
@@ -1167,12 +1229,526 @@ pub struct WorkerAffinityStatus {
     pub proc_cpus_allowed_list: String,
 }
 
-type JobFn = Arc<dyn Fn(usize, usize) + Send + Sync>;
+pub type JobFn = Arc<dyn Fn(usize, usize) + Send + Sync>;
+
+#[derive(Clone, Copy)]
+struct SyncConstPtr<T>(*const T);
+
+impl<T> SyncConstPtr<T> {
+    const fn from_ref(r: &T) -> Self {
+        Self(std::ptr::from_ref(r))
+    }
+
+    // SAFETY: Caller ensures pointee outlives dereference and has valid provenance for `&T`.
+    unsafe fn as_ref(&self) -> &T {
+        // SAFETY: Upheld by caller contract documented on `as_ref`.
+        unsafe { &*self.0 }
+    }
+}
+
+// SAFETY: Only constructed when caller synchronizes worker completion before `&T` ends and `T: Sync`.
+unsafe impl<T> Send for SyncConstPtr<T> {}
+// SAFETY: Read-only pointer wrapper for `T: Sync`.
+unsafe impl<T> Sync for SyncConstPtr<T> {}
+
+#[derive(Clone, Copy)]
+struct SyncMutPtr<T>(*mut T);
+
+impl<T> SyncMutPtr<T> {
+    const fn as_ptr(&self) -> *mut T {
+        self.0
+    }
+}
+
+// SAFETY: Workers strictly access mutually disjoint index ranges bounded by barrier synchronization.
+unsafe impl<T: Send> Send for SyncMutPtr<T> {}
+// SAFETY: Workers strictly access mutually disjoint index ranges within caller-owned allocation.
+unsafe impl<T: Send> Sync for SyncMutPtr<T> {}
+
+#[derive(Clone, Copy)]
+struct RawWorkerTask {
+    invoke: unsafe fn(*const (), usize, usize),
+    data: *const (),
+}
+
+impl RawWorkerTask {
+    fn from_fn<F: Fn(usize, usize) + Sync>(f: &F) -> Self {
+        unsafe fn call<F: Fn(usize, usize) + Sync>(ptr: *const (), worker_idx: usize, n: usize) {
+            // SAFETY: `ptr` borrows caller's `F` until barrier wait completes.
+            let f = unsafe { &*ptr.cast::<F>() };
+            f(worker_idx, n);
+        }
+        Self {
+            invoke: call::<F>,
+            data: std::ptr::from_ref(f).cast(),
+        }
+    }
+
+    // SAFETY: Caller ensures task target remains live until worker completion barrier exits.
+    unsafe fn call(&self, worker_idx: usize, num_workers: usize) {
+        // SAFETY: Upheld by caller contract documented on `call`.
+        unsafe { (self.invoke)(self.data, worker_idx, num_workers) };
+    }
+}
+
+// SAFETY: Borrowed closure lifetime is strictly bounded by synchronous barrier completion.
+unsafe impl Send for RawWorkerTask {}
+// SAFETY: Shared access to `F: Sync` across workers for barrier-bounded execution.
+unsafe impl Sync for RawWorkerTask {}
+
+#[derive(Clone, Copy)]
+struct RawInstallReq {
+    invoke: unsafe fn(*const ()),
+    slot: *const (),
+    pool: *const WorkerPool,
+}
+
+// SAFETY: Caller waits on `host_done` before popping `slot` or `&WorkerPool`.
+unsafe impl Send for RawInstallReq {}
+
+#[derive(Clone, Copy)]
+struct ParallelDispatch {
+    task: RawWorkerTask,
+    workers_only: bool,
+}
 
 struct PoolSharedState {
-    generation: usize,
-    active_job: Option<JobFn>,
+    parallel_gen: usize,
+    parallel_task: Option<ParallelDispatch>,
+    install_gen: usize,
+    install_req: Option<RawInstallReq>,
     shutdown: bool,
+}
+
+struct DedicatedShared {
+    profile: CoordinationProfile,
+    num_workers: usize,
+    exec_mutex: Mutex<()>,
+    state: Mutex<PoolSharedState>,
+    worker0_cvar: Condvar,
+    workers_rest_cvar: Condvar,
+    host_done: (Mutex<bool>, Condvar),
+    #[cfg(not(miri))]
+    session_shared: SessionShared,
+    shutdown: Arc<AtomicBool>,
+    wait_slots: Arc<[WorkerWaitSlot]>,
+    spin_barrier: Option<Arc<SpinBarrier>>,
+    futex_barrier: Option<Arc<FutexBarrier>>,
+    workers_spin_barrier: Option<Arc<SpinBarrier>>,
+    workers_futex_barrier: Option<Arc<FutexBarrier>>,
+    coordinator_sense: AtomicBool,
+    worker0_seen_parallel_gen: AtomicUsize,
+    worker0_workers_sense: AtomicBool,
+}
+
+impl DedicatedShared {
+    fn wait_all_worker(&self, worker_index: usize, local_sense: &mut bool) {
+        if let Some(barrier) = &self.spin_barrier {
+            let wait_time = barrier.wait(local_sense, &self.shutdown);
+            self.wait_slots[worker_index].record_wait(wait_time);
+        } else if let Some(barrier) = &self.futex_barrier {
+            let wait_time = barrier.wait(&self.shutdown);
+            self.wait_slots[worker_index].record_wait(wait_time);
+        }
+    }
+
+    fn wait_nested_worker(&self, worker_index: usize, local_sense: &mut bool) {
+        if let Some(barrier) = &self.workers_spin_barrier {
+            let wait_time = barrier.wait(local_sense, &self.shutdown);
+            self.wait_slots[worker_index].record_wait(wait_time);
+        } else if let Some(barrier) = &self.workers_futex_barrier {
+            let wait_time = barrier.wait(&self.shutdown);
+            self.wait_slots[worker_index].record_wait(wait_time);
+        }
+    }
+
+    fn wait_coordinator_all(&self) {
+        if let Some(barrier) = &self.spin_barrier {
+            let mut local_sense = self.coordinator_sense.load(Ordering::Relaxed);
+            barrier.wait(&mut local_sense, &self.shutdown);
+            self.coordinator_sense.store(local_sense, Ordering::Relaxed);
+        } else if let Some(barrier) = &self.futex_barrier {
+            barrier.wait(&self.shutdown);
+        }
+    }
+
+    fn clear_parallel_task(&self) {
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.parallel_task = None;
+    }
+}
+
+struct DedicatedAsyncWaiter<'a> {
+    shared: &'a DedicatedShared,
+    _exec_guard: MutexGuard<'a, ()>,
+}
+
+impl Drop for DedicatedAsyncWaiter<'_> {
+    fn drop(&mut self) {
+        self.shared.wait_coordinator_all();
+        self.shared.clear_parallel_task();
+    }
+}
+
+enum Worker0Action {
+    Install(Option<RawInstallReq>),
+    Parallel(Option<ParallelDispatch>),
+}
+
+fn run_worker0_loop(shared: &Arc<DedicatedShared>) {
+    let mut external_sense = false;
+    let mut seen_install_gen = 0usize;
+    let num_workers = shared.num_workers;
+    let shared_ptr = Arc::as_ptr(shared);
+
+    loop {
+        let action = {
+            let mut guard = shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+            while !guard.shutdown
+                && !shared.shutdown.load(Ordering::Relaxed)
+                && guard.install_gen == seen_install_gen
+                && guard.parallel_gen == shared.worker0_seen_parallel_gen.load(Ordering::Relaxed)
+            {
+                guard = shared
+                    .worker0_cvar
+                    .wait(guard)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            if guard.shutdown || shared.shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            if guard.install_gen == seen_install_gen {
+                shared
+                    .worker0_seen_parallel_gen
+                    .store(guard.parallel_gen, Ordering::Relaxed);
+                Worker0Action::Parallel(guard.parallel_task)
+            } else {
+                seen_install_gen = guard.install_gen;
+                Worker0Action::Install(guard.install_req.take())
+            }
+        };
+
+        match action {
+            Worker0Action::Install(Some(req)) => {
+                let w_guard = TlsDedicatedWorkerGuard::enter(shared_ptr, 0, false);
+                // SAFETY: Caller keeps `&WorkerPool` alive while blocked waiting on `host_done`.
+                let pool_guard = TlsPoolGuard::enter(unsafe { &*req.pool });
+                // SAFETY: `invoke` catches panics and writes the result before returning.
+                unsafe { (req.invoke)(req.slot) };
+                drop(pool_guard);
+                drop(w_guard);
+
+                let (done_lock, done_cvar) = &shared.host_done;
+                let mut done = done_lock.lock().unwrap_or_else(PoisonError::into_inner);
+                *done = true;
+                done_cvar.notify_all();
+            }
+            Worker0Action::Install(None) => {
+                let (done_lock, done_cvar) = &shared.host_done;
+                let mut done = done_lock.lock().unwrap_or_else(PoisonError::into_inner);
+                *done = true;
+                done_cvar.notify_all();
+            }
+            Worker0Action::Parallel(Some(dispatch)) => {
+                let _w_guard = TlsDedicatedWorkerGuard::enter(shared_ptr, 0, true);
+                // SAFETY: Borrowed task remains valid until barrier synchronization completes.
+                unsafe { (dispatch.task.invoke)(dispatch.task.data, 0, num_workers) };
+                shared.wait_all_worker(0, &mut external_sense);
+            }
+            Worker0Action::Parallel(None) => {
+                shared.wait_all_worker(0, &mut external_sense);
+            }
+        }
+
+        if shared.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+    }
+}
+
+fn run_subworker_loop(shared: &Arc<DedicatedShared>, worker_index: usize) {
+    let mut external_sense = false;
+    let mut workers_sense = false;
+    let mut seen_parallel_gen = 0usize;
+    let num_workers = shared.num_workers;
+    let shared_ptr = Arc::as_ptr(shared);
+
+    loop {
+        let dispatch = {
+            let mut guard = shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+            while !guard.shutdown
+                && !shared.shutdown.load(Ordering::Relaxed)
+                && guard.parallel_gen == seen_parallel_gen
+            {
+                guard = shared
+                    .workers_rest_cvar
+                    .wait(guard)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            if guard.shutdown || shared.shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            seen_parallel_gen = guard.parallel_gen;
+            guard.parallel_task
+        };
+
+        if let Some(d) = dispatch {
+            let _w_guard = TlsDedicatedWorkerGuard::enter(shared_ptr, worker_index, true);
+            // SAFETY: Borrowed task remains valid until barrier synchronization completes.
+            unsafe { (d.task.invoke)(d.task.data, worker_index, num_workers) };
+            if d.workers_only {
+                shared.wait_nested_worker(worker_index, &mut workers_sense);
+            } else {
+                shared.wait_all_worker(worker_index, &mut external_sense);
+            }
+        }
+
+        if shared.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+    }
+}
+
+fn dedicated_worker_entry(
+    shared: &Arc<DedicatedShared>,
+    worker_index: usize,
+    assigned_core: usize,
+    req_mask: u64,
+    tx: &mpsc::Sender<Result<WorkerAffinityStatus, K3Error>>,
+) {
+    set_current_thread_core(assigned_core);
+    // SAFETY: `raw_pin_thread` uses only fixed-frame integer syscalls to pin the worker.
+    let pin_res = unsafe { raw_pin_thread(assigned_core) };
+    let pin_result = verify_pinned_thread(
+        worker_index,
+        assigned_core,
+        req_mask,
+        shared.num_workers,
+        pin_res,
+    );
+    let is_ok = pin_result.is_ok();
+    let _ = tx.send(pin_result);
+    if !is_ok {
+        return;
+    }
+    if worker_index == 0 {
+        run_worker0_loop(shared);
+    } else {
+        run_subworker_loop(shared, worker_index);
+    }
+}
+
+#[cfg(not(miri))]
+struct RayonSignal {
+    done: Mutex<bool>,
+    cvar: Condvar,
+}
+
+#[cfg(not(miri))]
+impl RayonSignal {
+    const fn new() -> Self {
+        Self {
+            done: Mutex::new(false),
+            cvar: Condvar::new(),
+        }
+    }
+
+    fn mark_done(&self) {
+        let mut g = self.done.lock().unwrap_or_else(PoisonError::into_inner);
+        *g = true;
+        self.cvar.notify_all();
+    }
+
+    fn wait(&self) {
+        let mut g = self.done.lock().unwrap_or_else(PoisonError::into_inner);
+        while !*g {
+            g = self.cvar.wait(g).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+#[cfg(not(miri))]
+struct RayonFinishNotifier<'a>(&'a RayonSignal);
+
+#[cfg(not(miri))]
+impl Drop for RayonFinishNotifier<'_> {
+    fn drop(&mut self) {
+        self.0.mark_done();
+    }
+}
+
+#[cfg(not(miri))]
+struct RayonSignalWaiter<'a>(&'a RayonSignal);
+
+#[cfg(not(miri))]
+impl Drop for RayonSignalWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.wait();
+    }
+}
+
+#[cfg(not(miri))]
+#[derive(Clone, Copy)]
+struct SessionStep {
+    invoke: unsafe fn(*const ()),
+    slot: *const (),
+}
+
+#[cfg(not(miri))]
+// SAFETY: Caller blocks inside `PhaseSession::run` until worker marks `SessionCmd::Done`.
+unsafe impl Send for SessionStep {}
+
+#[cfg(not(miri))]
+enum SessionCmd {
+    Idle,
+    Run(SessionStep),
+    Done,
+    Close,
+}
+
+#[cfg(not(miri))]
+fn pre_touch_sync_pair<T>(mutex: &Mutex<T>, cvar: &Condvar) {
+    let guard = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+    let (guard, _) = cvar
+        .wait_timeout(guard, Duration::ZERO)
+        .unwrap_or_else(PoisonError::into_inner);
+    cvar.notify_all();
+    drop(guard);
+}
+
+#[cfg(not(miri))]
+struct SessionShared {
+    mutex: Mutex<SessionCmd>,
+    cvar: Condvar,
+}
+
+#[cfg(not(miri))]
+impl SessionShared {
+    fn new() -> Self {
+        let shared = Self {
+            mutex: Mutex::new(SessionCmd::Idle),
+            cvar: Condvar::new(),
+        };
+        pre_touch_sync_pair(&shared.mutex, &shared.cvar);
+        shared
+    }
+}
+
+#[cfg(not(miri))]
+fn run_session_worker_loop(shared: &SessionShared) {
+    loop {
+        let step = {
+            let mut guard = shared.mutex.lock().unwrap_or_else(PoisonError::into_inner);
+            loop {
+                match *guard {
+                    SessionCmd::Idle | SessionCmd::Done => {
+                        guard = shared
+                            .cvar
+                            .wait(guard)
+                            .unwrap_or_else(PoisonError::into_inner);
+                    }
+                    SessionCmd::Run(step) => {
+                        *guard = SessionCmd::Idle;
+                        break Some(step);
+                    }
+                    SessionCmd::Close => break None,
+                }
+            }
+        };
+        let Some(step) = step else {
+            return;
+        };
+        // SAFETY: Caller's `SessionStep` cell remains valid until we publish `SessionCmd::Done`.
+        unsafe { (step.invoke)(step.slot) };
+        let mut guard = shared.mutex.lock().unwrap_or_else(PoisonError::into_inner);
+        *guard = SessionCmd::Done;
+        shared.cvar.notify_all();
+    }
+}
+
+/// Borrowed handle for running multiple sequential operations inside a single hoisted
+/// [`WorkerPool::install_for_phase`] entry on the target cluster thread.
+#[derive(Debug)]
+pub struct PhaseSession<'a> {
+    mode: PhaseSessionMode<'a>,
+}
+
+#[derive(Debug)]
+enum PhaseSessionMode<'a> {
+    Inline {
+        _marker: PhantomData<&'a WorkerPool>,
+    },
+    #[cfg(not(miri))]
+    WorkerLoop { ctrl: &'a SessionShared },
+}
+
+#[cfg(not(miri))]
+impl std::fmt::Debug for SessionShared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionShared").finish_non_exhaustive()
+    }
+}
+
+impl PhaseSession<'_> {
+    /// Executes `op` on the target cluster worker thread owned by this active session.
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by `op` on the worker thread.
+    pub fn run<OP, T>(&mut self, op: OP) -> T
+    where
+        OP: FnOnce() -> T + Send,
+        T: Send,
+    {
+        match &self.mode {
+            PhaseSessionMode::Inline { .. } => op(),
+            #[cfg(not(miri))]
+            PhaseSessionMode::WorkerLoop { ctrl } => {
+                unsafe fn invoke_step<OP, T>(slot_ptr: *const ())
+                where
+                    OP: FnOnce() -> T + Send,
+                    T: Send,
+                {
+                    // SAFETY: Caller passes `&UnsafeCell` alive until `SessionCmd::Done` is signaled.
+                    let slot = unsafe {
+                        &*slot_ptr.cast::<UnsafeCell<(Option<OP>, Option<thread::Result<T>>)>>()
+                    };
+                    // SAFETY: Only the active session worker accesses `slot` between `Run` and `Done`.
+                    let (op_opt, res_opt) = unsafe { &mut *slot.get() };
+                    let op = op_opt.take().expect("phase session step missing closure");
+                    *res_opt = Some(catch_unwind(AssertUnwindSafe(op)));
+                }
+
+                let cell: UnsafeCell<(Option<OP>, Option<thread::Result<T>>)> =
+                    UnsafeCell::new((Some(op), None));
+                let step = SessionStep {
+                    invoke: invoke_step::<OP, T>,
+                    slot: std::ptr::from_ref(&cell).cast(),
+                };
+                {
+                    let mut guard = ctrl.mutex.lock().unwrap_or_else(PoisonError::into_inner);
+                    *guard = SessionCmd::Run(step);
+                    ctrl.cvar.notify_all();
+                    while !matches!(*guard, SessionCmd::Done) {
+                        guard = ctrl
+                            .cvar
+                            .wait(guard)
+                            .unwrap_or_else(PoisonError::into_inner);
+                    }
+                    *guard = SessionCmd::Idle;
+                }
+                // SAFETY: Worker stored `SessionCmd::Done` and no longer accesses `cell`.
+                let res = unsafe { &mut *cell.get() }
+                    .1
+                    .take()
+                    .expect("phase session step missing result");
+                match res {
+                    Ok(val) => val,
+                    Err(payload) => resume_unwind(payload),
+                }
+            }
+        }
+    }
 }
 
 /// Cache-line aligned (64-byte) per-worker barrier wait accumulator (US-02 R1, ADR-006).
@@ -1348,10 +1924,7 @@ impl FutexBarrier {
         }
 
         let start = Instant::now();
-        let mut guard = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let current_gen = guard.generation;
         guard.count += 1;
         if guard.count == self.num_threads {
@@ -1364,7 +1937,7 @@ impl FutexBarrier {
                 guard = self
                     .cvar
                     .wait(guard)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .unwrap_or_else(PoisonError::into_inner);
             }
             start.elapsed()
         }
@@ -1378,15 +1951,8 @@ impl FutexBarrier {
 
 enum PoolBackend {
     DedicatedThreads {
-        profile: CoordinationProfile,
-        state: Arc<(Mutex<PoolSharedState>, Condvar)>,
-        shutdown: Arc<AtomicBool>,
-        spin_barrier: Option<Arc<SpinBarrier>>,
-        futex_barrier: Option<Arc<FutexBarrier>>,
-        coordinator_sense: Arc<AtomicBool>,
+        shared: Arc<DedicatedShared>,
         handles: Vec<JoinHandle<()>>,
-        #[cfg_attr(miri, allow(dead_code))]
-        rayon_exec_pool: OnceLock<Option<rayon::ThreadPool>>,
     },
     Rayon {
         pool: rayon::ThreadPool,
@@ -1400,9 +1966,9 @@ enum PoolBackend {
 impl std::fmt::Debug for PoolBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::DedicatedThreads { profile, .. } => f
+            Self::DedicatedThreads { shared, .. } => f
                 .debug_struct("DedicatedThreads")
-                .field("profile", profile)
+                .field("profile", &shared.profile)
                 .finish_non_exhaustive(),
             Self::Rayon { .. } => f.debug_struct("Rayon").finish_non_exhaustive(),
             Self::Dual {
@@ -1542,107 +2108,72 @@ impl WorkerPool {
 
         match profile {
             CoordinationProfile::Spin | CoordinationProfile::Futex => {
-                let state = Arc::new((
-                    Mutex::new(PoolSharedState {
-                        generation: 0,
-                        active_job: None,
+                let spin_barrier = (profile == CoordinationProfile::Spin)
+                    .then(|| Arc::new(SpinBarrier::new(num_workers + 1)));
+                let futex_barrier = (profile == CoordinationProfile::Futex)
+                    .then(|| Arc::new(FutexBarrier::new(num_workers + 1)));
+                let workers_spin_barrier = (profile == CoordinationProfile::Spin
+                    && num_workers > 1)
+                    .then(|| Arc::new(SpinBarrier::new(num_workers)));
+                let workers_futex_barrier = (profile == CoordinationProfile::Futex
+                    && num_workers > 1)
+                    .then(|| Arc::new(FutexBarrier::new(num_workers)));
+
+                let shared = Arc::new(DedicatedShared {
+                    profile,
+                    num_workers,
+                    exec_mutex: Mutex::new(()),
+                    state: Mutex::new(PoolSharedState {
+                        parallel_gen: 0,
+                        parallel_task: None,
+                        install_gen: 0,
+                        install_req: None,
                         shutdown: false,
                     }),
-                    Condvar::new(),
-                ));
-                let shutdown = Arc::new(AtomicBool::new(false));
-                let coordinator_sense = Arc::new(AtomicBool::new(false));
-
-                let spin_barrier = if profile == CoordinationProfile::Spin {
-                    Some(Arc::new(SpinBarrier::new(num_workers + 1)))
-                } else {
-                    None
-                };
-
-                let futex_barrier = if profile == CoordinationProfile::Futex {
-                    Some(Arc::new(FutexBarrier::new(num_workers + 1)))
-                } else {
-                    None
-                };
+                    worker0_cvar: Condvar::new(),
+                    workers_rest_cvar: Condvar::new(),
+                    host_done: (Mutex::new(false), Condvar::new()),
+                    #[cfg(not(miri))]
+                    session_shared: SessionShared::new(),
+                    shutdown: Arc::new(AtomicBool::new(false)),
+                    wait_slots: Arc::clone(&wait_slots),
+                    spin_barrier,
+                    futex_barrier,
+                    workers_spin_barrier,
+                    workers_futex_barrier,
+                    coordinator_sense: AtomicBool::new(false),
+                    worker0_seen_parallel_gen: AtomicUsize::new(0),
+                    worker0_workers_sense: AtomicBool::new(false),
+                });
+                #[cfg(not(miri))]
+                {
+                    drop(shared.exec_mutex.lock());
+                    pre_touch_sync_pair(&shared.state, &shared.worker0_cvar);
+                    pre_touch_sync_pair(&shared.state, &shared.workers_rest_cvar);
+                    pre_touch_sync_pair(&shared.host_done.0, &shared.host_done.1);
+                }
 
                 let (init_tx, init_rx) = mpsc::channel::<Result<WorkerAffinityStatus, K3Error>>();
                 let mut handles = Vec::with_capacity(num_workers);
 
                 for (worker_index, &assigned_core) in affinity.assigned_cores.iter().enumerate() {
-                    let state_clone = Arc::clone(&state);
-                    let shutdown_clone = Arc::clone(&shutdown);
-                    let spin_barrier_clone = spin_barrier.clone();
-                    let futex_barrier_clone = futex_barrier.clone();
-                    let wait_slots_clone = Arc::clone(&wait_slots);
+                    let shared_clone = Arc::clone(&shared);
                     let tx = init_tx.clone();
                     let req_mask = affinity.effective_mask;
 
                     let handle = thread::Builder::new()
                         .name(format!("k3-worker-{worker_index}"))
                         .spawn(move || {
-                            set_current_thread_core(assigned_core);
-                            // SAFETY: `raw_pin_thread` uses only fixed-frame integer syscalls to pin the worker.
-                            let pin_res = unsafe { raw_pin_thread(assigned_core) };
-                            let pin_result = verify_pinned_thread(
+                            dedicated_worker_entry(
+                                &shared_clone,
                                 worker_index,
                                 assigned_core,
                                 req_mask,
-                                num_workers,
-                                pin_res,
+                                &tx,
                             );
-                            let is_ok = pin_result.is_ok();
-                            let _ = tx.send(pin_result);
-                            if !is_ok {
-                                return;
-                            }
-
-                            let mut local_sense = false;
-                            let mut seen_gen = 0usize;
-                            loop {
-                                let (job, shutdown_flag) = {
-                                    let (lock, cvar) = &*state_clone;
-                                    let mut guard = lock
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    while !guard.shutdown
-                                        && !shutdown_clone.load(Ordering::Relaxed)
-                                        && guard.generation == seen_gen
-                                    {
-                                        guard = cvar
-                                            .wait(guard)
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    }
-                                    if guard.shutdown || shutdown_clone.load(Ordering::Relaxed) {
-                                        return;
-                                    }
-                                    seen_gen = guard.generation;
-                                    (guard.active_job.clone(), guard.shutdown)
-                                };
-
-                                if let Some(work_fn) = job {
-                                    work_fn(worker_index, num_workers);
-                                }
-
-                                if let Some(barrier) = &spin_barrier_clone {
-                                    let wait_time = barrier.wait(&mut local_sense, &shutdown_clone);
-                                    wait_slots_clone[worker_index].record_wait(wait_time);
-                                } else if let Some(barrier) = &futex_barrier_clone {
-                                    let wait_time = barrier.wait(&shutdown_clone);
-                                    wait_slots_clone[worker_index].record_wait(wait_time);
-                                }
-
-                                if shutdown_flag || shutdown_clone.load(Ordering::Relaxed) {
-                                    return;
-                                }
-                            }
                         })
                         .map_err(|err| {
-                            shutdown_dedicated(
-                                &state,
-                                &shutdown,
-                                futex_barrier.as_ref(),
-                                &mut handles,
-                            );
+                            shutdown_dedicated(&shared, &mut handles);
                             K3Error::AffinityError {
                                 requested_mask: affinity.effective_mask,
                                 requested_threads: num_workers,
@@ -1663,21 +2194,11 @@ impl WorkerPool {
                             worker_statuses.push(status);
                         }
                         Ok(Err(err)) => {
-                            shutdown_dedicated(
-                                &state,
-                                &shutdown,
-                                futex_barrier.as_ref(),
-                                &mut handles,
-                            );
+                            shutdown_dedicated(&shared, &mut handles);
                             return Err(err);
                         }
                         Err(recv_err) => {
-                            shutdown_dedicated(
-                                &state,
-                                &shutdown,
-                                futex_barrier.as_ref(),
-                                &mut handles,
-                            );
+                            shutdown_dedicated(&shared, &mut handles);
                             return Err(K3Error::AffinityError {
                                 requested_mask: affinity.effective_mask,
                                 requested_threads: num_workers,
@@ -1696,16 +2217,7 @@ impl WorkerPool {
                     phase_policy: None,
                     worker_statuses,
                     wait_slots,
-                    backend: PoolBackend::DedicatedThreads {
-                        profile,
-                        state,
-                        shutdown,
-                        spin_barrier,
-                        futex_barrier,
-                        coordinator_sense,
-                        handles,
-                        rayon_exec_pool: OnceLock::new(),
-                    },
+                    backend: PoolBackend::DedicatedThreads { shared, handles },
                 })
             }
             CoordinationProfile::Rayon => {
@@ -2077,104 +2589,349 @@ impl WorkerPool {
         }
     }
 
+    /// Invokes `f` with a reference to the [`WorkerPool`] currently installed on this thread via
+    /// [`Self::install`], [`Self::install_for_phase`], or [`Self::with_phase_session`], if any.
+    pub fn with_current<F, R>(f: F) -> Option<R>
+    where
+        F: FnOnce(&WorkerPool) -> R,
+    {
+        CURRENT_WORKER_POOL.with(|cell| {
+            let ptr = cell.get()?;
+            // SAFETY: `TlsPoolGuard` ensures `ptr` remains live and shared for the exact scope of
+            // `install` / `with_phase_session` and restores the previous value on exit.
+            let pool = unsafe { &*ptr };
+            Some(f(pool))
+        })
+    }
+
+    fn is_current_worker_on_pool(&self) -> bool {
+        match &self.backend {
+            PoolBackend::DedicatedThreads { shared, .. } => {
+                let shared_ptr = Arc::as_ptr(shared);
+                CURRENT_DEDICATED_WORKER.with(|c| {
+                    c.get()
+                        .is_some_and(|ctx| std::ptr::eq(ctx.shared_ptr, shared_ptr))
+                })
+            }
+            PoolBackend::Rayon { .. } => CURRENT_WORKER_POOL.with(|c| {
+                c.get()
+                    .is_some_and(|ptr| std::ptr::eq(ptr, std::ptr::from_ref(self)))
+            }),
+            PoolBackend::Dual {
+                x100_pool,
+                a100_pool,
+            } => x100_pool.is_current_worker_on_pool() || a100_pool.is_current_worker_on_pool(),
+        }
+    }
+
+    /// Executes `task(worker_index, total_workers)` in parallel across all pinned worker threads
+    /// without requiring `'static` closures or heap-allocated `Arc` wrappers.
+    pub fn execute_scoped<F>(&self, task: &F)
+    where
+        F: Fn(usize, usize) + Sync,
+    {
+        let raw = RawWorkerTask::from_fn(task);
+        self.execute_raw_task(raw);
+    }
+
+    fn execute_raw_task(&self, task: RawWorkerTask) {
+        match &self.backend {
+            PoolBackend::Dual { .. } => {
+                let total_workers = self.affinity.threads;
+                let nx = self.x100_pool().map_or(0, Self::thread_count);
+                self.execute_split_scoped(
+                    &|w_idx, _| {
+                        // SAFETY: Caller waits for both lanes to finish before stack closure exits.
+                        unsafe { task.call(w_idx, total_workers) };
+                    },
+                    &|w_idx, _| {
+                        // SAFETY: Caller waits for both lanes to finish before stack closure exits.
+                        unsafe { task.call(nx + w_idx, total_workers) };
+                    },
+                );
+            }
+            PoolBackend::DedicatedThreads { shared, .. } => {
+                dispatch_dedicated_scoped(shared, task);
+            }
+            PoolBackend::Rayon { pool } => {
+                let num_workers = self.affinity.threads;
+                let wait_slots = &self.wait_slots;
+                let t_start = Instant::now();
+
+                if num_workers <= 16 {
+                    let finish_times: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+                    pool.install(|| {
+                        let _tls = TlsPoolGuard::enter(self);
+                        rayon::scope(|s| {
+                            for (worker_idx, finish_ref) in
+                                finish_times.iter().take(num_workers).enumerate()
+                            {
+                                s.spawn(move |_| {
+                                    // SAFETY: `rayon::scope` joins all spawned closures before exit.
+                                    unsafe { task.call(worker_idx, num_workers) };
+                                    let elapsed_ns = u64::try_from(t_start.elapsed().as_nanos())
+                                        .unwrap_or(u64::MAX);
+                                    finish_ref.store(elapsed_ns, Ordering::Release);
+                                });
+                            }
+                        });
+                    });
+                    let t_total_ns =
+                        u64::try_from(t_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    for (worker_idx, finish_atomic) in
+                        finish_times.iter().take(num_workers).enumerate()
+                    {
+                        let finish_ns = finish_atomic.load(Ordering::Acquire);
+                        let wait_ns = t_total_ns.saturating_sub(finish_ns);
+                        wait_slots[worker_idx].record_wait_nanos(wait_ns);
+                    }
+                } else {
+                    let finish_times: Vec<AtomicU64> =
+                        (0..num_workers).map(|_| AtomicU64::new(0)).collect();
+                    pool.install(|| {
+                        let _tls = TlsPoolGuard::enter(self);
+                        rayon::scope(|s| {
+                            for (worker_idx, finish_ref) in finish_times.iter().enumerate() {
+                                s.spawn(move |_| {
+                                    // SAFETY: `rayon::scope` joins all spawned closures before exit.
+                                    unsafe { task.call(worker_idx, num_workers) };
+                                    let elapsed_ns = u64::try_from(t_start.elapsed().as_nanos())
+                                        .unwrap_or(u64::MAX);
+                                    finish_ref.store(elapsed_ns, Ordering::Release);
+                                });
+                            }
+                        });
+                    });
+                    let t_total_ns =
+                        u64::try_from(t_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    for (worker_idx, finish_atomic) in finish_times.iter().enumerate() {
+                        let finish_ns = finish_atomic.load(Ordering::Acquire);
+                        let wait_ns = t_total_ns.saturating_sub(finish_ns);
+                        wait_slots[worker_idx].record_wait_nanos(wait_ns);
+                    }
+                }
+            }
+        }
+    }
+
     /// Executes `task(worker_index, total_workers)` in parallel across all pinned worker threads
     /// and waits for completion.
     pub fn execute<F>(&self, task: F)
     where
         F: Fn(usize, usize) + Send + Sync + 'static,
     {
-        self.execute_job(Arc::new(task));
+        self.execute_scoped(&task);
     }
 
-    /// Internal non-generic job dispatcher to eliminate recursive monomorphization across dual pools.
+    /// Internal non-generic job dispatcher kept compatible with `JobFn` callers.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn execute_job(&self, job: JobFn) {
-        match &self.backend {
-            PoolBackend::Dual {
-                x100_pool,
-                a100_pool,
-            } => {
-                let j1 = Arc::clone(&job);
-                let j2 = Arc::clone(&job);
-                let total_workers = self.affinity.threads;
-                let nx = x100_pool.thread_count();
+        self.execute_scoped(&|w_idx, total| job(w_idx, total));
+    }
 
-                thread::scope(|s| {
-                    s.spawn(move || {
-                        let wrapped: JobFn = Arc::new(move |w_idx, _| {
-                            j1(w_idx, total_workers);
-                        });
-                        x100_pool.execute_job(wrapped);
-                    });
-                    let wrapped: JobFn = Arc::new(move |w_idx, _| {
-                        j2(nx + w_idx, total_workers);
-                    });
-                    a100_pool.execute_job(wrapped);
-                });
+    /// Executes `f(range, worker_index)` across balanced non-empty sub-ranges partitioning `0..n_items`.
+    pub fn dispatch_indexed<F>(&self, n_items: usize, f: F)
+    where
+        F: Fn(Range<usize>, usize) + Sync,
+    {
+        if n_items == 0 {
+            return;
+        }
+        let n_workers = self.thread_count().max(1);
+        if n_workers == 1 && self.is_current_worker_on_pool() {
+            f(0..n_items, 0);
+            return;
+        }
+        self.execute_scoped(&|w_idx, total| {
+            let start = usize::try_from((w_idx as u128 * n_items as u128) / (total.max(1) as u128))
+                .unwrap_or(n_items);
+            let end =
+                usize::try_from(((w_idx + 1) as u128 * n_items as u128) / (total.max(1) as u128))
+                    .unwrap_or(n_items);
+            if start < end {
+                f(start..end, w_idx);
             }
-            PoolBackend::DedicatedThreads {
-                state,
-                shutdown,
-                spin_barrier,
-                futex_barrier,
-                coordinator_sense,
-                ..
-            } => {
-                {
-                    let (lock, cvar) = &**state;
-                    let mut guard = lock
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    guard.active_job = Some(job);
-                    guard.generation = guard.generation.wrapping_add(1);
-                    cvar.notify_all();
-                }
-                if let Some(barrier) = spin_barrier {
-                    let mut local_sense = coordinator_sense.load(Ordering::Relaxed);
-                    barrier.wait(&mut local_sense, shutdown);
-                    coordinator_sense.store(local_sense, Ordering::Relaxed);
-                } else if let Some(barrier) = futex_barrier {
-                    barrier.wait(shutdown);
-                }
-                {
-                    let (lock, _) = &**state;
-                    let mut guard = lock
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    guard.active_job = None;
-                }
-            }
-            PoolBackend::Rayon { pool } => {
-                let num_workers = self.affinity.threads;
-                let wait_slots = Arc::clone(&self.wait_slots);
-                let finish_times = Arc::new(
-                    (0..num_workers)
-                        .map(|_| AtomicU64::new(0))
-                        .collect::<Vec<_>>(),
-                );
-                let t_start = Instant::now();
+        });
+    }
 
+    /// Executes `f(index)` across all `n_items` indices in `0..n_items` on this pool's workers.
+    pub fn par_for_each_index<F>(&self, n_items: usize, f: F)
+    where
+        F: Fn(usize) + Sync,
+    {
+        if n_items == 0 {
+            return;
+        }
+        if let PoolBackend::Rayon { pool } = &self.backend {
+            use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+            if self.is_current_worker_on_pool() {
+                (0..n_items).into_par_iter().for_each(&f);
+            } else {
+                pool.install(|| (0..n_items).into_par_iter().for_each(&f));
+            }
+            return;
+        }
+        self.dispatch_indexed(n_items, |range, _| {
+            for idx in range {
+                f(idx);
+            }
+        });
+    }
+
+    /// Processes disjoint mutable chunks of `slice` in parallel across the pool's pinned workers.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `chunk_size == 0`.
+    pub fn par_chunks_mut<T, F>(&self, slice: &mut [T], chunk_size: usize, f: F)
+    where
+        T: Send,
+        F: Fn(usize, &mut [T]) + Sync,
+    {
+        assert!(chunk_size > 0, "chunk_size must be non-zero");
+        if slice.is_empty() {
+            return;
+        }
+        let num_chunks = slice.len().div_ceil(chunk_size);
+        if (self.thread_count() <= 1 || num_chunks <= 1) && self.is_current_worker_on_pool() {
+            for (c_idx, chunk) in slice.chunks_mut(chunk_size).enumerate() {
+                f(c_idx, chunk);
+            }
+            return;
+        }
+        if let PoolBackend::Rayon { pool } = &self.backend {
+            use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+            if self.is_current_worker_on_pool() {
+                slice
+                    .par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(idx, ch)| f(idx, ch));
+            } else {
                 pool.install(|| {
-                    rayon::scope(|s| {
-                        for worker_idx in 0..num_workers {
-                            let finish_times_clone = Arc::clone(&finish_times);
-                            let job_clone = Arc::clone(&job);
-                            s.spawn(move |_| {
-                                job_clone(worker_idx, num_workers);
-                                let elapsed_ns =
-                                    u64::try_from(t_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                                finish_times_clone[worker_idx].store(elapsed_ns, Ordering::Release);
-                            });
-                        }
-                    });
+                    slice
+                        .par_chunks_mut(chunk_size)
+                        .enumerate()
+                        .for_each(|(idx, ch)| f(idx, ch));
                 });
+            }
+            return;
+        }
+        let len = slice.len();
+        let ptr = SyncMutPtr(slice.as_mut_ptr());
+        self.execute_scoped(&|w_idx, n_workers| {
+            let c_start =
+                usize::try_from((w_idx as u128 * num_chunks as u128) / (n_workers.max(1) as u128))
+                    .unwrap_or(num_chunks);
+            let c_end = usize::try_from(
+                ((w_idx + 1) as u128 * num_chunks as u128) / (n_workers.max(1) as u128),
+            )
+            .unwrap_or(num_chunks);
+            for c_idx in c_start..c_end {
+                let elem_start = c_idx * chunk_size;
+                let elem_end = (elem_start + chunk_size).min(len);
+                // SAFETY: Distinct `c_idx` ranges map to strictly disjoint sub-slices within
+                // `slice`, bounded by synchronous worker completion before `slice` is accessed again.
+                let chunk = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        ptr.as_ptr().add(elem_start),
+                        elem_end - elem_start,
+                    )
+                };
+                f(c_idx, chunk);
+            }
+        });
+    }
 
-                let t_total_ns = u64::try_from(t_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                for worker_idx in 0..num_workers {
-                    let finish_ns = finish_times[worker_idx].load(Ordering::Acquire);
-                    let wait_ns = t_total_ns.saturating_sub(finish_ns);
-                    wait_slots[worker_idx].record_wait_nanos(wait_ns);
+    /// Fallible parallel counterpart to [`Self::par_chunks_mut`], returning the first error emitted.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the first `Err(E)` returned by `f` across any worker.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `chunk_size == 0`.
+    pub fn try_par_chunks_mut<T, E, F>(
+        &self,
+        slice: &mut [T],
+        chunk_size: usize,
+        f: F,
+    ) -> Result<(), E>
+    where
+        T: Send,
+        E: Send,
+        F: Fn(usize, &mut [T]) -> Result<(), E> + Sync,
+    {
+        assert!(chunk_size > 0, "chunk_size must be non-zero");
+        if slice.is_empty() {
+            return Ok(());
+        }
+        let num_chunks = slice.len().div_ceil(chunk_size);
+        if (self.thread_count() <= 1 || num_chunks <= 1) && self.is_current_worker_on_pool() {
+            for (c_idx, chunk) in slice.chunks_mut(chunk_size).enumerate() {
+                f(c_idx, chunk)?;
+            }
+            return Ok(());
+        }
+        if let PoolBackend::Rayon { pool } = &self.backend {
+            use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+            return if self.is_current_worker_on_pool() {
+                slice
+                    .par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .try_for_each(|(idx, ch)| f(idx, ch))
+            } else {
+                pool.install(|| {
+                    slice
+                        .par_chunks_mut(chunk_size)
+                        .enumerate()
+                        .try_for_each(|(idx, ch)| f(idx, ch))
+                })
+            };
+        }
+        let len = slice.len();
+        let ptr = SyncMutPtr(slice.as_mut_ptr());
+        let err_flag = AtomicBool::new(false);
+        let first_err: Mutex<Option<E>> = Mutex::new(None);
+        self.execute_scoped(&|w_idx, n_workers| {
+            let c_start =
+                usize::try_from((w_idx as u128 * num_chunks as u128) / (n_workers.max(1) as u128))
+                    .unwrap_or(num_chunks);
+            let c_end = usize::try_from(
+                ((w_idx + 1) as u128 * num_chunks as u128) / (n_workers.max(1) as u128),
+            )
+            .unwrap_or(num_chunks);
+            for c_idx in c_start..c_end {
+                if err_flag.load(Ordering::Relaxed) {
+                    return;
+                }
+                let elem_start = c_idx * chunk_size;
+                let elem_end = (elem_start + chunk_size).min(len);
+                // SAFETY: Distinct `c_idx` ranges map to strictly disjoint sub-slices within
+                // `slice`, bounded by synchronous worker completion before `slice` is accessed again.
+                let chunk = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        ptr.as_ptr().add(elem_start),
+                        elem_end - elem_start,
+                    )
+                };
+                if let Err(err) = f(c_idx, chunk) {
+                    err_flag.store(true, Ordering::Relaxed);
+                    let mut guard = first_err.lock().unwrap_or_else(PoisonError::into_inner);
+                    if guard.is_none() {
+                        *guard = Some(err);
+                    }
+                    return;
                 }
             }
+        });
+        if let Some(err) = first_err
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            Err(err)
+        } else {
+            Ok(())
         }
     }
 
@@ -2184,12 +2941,12 @@ impl WorkerPool {
         F: Fn(usize, usize) + Send + Sync + 'static,
     {
         match &self.backend {
-            PoolBackend::Dual { x100_pool, .. } => x100_pool.execute_job(Arc::new(task)),
+            PoolBackend::Dual { x100_pool, .. } => x100_pool.execute_scoped(&task),
             _ => {
                 if self.affinity.cluster == Some(ClusterPreset::X100)
                     || (!self.affinity.x100_cores.is_empty() && self.affinity.a100_cores.is_empty())
                 {
-                    self.execute_job(Arc::new(task));
+                    self.execute_scoped(&task);
                 }
             }
         }
@@ -2201,12 +2958,40 @@ impl WorkerPool {
         F: Fn(usize, usize) + Send + Sync + 'static,
     {
         match &self.backend {
-            PoolBackend::Dual { a100_pool, .. } => a100_pool.execute_job(Arc::new(task)),
+            PoolBackend::Dual { a100_pool, .. } => a100_pool.execute_scoped(&task),
             _ => {
                 if self.affinity.cluster == Some(ClusterPreset::A100)
                     || (!self.affinity.a100_cores.is_empty() && self.affinity.x100_cores.is_empty())
                 {
-                    self.execute_job(Arc::new(task));
+                    self.execute_scoped(&task);
+                }
+            }
+        }
+    }
+
+    /// Executes independent scoped tasks concurrently across persistent X100 and A100 worker
+    /// pools without spawning transient OS threads or heap-allocating synchronization state.
+    pub fn execute_split_scoped<FX, FA>(&self, x100_task: &FX, a100_task: &FA)
+    where
+        FX: Fn(usize, usize) + Sync,
+        FA: Fn(usize, usize) + Sync,
+    {
+        match &self.backend {
+            PoolBackend::Dual {
+                x100_pool,
+                a100_pool,
+            } => {
+                if x100_pool.is_current_worker_on_pool() {
+                    dispatch_dual_async_then_sync(a100_pool, a100_task, x100_pool, x100_task);
+                } else {
+                    dispatch_dual_async_then_sync(x100_pool, x100_task, a100_pool, a100_task);
+                }
+            }
+            _ => {
+                if self.affinity.cluster == Some(ClusterPreset::A100) {
+                    self.execute_scoped(a100_task);
+                } else {
+                    self.execute_scoped(x100_task);
                 }
             }
         }
@@ -2215,31 +3000,10 @@ impl WorkerPool {
     /// Executes independent tasks concurrently across X100 and A100 worker pools.
     pub fn execute_split<FX, FA>(&self, x100_task: FX, a100_task: FA)
     where
-        FX: Fn(usize, usize) + Send + Sync + 'static,
-        FA: Fn(usize, usize) + Send + Sync + 'static,
+        FX: Fn(usize, usize) + Sync,
+        FA: Fn(usize, usize) + Sync,
     {
-        match &self.backend {
-            PoolBackend::Dual {
-                x100_pool,
-                a100_pool,
-            } => {
-                let jx: JobFn = Arc::new(x100_task);
-                let ja: JobFn = Arc::new(a100_task);
-                thread::scope(|s| {
-                    s.spawn(|| {
-                        x100_pool.execute_job(jx);
-                    });
-                    a100_pool.execute_job(ja);
-                });
-            }
-            _ => {
-                if self.affinity.cluster == Some(ClusterPreset::A100) {
-                    self.execute_job(Arc::new(a100_task));
-                } else {
-                    self.execute_job(Arc::new(x100_task));
-                }
-            }
-        }
+        self.execute_split_scoped(&x100_task, &a100_task);
     }
 
     /// Returns a reference to the X100 worker pool if operating in dual-cluster mode.
@@ -2266,9 +3030,38 @@ impl WorkerPool {
         matches!(self.backend, PoolBackend::Dual { .. })
     }
 
-    /// Executes `op` inside this pool's pinned Rayon worker context so nested `rayon::scope`,
-    /// `rayon::join`, and parallel iterators inside architecture recipes execute strictly on
-    /// the pool's assigned physical cores without touching the unpinned global Rayon pool.
+    fn resolve_phase_pool(
+        &self,
+        phase: crate::engine::EnginePhase,
+        policy: ClusterPhasePolicy,
+    ) -> &WorkerPool {
+        match &self.backend {
+            PoolBackend::Dual {
+                x100_pool,
+                a100_pool,
+            } => {
+                let a100_has_ime = if policy == ClusterPhasePolicy::Auto {
+                    has_a100_ime_for_mask(a100_pool.affinity().effective_mask)
+                } else {
+                    false
+                };
+                if select_dual_cluster_a100(policy, phase, a100_has_ime) {
+                    a100_pool.as_ref()
+                } else {
+                    x100_pool.as_ref()
+                }
+            }
+            _ => self,
+        }
+    }
+
+    /// Executes `op` directly on this pool's pinned worker context (`worker 0` on
+    /// [`CoordinationProfile::Spin`]/[`CoordinationProfile::Futex`] or a pool worker on
+    /// [`CoordinationProfile::Rayon`]) without creating a secondary Rayon thread pool.
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised inside `op`.
     pub fn install<OP, R>(&self, op: OP) -> R
     where
         OP: FnOnce() -> R + Send,
@@ -2276,36 +3069,50 @@ impl WorkerPool {
     {
         #[cfg(miri)]
         {
+            let _tls = TlsPoolGuard::enter(self);
             op()
         }
         #[cfg(not(miri))]
         match &self.backend {
-            PoolBackend::Rayon { pool } => pool.install(op),
-            PoolBackend::DedicatedThreads {
-                rayon_exec_pool, ..
-            } => {
-                if self.affinity.threads > 1 {
-                    self.execute(|_, _| {});
-                }
-                let exec_pool = rayon_exec_pool.get_or_init(|| {
-                    let assigned_cores = self.affinity.assigned_cores.clone();
-                    let num_workers = self.affinity.threads;
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(num_workers)
-                        .thread_name(|i| format!("k3-dedicated-rayon-{i}"))
-                        .start_handler(move |worker_idx| {
-                            let core = assigned_cores[worker_idx];
-                            set_current_thread_core(core);
-                            // SAFETY: `raw_pin_thread` uses fixed-frame integer syscalls to pin the worker.
-                            let _ = unsafe { raw_pin_thread(core) };
-                        })
-                        .build()
-                        .ok()
-                });
-                if let Some(pool) = exec_pool.as_ref() {
-                    pool.install(op)
-                } else {
+            PoolBackend::Rayon { pool } => {
+                if self.is_current_worker_on_pool() {
+                    let _tls = TlsPoolGuard::enter(self);
                     op()
+                } else {
+                    pool.install(|| {
+                        let _tls = TlsPoolGuard::enter(self);
+                        op()
+                    })
+                }
+            }
+            PoolBackend::DedicatedThreads { shared, .. } => {
+                if self.is_current_worker_on_pool() {
+                    let _tls = TlsPoolGuard::enter(self);
+                    return op();
+                }
+
+                let cell: UnsafeCell<(Option<OP>, Option<thread::Result<R>>)> =
+                    UnsafeCell::new((Some(op), None));
+                let req = RawInstallReq {
+                    invoke: invoke_dedicated_install::<OP, R>,
+                    slot: std::ptr::from_ref(&cell).cast(),
+                    pool: std::ptr::from_ref(self),
+                };
+                {
+                    let exec_guard = start_dedicated_install(shared.as_ref(), req);
+                    let _waiter = DedicatedInstallWaiter {
+                        shared: shared.as_ref(),
+                        _exec_guard: exec_guard,
+                    };
+                }
+                // SAFETY: `DedicatedInstallWaiter` synchronized on `host_done` before returning.
+                let res = unsafe { &mut *cell.get() }
+                    .1
+                    .take()
+                    .expect("install slot missing result");
+                match res {
+                    Ok(val) => val,
+                    Err(payload) => resume_unwind(payload),
                 }
             }
             PoolBackend::Dual { x100_pool, .. } => x100_pool.install(op),
@@ -2337,65 +3144,369 @@ impl WorkerPool {
         OP: FnOnce() -> R + Send,
         R: Send,
     {
+        self.resolve_phase_pool(phase, policy).install(op)
+    }
+
+    /// Enters the target cluster pool for `(phase, policy)` once and exposes a [`PhaseSession`]
+    /// to `f` on the caller thread, allowing `!Send` streaming callbacks to interleave across
+    /// multiple pinned worker steps without re-entering pool installation per token.
+    pub fn with_phase_session<F, R>(
+        &self,
+        phase: crate::engine::EnginePhase,
+        policy: ClusterPhasePolicy,
+        f: F,
+    ) -> R
+    where
+        F: FnOnce(&mut PhaseSession<'_>) -> R,
+    {
+        let target_pool = self.resolve_phase_pool(phase, policy);
         #[cfg(miri)]
         {
-            let _ = (phase, policy);
-            op()
+            let _tls = TlsPoolGuard::enter(target_pool);
+            let mut session = PhaseSession {
+                mode: PhaseSessionMode::Inline {
+                    _marker: PhantomData,
+                },
+            };
+            f(&mut session)
         }
         #[cfg(not(miri))]
-        match &self.backend {
-            PoolBackend::Dual {
-                x100_pool,
-                a100_pool,
-            } => {
-                let a100_has_ime = if policy == ClusterPhasePolicy::Auto {
-                    has_a100_ime_for_mask(a100_pool.affinity().effective_mask)
-                } else {
-                    false
+        {
+            if target_pool.is_current_worker_on_pool() {
+                let _tls = TlsPoolGuard::enter(target_pool);
+                let mut session = PhaseSession {
+                    mode: PhaseSessionMode::Inline {
+                        _marker: PhantomData,
+                    },
                 };
-                if select_dual_cluster_a100(policy, phase, a100_has_ime) {
-                    a100_pool.install(op)
-                } else {
-                    x100_pool.install(op)
+                return f(&mut session);
+            }
+            match &target_pool.backend {
+                PoolBackend::DedicatedThreads { shared, .. } => {
+                    run_dedicated_phase_session(target_pool, shared, f)
+                }
+                PoolBackend::Rayon { pool } => run_rayon_phase_session(target_pool, pool, f),
+                PoolBackend::Dual { .. } => unreachable!("resolve_phase_pool returned dual pool"),
+            }
+        }
+    }
+}
+
+#[cfg(not(miri))]
+unsafe fn invoke_dedicated_install<OP, R>(slot_ptr: *const ())
+where
+    OP: FnOnce() -> R + Send,
+    R: Send,
+{
+    // SAFETY: Caller keeps `&UnsafeCell` alive until `wait_host_done` completes.
+    let slot = unsafe { &*slot_ptr.cast::<UnsafeCell<(Option<OP>, Option<thread::Result<R>>)>>() };
+    // SAFETY: Only worker 0 accesses `slot` between submission and `host_done`.
+    let (op_opt, res_opt) = unsafe { &mut *slot.get() };
+    let op = op_opt.take().expect("install slot missing closure");
+    *res_opt = Some(catch_unwind(AssertUnwindSafe(op)));
+}
+
+#[cfg(not(miri))]
+struct DedicatedInstallWaiter<'a> {
+    shared: &'a DedicatedShared,
+    _exec_guard: MutexGuard<'a, ()>,
+}
+
+#[cfg(not(miri))]
+impl Drop for DedicatedInstallWaiter<'_> {
+    fn drop(&mut self) {
+        wait_host_done(self.shared);
+    }
+}
+
+#[cfg(not(miri))]
+unsafe fn invoke_session_loop(slot_ptr: *const ()) {
+    // SAFETY: Caller keeps `SessionShared` alive until `DedicatedSessionGuard` drops.
+    let ctrl = unsafe { &*slot_ptr.cast::<SessionShared>() };
+    let _ = catch_unwind(AssertUnwindSafe(|| run_session_worker_loop(ctrl)));
+}
+
+#[cfg(not(miri))]
+struct DedicatedSessionGuard<'a> {
+    ctrl: &'a SessionShared,
+    shared: &'a DedicatedShared,
+    _exec_guard: MutexGuard<'a, ()>,
+}
+
+#[cfg(not(miri))]
+impl Drop for DedicatedSessionGuard<'_> {
+    fn drop(&mut self) {
+        {
+            let mut g = self
+                .ctrl
+                .mutex
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *g = SessionCmd::Close;
+            self.ctrl.cvar.notify_all();
+        }
+        wait_host_done(self.shared);
+        let mut g = self
+            .ctrl
+            .mutex
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *g = SessionCmd::Idle;
+    }
+}
+
+#[cfg(not(miri))]
+struct RayonSessionGuard<'a> {
+    ctrl: &'a SessionShared,
+    finished: &'a RayonSignal,
+}
+
+#[cfg(not(miri))]
+impl Drop for RayonSessionGuard<'_> {
+    fn drop(&mut self) {
+        {
+            let mut g = self
+                .ctrl
+                .mutex
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *g = SessionCmd::Close;
+            self.ctrl.cvar.notify_all();
+        }
+        self.finished.wait();
+    }
+}
+
+#[cfg(not(miri))]
+fn run_dedicated_phase_session<F, R>(
+    target_pool: &WorkerPool,
+    shared: &Arc<DedicatedShared>,
+    f: F,
+) -> R
+where
+    F: FnOnce(&mut PhaseSession<'_>) -> R,
+{
+    let session_shared = &shared.session_shared;
+    let req = RawInstallReq {
+        invoke: invoke_session_loop,
+        slot: std::ptr::from_ref(session_shared).cast(),
+        pool: std::ptr::from_ref(target_pool),
+    };
+    let exec_guard = start_dedicated_install(shared.as_ref(), req);
+    let _session_guard = DedicatedSessionGuard {
+        ctrl: session_shared,
+        shared: shared.as_ref(),
+        _exec_guard: exec_guard,
+    };
+    let mut session = PhaseSession {
+        mode: PhaseSessionMode::WorkerLoop {
+            ctrl: session_shared,
+        },
+    };
+    f(&mut session)
+}
+
+#[cfg(not(miri))]
+fn run_rayon_phase_session<F, R>(target_pool: &WorkerPool, pool: &rayon::ThreadPool, f: F) -> R
+where
+    F: FnOnce(&mut PhaseSession<'_>) -> R,
+{
+    let session_shared = SessionShared::new();
+    let finished = RayonSignal::new();
+    let ctrl_ptr = SyncConstPtr::from_ref(&session_shared);
+    let fin_ptr = SyncConstPtr::from_ref(&finished);
+    let pool_ptr = SyncConstPtr::from_ref(target_pool);
+
+    pool.spawn(move || {
+        // SAFETY: `RayonSessionGuard` keeps `finished` live until `_fin` drops on exit.
+        let _fin = RayonFinishNotifier(unsafe { fin_ptr.as_ref() });
+        // SAFETY: `RayonSessionGuard` keeps `target_pool` live until `_fin` drops on exit.
+        let _tls = TlsPoolGuard::enter(unsafe { pool_ptr.as_ref() });
+        // SAFETY: `RayonSessionGuard` keeps `session_shared` live until `_fin` drops on exit.
+        run_session_worker_loop(unsafe { ctrl_ptr.as_ref() });
+    });
+
+    let _session_guard = RayonSessionGuard {
+        ctrl: &session_shared,
+        finished: &finished,
+    };
+    let mut session = PhaseSession {
+        mode: PhaseSessionMode::WorkerLoop {
+            ctrl: &session_shared,
+        },
+    };
+    f(&mut session)
+}
+
+fn dispatch_dedicated_scoped(shared: &Arc<DedicatedShared>, task: RawWorkerTask) {
+    let shared_ptr = Arc::as_ptr(shared);
+    if let Some(ctx) = CURRENT_DEDICATED_WORKER.with(Cell::get) {
+        if std::ptr::eq(ctx.shared_ptr, shared_ptr) {
+            if ctx.worker_index == 0 && !ctx.in_nested {
+                if shared.num_workers <= 1 {
+                    let _nested = TlsDedicatedWorkerGuard::enter(shared_ptr, 0, true);
+                    // SAFETY: Caller closure stays alive on current frame for inline call.
+                    unsafe { (task.invoke)(task.data, 0, 1) };
+                    return;
+                }
+                let _nested = TlsDedicatedWorkerGuard::enter(shared_ptr, 0, true);
+                {
+                    let mut guard = shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+                    guard.parallel_task = Some(ParallelDispatch {
+                        task,
+                        workers_only: true,
+                    });
+                    guard.parallel_gen = guard.parallel_gen.wrapping_add(1);
+                    shared
+                        .worker0_seen_parallel_gen
+                        .store(guard.parallel_gen, Ordering::Relaxed);
+                    shared.workers_rest_cvar.notify_all();
+                }
+                // SAFETY: Borrowed task stays valid until `wait_nested_worker` completes.
+                unsafe { (task.invoke)(task.data, 0, shared.num_workers) };
+                let mut sense = shared.worker0_workers_sense.load(Ordering::Relaxed);
+                shared.wait_nested_worker(0, &mut sense);
+                shared.worker0_workers_sense.store(sense, Ordering::Relaxed);
+                shared.clear_parallel_task();
+            } else {
+                for w_idx in 0..shared.num_workers {
+                    // SAFETY: Recursive fallback runs sequentially inside current frame.
+                    unsafe { (task.invoke)(task.data, w_idx, shared.num_workers) };
                 }
             }
-            _ => self.install(op),
+            return;
         }
+    }
+
+    let _waiter = start_dedicated_scoped_async(shared, task);
+}
+
+fn start_dedicated_scoped_async(
+    shared: &Arc<DedicatedShared>,
+    task: RawWorkerTask,
+) -> DedicatedAsyncWaiter<'_> {
+    let exec_guard = shared
+        .exec_mutex
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    {
+        let mut guard = shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.parallel_task = Some(ParallelDispatch {
+            task,
+            workers_only: false,
+        });
+        guard.parallel_gen = guard.parallel_gen.wrapping_add(1);
+        shared.worker0_cvar.notify_one();
+        shared.workers_rest_cvar.notify_all();
+    }
+    DedicatedAsyncWaiter {
+        shared: shared.as_ref(),
+        _exec_guard: exec_guard,
+    }
+}
+
+fn dispatch_dual_async_then_sync<FA, FS>(
+    async_pool: &WorkerPool,
+    async_task: &FA,
+    sync_pool: &WorkerPool,
+    sync_task: &FS,
+) where
+    FA: Fn(usize, usize) + Sync,
+    FS: Fn(usize, usize) + Sync,
+{
+    let bg_task = RawWorkerTask::from_fn(async_task);
+    let fg_task = RawWorkerTask::from_fn(sync_task);
+    match &async_pool.backend {
+        PoolBackend::DedicatedThreads { shared, .. } => {
+            let _waiter = start_dedicated_scoped_async(shared, bg_task);
+            sync_pool.execute_raw_task(fg_task);
+        }
+        PoolBackend::Rayon { pool } => {
+            #[cfg(not(miri))]
+            {
+                let signal = RayonSignal::new();
+                let sig_ptr = SyncConstPtr::from_ref(&signal);
+                let pool_ptr = SyncConstPtr::from_ref(async_pool);
+                let na = async_pool.thread_count();
+                pool.spawn(move || {
+                    // SAFETY: `RayonSignalWaiter` guarantees `signal` remains valid until `_fin` drops.
+                    let _fin = RayonFinishNotifier(unsafe { sig_ptr.as_ref() });
+                    // SAFETY: `RayonSignalWaiter` guarantees `async_pool` remains valid until `_fin` drops.
+                    let _tls = TlsPoolGuard::enter(unsafe { pool_ptr.as_ref() });
+                    rayon::scope(|s| {
+                        for w in 0..na {
+                            s.spawn(move |_| {
+                                // SAFETY: `RayonSignalWaiter` guarantees `async_task` outlives `scope`.
+                                unsafe { bg_task.call(w, na) };
+                            });
+                        }
+                    });
+                });
+                let _waiter = RayonSignalWaiter(&signal);
+                sync_pool.execute_raw_task(fg_task);
+            }
+            #[cfg(miri)]
+            {
+                let _ = pool;
+                async_pool.execute_raw_task(bg_task);
+                sync_pool.execute_raw_task(fg_task);
+            }
+        }
+        PoolBackend::Dual { .. } => {
+            async_pool.execute_raw_task(bg_task);
+            sync_pool.execute_raw_task(fg_task);
+        }
+    }
+}
+
+fn start_dedicated_install(shared: &DedicatedShared, req: RawInstallReq) -> MutexGuard<'_, ()> {
+    let exec_guard = shared
+        .exec_mutex
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    {
+        let (done_lock, _) = &shared.host_done;
+        let mut done = done_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        *done = false;
+    }
+    {
+        let mut guard = shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.install_req = Some(req);
+        guard.install_gen = guard.install_gen.wrapping_add(1);
+        shared.worker0_cvar.notify_one();
+    }
+    exec_guard
+}
+
+fn wait_host_done(shared: &DedicatedShared) {
+    let (done_lock, done_cvar) = &shared.host_done;
+    let mut done = done_lock.lock().unwrap_or_else(PoisonError::into_inner);
+    while !*done {
+        done = done_cvar.wait(done).unwrap_or_else(PoisonError::into_inner);
     }
 }
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
-        if let PoolBackend::DedicatedThreads {
-            state,
-            shutdown,
-            futex_barrier,
-            handles,
-            ..
-        } = &mut self.backend
-        {
-            shutdown_dedicated(state, shutdown, futex_barrier.as_ref(), handles);
+        if let PoolBackend::DedicatedThreads { shared, handles } = &mut self.backend {
+            shutdown_dedicated(shared, handles);
         }
     }
 }
 
-fn shutdown_dedicated(
-    state: &Arc<(Mutex<PoolSharedState>, Condvar)>,
-    shutdown: &Arc<AtomicBool>,
-    futex_barrier: Option<&Arc<FutexBarrier>>,
-    handles: &mut Vec<JoinHandle<()>>,
-) {
-    shutdown.store(true, Ordering::Release);
+fn shutdown_dedicated(shared: &Arc<DedicatedShared>, handles: &mut Vec<JoinHandle<()>>) {
+    shared.shutdown.store(true, Ordering::Release);
     {
-        let (lock, cvar) = &**state;
-        let mut guard = lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = shared.state.lock().unwrap_or_else(PoisonError::into_inner);
         guard.shutdown = true;
-        cvar.notify_all();
+        shared.worker0_cvar.notify_all();
+        shared.workers_rest_cvar.notify_all();
     }
-    if let Some(fb) = futex_barrier {
+    if let Some(fb) = &shared.futex_barrier {
         fb.notify_shutdown();
+    }
+    if let Some(wfb) = &shared.workers_futex_barrier {
+        wfb.notify_shutdown();
     }
     for handle in handles.drain(..) {
         let _ = handle.join();
@@ -2582,7 +3693,6 @@ fn read_proc_task_cpus_allowed_list(tid: i64) -> Option<String> {
     None
 }
 
-#[cfg(any(test, not(miri)))]
 const fn select_dual_cluster_a100(
     policy: ClusterPhasePolicy,
     phase: crate::engine::EnginePhase,
@@ -3418,6 +4528,123 @@ mod tests {
             &k3_topo,
         ) {
             verify_dual_pool_phase_cluster_isolation(&dual_pool);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_dedicated_threads_single_pool_no_extra_threads_and_disjoint_fanout() {
+        use jero_core::{
+            CoordinationProfile, GgufFile, QuantType, test_helpers::create_synthetic_gguf_v3,
+        };
+        use std::cell::Cell;
+        use std::collections::HashSet;
+        use std::rc::Rc;
+        use std::sync::Mutex;
+
+        let bytes = create_synthetic_gguf_v3(
+            "llama",
+            32,
+            &[("output_norm.weight", QuantType::F32, &[16][..])],
+        );
+        let gguf = GgufFile::parse(&bytes).expect("parse gguf");
+        for profile in [
+            CoordinationProfile::Spin,
+            CoordinationProfile::Futex,
+            CoordinationProfile::Rayon,
+        ] {
+            let pool = WorkerPool::for_phase_policy(
+                ClusterPhasePolicy::X100Only,
+                gguf.metadata(),
+                8,
+                None,
+                Some(4),
+                profile,
+            )
+            .expect("create worker pool");
+            assert!(pool.thread_count() <= 4);
+
+            let seen_tids: Mutex<HashSet<thread::ThreadId>> = Mutex::new(HashSet::new());
+            let record_tid = || {
+                seen_tids
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(thread::current().id());
+            };
+
+            // Verify `install` + nested `par_chunks_mut` / `par_for_each_index` / `dispatch_indexed`
+            // / `execute_scoped` never spawns an extra thread pool or leaks outside N workers.
+            let mut buf = vec![0_usize; 257];
+            pool.install(|| {
+                assert!(WorkerPool::with_current(|_| ()).is_some());
+                record_tid();
+
+                pool.par_chunks_mut(&mut buf, 32, |chunk_idx, chunk| {
+                    record_tid();
+                    for (offset, slot) in chunk.iter_mut().enumerate() {
+                        *slot = chunk_idx * 32 + offset + 1;
+                    }
+                });
+
+                pool.dispatch_indexed(64, |range, _worker_idx| {
+                    record_tid();
+                    assert!(!range.is_empty());
+                });
+
+                let sum_check = AtomicUsize::new(0);
+                pool.par_for_each_index(64, |idx| {
+                    record_tid();
+                    sum_check.fetch_add(idx + 1, Ordering::Relaxed);
+                });
+                assert_eq!(sum_check.load(Ordering::Acquire), (64 * 65) / 2);
+
+                pool.execute_scoped(&|_worker_idx, _num_workers| {
+                    record_tid();
+                });
+            });
+
+            for (i, &val) in buf.iter().enumerate() {
+                assert_eq!(val, i + 1, "par_chunks_mut disjoint write mismatch at {i}");
+            }
+
+            let err = pool
+                .try_par_chunks_mut(
+                    &mut buf,
+                    16,
+                    |chunk_idx, _chunk| -> Result<(), &'static str> {
+                        if chunk_idx == 3 { Err("boom") } else { Ok(()) }
+                    },
+                )
+                .expect_err("try_par_chunks_mut must surface worker error");
+            assert_eq!(err, "boom");
+
+            let distinct_count = seen_tids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len();
+            assert!(
+                distinct_count <= pool.thread_count(),
+                "{profile:?} observed {distinct_count} worker threads for pool of size {}",
+                pool.thread_count()
+            );
+
+            // Verify `with_phase_session` retains `!Send` state on caller thread across iterations.
+            let local_counter = Rc::new(Cell::new(0_usize));
+            let local_ref = Rc::clone(&local_counter);
+            let total = pool.with_phase_session(
+                crate::engine::EnginePhase::Decode,
+                ClusterPhasePolicy::Auto,
+                |session| {
+                    for step in 0..8 {
+                        let out = session.run(|| step * 2);
+                        assert_eq!(out, step * 2);
+                        local_ref.set(local_ref.get() + 1);
+                    }
+                    local_ref.get()
+                },
+            );
+            assert_eq!(total, 8);
+            assert_eq!(local_counter.get(), 8);
         }
     }
 }

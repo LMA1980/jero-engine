@@ -11,7 +11,7 @@ use jero_tokenizer::{GgufTokenizer, TokenType, Tokenizer};
 use serde::{Deserialize, Serialize};
 
 use crate::affinity::{
-    ClusterPhasePolicy, WorkerPool, X100_CLUSTER_MASK, select_phase_policy_for_arch,
+    ClusterPhasePolicy, PhaseSession, WorkerPool, X100_CLUSTER_MASK, select_phase_policy_for_arch,
 };
 use crate::engine::{EnginePhase, StreamAction, infer_logits_buffer_len, sample_greedy_argmax};
 use crate::kv::SingleSlotKvArena;
@@ -397,53 +397,39 @@ where
     let mut generated_text = String::new();
 
     if max_tokens > 0 {
-        let mut current_token =
-            sample_greedy_argmax(&ctx.logits()[..sample_len]).ok_or_else(|| {
-                K3Error::CapabilityMismatch {
-                    architecture: recipe.architecture_id().to_owned(),
-                    reason: "empty logits buffer after prefill step".to_owned(),
-                }
-            })?;
+        let current_token = sample_greedy_argmax(&ctx.logits()[..sample_len]).ok_or_else(|| {
+            K3Error::CapabilityMismatch {
+                architecture: recipe.architecture_id().to_owned(),
+                reason: "empty logits buffer after prefill step".to_owned(),
+            }
+        })?;
         greedy_token_ids.push(current_token);
 
-        if on_token(current_token, &mut generated_text)? == StreamAction::Continue {
-            while greedy_token_ids.len() < max_tokens && ctx.position() < n_ctx {
-                ctx.prepare_decode(current_token)?;
-                if let Some(pool) = worker_pool {
-                    pool.install_for_phase(EnginePhase::Decode, effective_policy, || {
-                        recipe.decode_step(&mut ctx, weights)
-                    })?;
-                } else {
-                    recipe.decode_step(&mut ctx, weights)?;
-                }
-
-                let step_len = vocab_size.min(ctx.logits().len());
-                // Validate finiteness on every decode step as well
-                if let Some((bad_idx, bad_val)) = ctx.logits()[..step_len]
-                    .iter()
-                    .enumerate()
-                    .find(|(_, v)| !v.is_finite())
-                {
-                    return Err(K3Error::CapabilityMismatch {
-                        architecture: recipe.architecture_id().to_owned(),
-                        reason: format!(
-                            "non-finite decode logit {bad_val} at token_id {bad_idx} (step {})",
-                            greedy_token_ids.len()
-                        ),
-                    });
-                }
-
-                current_token =
-                    sample_greedy_argmax(&ctx.logits()[..step_len]).ok_or_else(|| {
-                        K3Error::CapabilityMismatch {
-                            architecture: recipe.architecture_id().to_owned(),
-                            reason: "empty logits buffer after decode step".to_owned(),
-                        }
-                    })?;
-                greedy_token_ids.push(current_token);
-                if on_token(current_token, &mut generated_text)? == StreamAction::Stop {
-                    break;
-                }
+        if on_token(current_token, &mut generated_text)? == StreamAction::Continue
+            && greedy_token_ids.len() < max_tokens
+            && ctx.position() < n_ctx
+        {
+            let mut state = ParityDecodeLoopState {
+                ctx: &mut ctx,
+                greedy_token_ids: &mut greedy_token_ids,
+                generated_text: &mut generated_text,
+                current_token,
+                max_tokens,
+                n_ctx,
+                vocab_size,
+            };
+            if let Some(pool) = worker_pool {
+                pool.with_phase_session(EnginePhase::Decode, effective_policy, |session| {
+                    run_parity_decode_loop(
+                        &mut state,
+                        recipe,
+                        weights,
+                        &mut on_token,
+                        Some(session),
+                    )
+                })?;
+            } else {
+                run_parity_decode_loop(&mut state, recipe, weights, &mut on_token, None)?;
             }
         }
     }
@@ -460,6 +446,72 @@ where
     };
 
     Ok((report, generated_text))
+}
+
+struct ParityDecodeLoopState<'a, 'b> {
+    ctx: &'a mut ExecutionContext<'b>,
+    greedy_token_ids: &'a mut Vec<u32>,
+    generated_text: &'a mut String,
+    current_token: u32,
+    max_tokens: usize,
+    n_ctx: usize,
+    vocab_size: usize,
+}
+
+fn run_parity_decode_loop<F>(
+    state: &mut ParityDecodeLoopState<'_, '_>,
+    recipe: &dyn ArchRecipe,
+    weights: &dyn ModelWeights,
+    on_token: &mut F,
+    mut session: Option<&mut PhaseSession<'_>>,
+) -> Result<(), K3Error>
+where
+    F: FnMut(u32, &mut String) -> Result<StreamAction, K3Error>,
+{
+    while state.greedy_token_ids.len() < state.max_tokens && state.ctx.position() < state.n_ctx {
+        let token_in = state.current_token;
+        let ctx_ref = &mut *state.ctx;
+        if let Some(active_session) = session.as_deref_mut() {
+            active_session.run(|| {
+                ctx_ref.reset_scratch();
+                ctx_ref.prepare_decode(token_in)?;
+                recipe.decode_step(ctx_ref, weights)
+            })?;
+        } else {
+            ctx_ref.reset_scratch();
+            ctx_ref.prepare_decode(token_in)?;
+            recipe.decode_step(ctx_ref, weights)?;
+        }
+
+        let step_len = state.vocab_size.min(state.ctx.logits().len());
+        // Validate finiteness on every decode step as well
+        if let Some((bad_idx, bad_val)) = state.ctx.logits()[..step_len]
+            .iter()
+            .enumerate()
+            .find(|(_, v)| !v.is_finite())
+        {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: recipe.architecture_id().to_owned(),
+                reason: format!(
+                    "non-finite decode logit {bad_val} at token_id {bad_idx} (step {})",
+                    state.greedy_token_ids.len()
+                ),
+            });
+        }
+
+        state.current_token =
+            sample_greedy_argmax(&state.ctx.logits()[..step_len]).ok_or_else(|| {
+                K3Error::CapabilityMismatch {
+                    architecture: recipe.architecture_id().to_owned(),
+                    reason: "empty logits buffer after decode step (or all-NaN)".to_owned(),
+                }
+            })?;
+        state.greedy_token_ids.push(state.current_token);
+        if on_token(state.current_token, state.generated_text)? == StreamAction::Stop {
+            break;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn encode_chunk_without_bos(

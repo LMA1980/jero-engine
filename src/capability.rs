@@ -1733,6 +1733,7 @@ impl RecipeRegistry {
     #[must_use]
     pub fn instantiate_recipe_from_gguf(gguf: &GgufFile<'_>) -> Option<Box<dyn ArchRecipe>> {
         let params = GgufHyperparams::from_gguf(gguf);
+        #[cfg(any(feature = "jero-arch-phi3", feature = "jero-arch-mistral"))]
         let arch = params.architecture.as_str();
 
         #[cfg(feature = "jero-arch-phi3")]
@@ -1813,13 +1814,11 @@ fn validate_raw_gguf_hyperparams(gguf: &GgufFile<'_>) -> Result<(), K3Error> {
         });
     }
     validate_raw_ssm_and_granite_hyperparams(gguf, arch)?;
+    #[cfg(feature = "jero-arch-dory")]
     if arch == "dory"
         && let Some(val) = gguf.metadata_value("dory.rope.profile")
     {
-        #[cfg(feature = "jero-arch-dory")]
-        {
-            jero_arch_dory::DoryRecipe::parse_rope_profile(val)?;
-        }
+        jero_arch_dory::DoryRecipe::parse_rope_profile(val)?;
     }
     Ok(())
 }

@@ -856,48 +856,63 @@ fn generate_from_ready_context(
     let mut current_token = sample_greedy_argmax(&ctx.logits()[..sample_len])
         .ok_or_else(|| (500_u16, "empty logits buffer".to_owned()))?;
 
-    loop {
-        let step_len = vocab_size.min(ctx.logits().len());
-        let (lp, top_map) =
-            compute_step_logprobs(&ctx.logits()[..step_len], current_token, top_k, tokenizer);
-        gen_count += 1;
+    let finish_reason = worker_pool.with_phase_session(
+        EnginePhase::Decode,
+        effective_policy,
+        |session| -> Result<&'static str, (u16, String)> {
+            loop {
+                let step_len = vocab_size.min(ctx.logits().len());
+                let (lp, top_map) = compute_step_logprobs(
+                    &ctx.logits()[..step_len],
+                    current_token,
+                    top_k,
+                    tokenizer,
+                );
+                gen_count += 1;
 
-        if stop_ids.contains(&current_token) || tokenizer.special_tokens().is_stop(current_token) {
-            stopped = true;
-            break;
-        }
+                if stop_ids.contains(&current_token)
+                    || tokenizer.special_tokens().is_stop(current_token)
+                {
+                    stopped = true;
+                    break;
+                }
 
-        let piece = decode_token_piece_lossy(tokenizer, current_token);
-        text_offset.push(*running_offset);
-        *running_offset += piece.len();
-        tokens_str.push(piece.clone());
-        token_logprobs.push(Some(lp));
-        top_logprobs.push(Some(top_map));
-        generated_text.push_str(&piece);
+                let piece = decode_token_piece_lossy(tokenizer, current_token);
+                text_offset.push(*running_offset);
+                *running_offset += piece.len();
+                tokens_str.push(piece.clone());
+                token_logprobs.push(Some(lp));
+                top_logprobs.push(Some(top_map));
+                generated_text.push_str(&piece);
 
-        if trim_matched_stop_sequence(&mut generated_text, stop_strings) {
-            stopped = true;
-            break;
-        }
+                if trim_matched_stop_sequence(&mut generated_text, stop_strings) {
+                    stopped = true;
+                    break;
+                }
 
-        if gen_count >= max_tokens || ctx.position() >= n_ctx || is_abort_requested() {
-            break;
-        }
+                if gen_count >= max_tokens || ctx.position() >= n_ctx || is_abort_requested() {
+                    break;
+                }
 
-        ctx.prepare_decode(current_token)
-            .map_err(|e| (500_u16, format!("prepare_decode failed: {e}")))?;
-        worker_pool
-            .install_for_phase(EnginePhase::Decode, effective_policy, || {
-                recipe.decode_step(ctx, locked_weights)
-            })
-            .map_err(|e| (500_u16, format!("decode_step failed: {e}")))?;
+                let ctx_ref = &mut *ctx;
+                session.run(|| {
+                    ctx_ref.reset_scratch();
+                    ctx_ref
+                        .prepare_decode(current_token)
+                        .map_err(|e| (500_u16, format!("prepare_decode failed: {e}")))?;
+                    recipe
+                        .decode_step(ctx_ref, locked_weights)
+                        .map_err(|e| (500_u16, format!("decode_step failed: {e}")))
+                })?;
 
-        let next_len = vocab_size.min(ctx.logits().len());
-        current_token = sample_greedy_argmax(&ctx.logits()[..next_len])
-            .ok_or_else(|| (500_u16, "empty decode logits".to_owned()))?;
-    }
+                let next_len = vocab_size.min(ctx.logits().len());
+                current_token = sample_greedy_argmax(&ctx.logits()[..next_len])
+                    .ok_or_else(|| (500_u16, "empty decode logits".to_owned()))?;
+            }
 
-    let finish_reason = if stopped { "stop" } else { "length" };
+            Ok(if stopped { "stop" } else { "length" })
+        },
+    )?;
     Ok((generated_text, gen_count, finish_reason))
 }
 

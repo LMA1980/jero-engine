@@ -119,6 +119,7 @@ pub use gemma::{
     gemma_norm_lane, select_top_k_experts,
 };
 
+#[cfg(feature = "jero-kernels-rvv")]
 pub use forward::DebertaV3Recipe;
 #[cfg(feature = "jero-arch-modernbert")]
 pub use modernbert as arch_modernbert;

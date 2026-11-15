@@ -15,8 +15,8 @@
 //! is bit-identical across every placement, split and kernel choice.
 
 use std::ops::Range;
-use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use jero_core::{
@@ -109,7 +109,13 @@ pub const FFN_DIM: usize = 1024;
 /// Number of transformer layers in the benchmark model.
 pub const N_LAYERS: usize = 4;
 
-type Job = Arc<dyn Fn(usize, usize) + Send + Sync>;
+/// Minimum output row count required before cross-cluster `RowSplit` fans out to both clusters.
+/// Projections with fewer than `ROW_SPLIT_MIN_ROWS` output rows stay on the dominant cluster.
+pub const ROW_SPLIT_MIN_ROWS: usize = 256;
+/// Output row alignment granularity for single-row GEMV (`m == 1`, Vector kernel).
+pub const GEMV_ROW_ALIGN: usize = 4;
+/// Output row alignment granularity for tiled / IME matrix kernels (`TILE_N = 8`).
+pub const IME_ROW_ALIGN: usize = TILE_N;
 
 /// Processor cluster a unit of work is dispatched to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +273,38 @@ pub fn partition_tiles(total: usize, share: f64) -> usize {
     tiles.min(total)
 }
 
+/// Computes an aligned row index partitioning `0..n_rows` across two clusters according to
+/// `first_share` (`[0.0, 1.0]`).
+///
+/// Bypasses cross-cluster splitting when `n_rows < ROW_SPLIT_MIN_ROWS`, returning `n_rows` when
+/// `first_share > 0.5` (all work on the first cluster) or `0` otherwise (all work on the second
+/// cluster). For larger matrices, rounds the split point to the nearest multiple of `align`
+/// (`GEMV_ROW_ALIGN = 4` for single-row Vector GEMV; `TILE_N = 8` for IME or batched projections).
+#[must_use]
+pub fn calibrate_split_row(n_rows: usize, first_share: f64, align: usize) -> usize {
+    if n_rows == 0 {
+        return 0;
+    }
+    let share = if first_share.is_finite() {
+        first_share.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    if n_rows < ROW_SPLIT_MIN_ROWS {
+        return if share > 0.5 { n_rows } else { 0 };
+    }
+    let align = align.max(1);
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "matrix row counts fit cleanly in f64 and share is clamped to [0, 1]"
+    )]
+    let approx = (n_rows as f64 * share).round() as usize;
+    let aligned = ((approx + align / 2) / align) * align;
+    aligned.min(n_rows)
+}
+
 fn splitmix(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = x;
@@ -327,18 +365,45 @@ impl Matrix {
     }
 }
 
-struct Operand {
-    m: usize,
-    k: usize,
-    rows: Vec<i8>,
-    packed: Option<Vec<i8>>,
+#[derive(Clone, Copy)]
+struct SyncMutPtr<T>(*mut T);
+
+impl<T> SyncMutPtr<T> {
+    const fn as_ptr(&self) -> *mut T {
+        self.0
+    }
 }
+
+// SAFETY: Matrix and vector workers write strictly disjoint index ranges guarded by barrier join.
+unsafe impl<T: Send> Send for SyncMutPtr<T> {}
+// SAFETY: Shared read-only copy of disjoint base pointers for `Send` elements.
+unsafe impl<T: Send> Sync for SyncMutPtr<T> {}
 
 fn worker_range(range: &Range<usize>, idx: usize, workers: usize) -> Range<usize> {
     let len = range.end - range.start;
     let chunk = len.div_ceil(workers.max(1));
     let lo = (range.start + idx * chunk).min(range.end);
     let hi = (lo + chunk).min(range.end);
+    lo..hi
+}
+
+fn aligned_row_subrange(
+    range: &Range<usize>,
+    idx: usize,
+    workers: usize,
+    align: usize,
+) -> Range<usize> {
+    if range.is_empty() {
+        return range.end..range.end;
+    }
+    let align = align.max(1);
+    let len = range.end - range.start;
+    let units = len.div_ceil(align);
+    let workers = workers.max(1);
+    let u_lo = (idx * units) / workers;
+    let u_hi = ((idx + 1) * units) / workers;
+    let lo = (range.start + u_lo * align).min(range.end);
+    let hi = (range.start + u_hi * align).min(range.end);
     lo..hi
 }
 
@@ -353,15 +418,28 @@ fn lane_error(lane: Lane) -> K3Error {
     }
 }
 
-fn run_lane(pool: &WorkerPool, lane: Lane, job: Job) -> Result<(), K3Error> {
+fn validate_lane(pool: &WorkerPool, lane: Lane) -> Result<(), K3Error> {
+    if (pool.x100_pool().is_some() && pool.a100_pool().is_some())
+        || pool.affinity().cluster == Some(lane.preset())
+    {
+        Ok(())
+    } else {
+        Err(lane_error(lane))
+    }
+}
+
+fn run_lane_scoped<F>(pool: &WorkerPool, lane: Lane, task: F) -> Result<(), K3Error>
+where
+    F: Fn(usize, usize) + Sync,
+{
     if let (Some(x), Some(a)) = (pool.x100_pool(), pool.a100_pool()) {
         match lane {
-            Lane::X100 => x.execute_job(job),
-            Lane::A100 => a.execute_job(job),
+            Lane::X100 => x.execute_scoped(&task),
+            Lane::A100 => a.execute_scoped(&task),
         }
         Ok(())
     } else if pool.affinity().cluster == Some(lane.preset()) {
-        pool.execute_job(job);
+        pool.execute_scoped(&task);
         Ok(())
     } else {
         Err(lane_error(lane))
@@ -373,19 +451,19 @@ fn run_lane(pool: &WorkerPool, lane: Lane, job: Job) -> Result<(), K3Error> {
 pub struct ForwardExec<'a> {
     pool: &'a WorkerPool,
     kernel: MatKernel,
-    matmul_cpus: Arc<AtomicU64>,
-    vector_cpus: Arc<AtomicU64>,
+    matmul_cpus: AtomicU64,
+    vector_cpus: AtomicU64,
 }
 
 impl<'a> ForwardExec<'a> {
     /// Creates a dispatch context over `pool` using `kernel` for matrix multiplications.
     #[must_use]
-    pub fn new(pool: &'a WorkerPool, kernel: MatKernel) -> Self {
+    pub const fn new(pool: &'a WorkerPool, kernel: MatKernel) -> Self {
         Self {
             pool,
             kernel,
-            matmul_cpus: Arc::new(AtomicU64::new(0)),
-            vector_cpus: Arc::new(AtomicU64::new(0)),
+            matmul_cpus: AtomicU64::new(0),
+            vector_cpus: AtomicU64::new(0),
         }
     }
 
@@ -401,104 +479,184 @@ impl<'a> ForwardExec<'a> {
         self.vector_cpus.load(Ordering::Relaxed)
     }
 
+    const fn lane_kernel(&self, lane: Lane) -> MatKernel {
+        match (self.kernel, lane) {
+            (MatKernel::Ime, Lane::A100) => MatKernel::Ime,
+            _ => MatKernel::Vector,
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "dispatches both m=1 split and batched m>1 paths"
+    )]
+    fn run_matmul_slice<'b>(
+        &'b self,
+        lane: Lane,
+        w: &'b Matrix,
+        x: &'b [i8],
+        packed_x: Option<&'b [i8]>,
+        m: usize,
+        abs_rows: &Range<usize>,
+        out_ptr: SyncMutPtr<i32>,
+        out_row_offset: usize,
+        out_stride: usize,
+    ) -> impl Fn(usize, usize) + Sync + 'b {
+        let lk = self.lane_kernel(lane);
+        let align = match lk {
+            MatKernel::Ime => TILE_N,
+            MatKernel::Vector => GEMV_ROW_ALIGN,
+        };
+        let rows = abs_rows.clone();
+        move |idx, workers| {
+            let sub = aligned_row_subrange(&rows, idx, workers, align);
+            if sub.is_empty() {
+                return;
+            }
+            self.matmul_cpus.fetch_or(cpu_bit(), Ordering::Relaxed);
+            // SAFETY: `sub` ranges are mutually disjoint across `idx in 0..workers` and reside
+            // inside `out_ptr`'s caller-owned `out` buffer until synchronous barrier completion.
+            unsafe {
+                matmul_rows(
+                    lk,
+                    w,
+                    x,
+                    packed_x,
+                    m,
+                    sub,
+                    out_ptr,
+                    out_row_offset,
+                    out_stride,
+                );
+            }
+        }
+    }
+
     /// `out[m x n] = x[m x k] * w^T` in exact `i32`, partitioned over `layout.matmul` lanes.
     #[allow(clippy::many_single_char_names)]
     fn matmul(
         &self,
         layout: &PhaseLayout,
-        w: &Arc<Matrix>,
+        w: &Matrix,
         x: &[i8],
         m: usize,
     ) -> Result<Vec<i32>, K3Error> {
-        let k = w.k;
-        let operand = Arc::new(Operand {
-            m,
-            k,
-            rows: x.to_vec(),
-            packed: (self.kernel == MatKernel::Ime).then(|| pack_tiles(x, m, k)),
-        });
         let n = w.n;
-        let n_tiles = n / TILE_N;
-        let out: Arc<Vec<AtomicI32>> = Arc::new((0..m * n).map(|_| AtomicI32::new(0)).collect());
+        let k = w.k;
+        let mut out = vec![0_i32; m * n];
+        if layout.matmul.is_empty() || m == 0 || n == 0 {
+            return Ok(out);
+        }
 
-        let mut jobs: Vec<(Lane, Job)> = Vec::new();
+        let packed_x = (self.kernel == MatKernel::Ime).then(|| pack_tiles(x, m, k));
+        let packed_ref = packed_x.as_deref();
+
+        if layout.matmul.len() == 1 {
+            let lane = layout.matmul[0].0;
+            let p = SyncMutPtr(out.as_mut_ptr());
+            let task = self.run_matmul_slice(lane, w, x, packed_ref, m, &(0..n), p, 0, n);
+            run_lane_scoped(self.pool, lane, task)?;
+            return Ok(out);
+        }
+
+        if layout.matmul.len() == 2 {
+            let (lane0, share0) = layout.matmul[0];
+            let (lane1, _share1) = layout.matmul[1];
+            let has_ime_lane =
+                self.kernel == MatKernel::Ime && (lane0 == Lane::A100 || lane1 == Lane::A100);
+            let row_align = if m == 1 && !has_ime_lane {
+                GEMV_ROW_ALIGN
+            } else {
+                IME_ROW_ALIGN
+            };
+            let split_row = calibrate_split_row(n, share0, row_align);
+            if split_row == 0 {
+                let p = SyncMutPtr(out.as_mut_ptr());
+                let task = self.run_matmul_slice(lane1, w, x, packed_ref, m, &(0..n), p, 0, n);
+                run_lane_scoped(self.pool, lane1, task)?;
+                return Ok(out);
+            }
+            if split_row == n {
+                let p = SyncMutPtr(out.as_mut_ptr());
+                let task = self.run_matmul_slice(lane0, w, x, packed_ref, m, &(0..n), p, 0, n);
+                run_lane_scoped(self.pool, lane0, task)?;
+                return Ok(out);
+            }
+
+            validate_lane(self.pool, lane0)?;
+            validate_lane(self.pool, lane1)?;
+
+            if lane0 != lane1 && self.pool.is_dual() {
+                let (r0, r1) = (0..split_row, split_row..n);
+                let (p0, p1, off1) = if m == 1 {
+                    let (s0, s1) = out.split_at_mut(split_row);
+                    (
+                        SyncMutPtr(s0.as_mut_ptr()),
+                        SyncMutPtr(s1.as_mut_ptr()),
+                        split_row,
+                    )
+                } else {
+                    (
+                        SyncMutPtr(out.as_mut_ptr()),
+                        SyncMutPtr(out.as_mut_ptr()),
+                        0,
+                    )
+                };
+                let t0 = self.run_matmul_slice(lane0, w, x, packed_ref, m, &r0, p0, 0, n);
+                let t1 = self.run_matmul_slice(lane1, w, x, packed_ref, m, &r1, p1, off1, n);
+                match (lane0, lane1) {
+                    (Lane::X100, Lane::A100) => self.pool.execute_split_scoped(&t0, &t1),
+                    (Lane::A100, Lane::X100) => self.pool.execute_split_scoped(&t1, &t0),
+                    _ => unreachable!("distinct dual lanes validated"),
+                }
+                return Ok(out);
+            }
+        }
+
+        // General multi-lane sequential fallback for synthetic plans with > 2 entries.
+        let n_tiles = n / TILE_N;
         let mut start = 0_usize;
         let mut acc_share = 0.0_f64;
+        let p = SyncMutPtr(out.as_mut_ptr());
         for (idx, &(lane, share)) in layout.matmul.iter().enumerate() {
             acc_share += share;
-            let end = if idx + 1 == layout.matmul.len() {
+            let end_tile = if idx + 1 == layout.matmul.len() {
                 n_tiles
             } else {
                 partition_tiles(n_tiles, acc_share)
             };
-            let range = start..end.max(start);
-            start = range.end;
+            let range = (start * TILE_N)..(end_tile.max(start) * TILE_N);
+            start = end_tile.max(start);
             if range.is_empty() {
                 continue;
             }
-            let (w, operand, out) = (Arc::clone(w), Arc::clone(&operand), Arc::clone(&out));
-            let lane_kernel = match (self.kernel, lane) {
-                (MatKernel::Ime, Lane::A100) => MatKernel::Ime,
-                _ => MatKernel::Vector,
-            };
-            let cpus = Arc::clone(&self.matmul_cpus);
-            let job: Job = Arc::new(move |idx, workers| {
-                let tiles = worker_range(&range, idx, workers);
-                if tiles.is_empty() {
-                    return;
-                }
-                cpus.fetch_or(cpu_bit(), Ordering::Relaxed);
-                matmul_tiles(lane_kernel, &w, &operand, tiles, &out);
-            });
-            jobs.push((lane, job));
+            let task = self.run_matmul_slice(lane, w, x, packed_ref, m, &range, p, 0, n);
+            run_lane_scoped(self.pool, lane, task)?;
         }
-
-        let results: Vec<Result<(), K3Error>> = if jobs.len() == 1 {
-            let (lane, job) = jobs.remove(0);
-            vec![run_lane(self.pool, lane, job)]
-        } else {
-            std::thread::scope(|s| {
-                let handles: Vec<_> = jobs
-                    .into_iter()
-                    .map(|(lane, job)| s.spawn(move || run_lane(self.pool, lane, job)))
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().expect("lane dispatch thread"))
-                    .collect()
-            })
-        };
-        for r in results {
-            r?;
-        }
-        Ok(out.iter().map(|v| v.load(Ordering::Relaxed)).collect())
+        Ok(out)
     }
 
     /// Runs `body(row_range)` over `rows` rows on the vector lane, partitioned across its workers.
     fn rows_on_lane<F>(&self, lane: Lane, rows: usize, body: F) -> Result<(), K3Error>
     where
-        F: Fn(Range<usize>) + Send + Sync + 'static,
+        F: Fn(Range<usize>) + Sync,
     {
-        let cpus = Arc::clone(&self.vector_cpus);
-        let job: Job = Arc::new(move |idx, workers| {
+        run_lane_scoped(self.pool, lane, |idx, workers| {
             let r = worker_range(&(0..rows), idx, workers);
             if r.is_empty() {
                 return;
             }
-            cpus.fetch_or(cpu_bit(), Ordering::Relaxed);
+            self.vector_cpus.fetch_or(cpu_bit(), Ordering::Relaxed);
             body(r);
-        });
-        run_lane(self.pool, lane, job)
+        })
     }
 
     fn rmsnorm(&self, lane: Lane, x: &[i8], m: usize) -> Result<Vec<i8>, K3Error> {
-        let input: Arc<Vec<i8>> = Arc::new(x.to_vec());
-        let out: Arc<Vec<AtomicU8>> =
-            Arc::new((0..m * MODEL_DIM).map(|_| AtomicU8::new(0)).collect());
-        let (i2, o2) = (Arc::clone(&input), Arc::clone(&out));
-        self.rows_on_lane(lane, m, move |rows| {
+        let mut out = vec![0_i8; m * MODEL_DIM];
+        let out_ptr = SyncMutPtr(out.as_mut_ptr());
+        self.rows_on_lane(lane, m, |rows| {
             for r in rows {
-                let row = &i2[r * MODEL_DIM..(r + 1) * MODEL_DIM];
+                let row = &x[r * MODEL_DIM..(r + 1) * MODEL_DIM];
                 let ms: u64 = row
                     .iter()
                     .map(|&v| u64::from(i32::from(v).unsigned_abs().pow(2)))
@@ -506,18 +664,20 @@ impl<'a> ForwardExec<'a> {
                 let rms = i32::try_from(isqrt(ms / MODEL_DIM as u64))
                     .unwrap_or(i32::MAX)
                     .max(1);
-                for (d, &v) in row.iter().enumerate() {
+                // SAFETY: Distinct `r` across workers writes disjoint `[r*MODEL_DIM..(r+1)*MODEL_DIM]` rows.
+                let out_row = unsafe {
+                    std::slice::from_raw_parts_mut(out_ptr.as_ptr().add(r * MODEL_DIM), MODEL_DIM)
+                };
+                for (dst, &v) in out_row.iter_mut().zip(row.iter()) {
                     let y = (i32::from(v) * 48 / rms).clamp(-127, 127);
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss,
-                        reason = "clamped to [-127, 127] and stored bit-preserving as u8"
-                    )]
-                    o2[r * MODEL_DIM + d].store(y as i8 as u8, Ordering::Relaxed);
+                    #[expect(clippy::cast_possible_truncation, reason = "clamped to [-127, 127]")]
+                    {
+                        *dst = y as i8;
+                    }
                 }
             }
         })?;
-        Ok(collect_i8(&out))
+        Ok(out)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -530,13 +690,9 @@ impl<'a> ForwardExec<'a> {
         m: usize,
         start_pos: usize,
     ) -> Result<Vec<i8>, K3Error> {
-        let q: Arc<Vec<i8>> = Arc::new(q.to_vec());
-        let kc: Arc<Vec<i8>> = Arc::new(k_cache.to_vec());
-        let vc: Arc<Vec<i8>> = Arc::new(v_cache.to_vec());
-        let out: Arc<Vec<AtomicU8>> =
-            Arc::new((0..m * MODEL_DIM).map(|_| AtomicU8::new(0)).collect());
-        let o2 = Arc::clone(&out);
-        self.rows_on_lane(lane, m, move |rows| {
+        let mut out = vec![0_i8; m * MODEL_DIM];
+        let out_ptr = SyncMutPtr(out.as_mut_ptr());
+        self.rows_on_lane(lane, m, |rows| {
             let mut acc = vec![0_i64; MODEL_DIM];
             for r in rows {
                 let pos = start_pos + r;
@@ -544,34 +700,30 @@ impl<'a> ForwardExec<'a> {
                 acc.fill(0);
                 let mut total_w = 0_i64;
                 for t in 0..=pos {
-                    let s = dot_i8_vector(qrow, &kc[t * MODEL_DIM..(t + 1) * MODEL_DIM]);
+                    let s = dot_i8_vector(qrow, &k_cache[t * MODEL_DIM..(t + 1) * MODEL_DIM]);
                     let w = i64::from((s >> 10).clamp(0, 127)) + 1;
                     total_w += w;
-                    let vrow = &vc[t * MODEL_DIM..(t + 1) * MODEL_DIM];
+                    let vrow = &v_cache[t * MODEL_DIM..(t + 1) * MODEL_DIM];
                     for (a, &v) in acc.iter_mut().zip(vrow) {
                         *a += w * i64::from(v);
                     }
                 }
-                for (d, &a) in acc.iter().enumerate() {
+                // SAFETY: Distinct `r` across workers writes disjoint `[r*MODEL_DIM..(r+1)*MODEL_DIM]` rows.
+                let out_row = unsafe {
+                    std::slice::from_raw_parts_mut(out_ptr.as_ptr().add(r * MODEL_DIM), MODEL_DIM)
+                };
+                for (dst, &a) in out_row.iter_mut().zip(acc.iter()) {
                     #[expect(
                         clippy::cast_possible_truncation,
                         reason = "weighted mean of i8 values"
                     )]
                     let y = (a / total_w) as i8;
-                    #[expect(clippy::cast_sign_loss, reason = "bit-preserving i8 store")]
-                    o2[r * MODEL_DIM + d].store(y as u8, Ordering::Relaxed);
+                    *dst = y;
                 }
             }
         })?;
-        Ok(collect_i8(&out))
+        Ok(out)
     }
-}
-
-fn collect_i8(out: &[AtomicU8]) -> Vec<i8> {
-    #[expect(clippy::cast_possible_wrap, reason = "bit-preserving u8 -> i8")]
-    out.iter()
-        .map(|v| v.load(Ordering::Relaxed) as i8)
-        .collect()
 }
 
 fn isqrt(v: u64) -> u64 {
@@ -587,46 +739,55 @@ fn isqrt(v: u64) -> u64 {
     x
 }
 
-fn matmul_tiles(
+// SAFETY: Every `(row, col)` with `row < m` and `col in abs_rows` maps to a strictly disjoint
+// offset `(row * out_stride) + (col - out_row_offset)` inside caller's mutable slice.
+#[expect(clippy::too_many_arguments, reason = "kernel row-slice dispatch")]
+unsafe fn matmul_rows(
     kernel: MatKernel,
     w: &Matrix,
-    x: &Operand,
-    tiles: Range<usize>,
-    out: &[AtomicI32],
+    x: &[i8],
+    packed_x: Option<&[i8]>,
+    m: usize,
+    abs_rows: Range<usize>,
+    out_ptr: SyncMutPtr<i32>,
+    out_row_offset: usize,
+    out_stride: usize,
 ) {
-    let n = w.n;
     match kernel {
         MatKernel::Ime => {
-            let a = x.packed.as_deref().expect("IME operand is packed");
+            let a = packed_x.expect("IME operand is packed");
+            let tile_start = abs_rows.start / TILE_N;
+            let tile_end = abs_rows.end / TILE_N;
             gemm_i8_ime(
                 a,
-                tile_count(x.m),
+                tile_count(m),
                 &w.packed,
-                tiles,
-                x.k / TILE_K,
+                tile_start..tile_end,
+                w.k / TILE_K,
                 |mt, nt, c: &[i32; TILE_C]| {
                     for i in 0..TILE_M {
                         let row = mt * TILE_M + i;
-                        if row >= x.m {
+                        if row >= m {
                             break;
                         }
                         for j in 0..TILE_N {
-                            out[row * n + nt * TILE_N + j]
-                                .store(c[i * TILE_N + j], Ordering::Relaxed);
+                            let col = nt * TILE_N + j;
+                            if col >= abs_rows.start && col < abs_rows.end {
+                                let dst_idx = row * out_stride + (col - out_row_offset);
+                                // SAFETY: Disjoint element guaranteed by `abs_rows` ownership.
+                                unsafe { out_ptr.as_ptr().add(dst_idx).write(c[i * TILE_N + j]) };
+                            }
                         }
                     }
                 },
             );
         }
         MatKernel::Vector => {
-            gemm_i8_vector(
-                &x.rows,
-                x.m,
-                &w.rows,
-                tiles.start * TILE_N..tiles.end * TILE_N,
-                x.k,
-                |r, c, v| out[r * n + c].store(v, Ordering::Relaxed),
-            );
+            gemm_i8_vector(x, m, &w.rows, abs_rows, w.k, |row, col, v| {
+                let dst_idx = row * out_stride + (col - out_row_offset);
+                // SAFETY: Disjoint element guaranteed by `abs_rows` ownership.
+                unsafe { out_ptr.as_ptr().add(dst_idx).write(v) };
+            });
         }
     }
 }
@@ -947,9 +1108,8 @@ pub fn measure_peak_macs(pool: &WorkerPool, lane: Lane, kernel: MatKernel) -> Re
         (MatKernel::Ime, Lane::A100) => MatKernel::Ime,
         _ => MatKernel::Vector,
     };
-    let rates: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&rates);
-    let job: Job = Arc::new(move |_, _| {
+    let rates: Mutex<Vec<f64>> = Mutex::new(Vec::new());
+    run_lane_scoped(pool, lane, |_, _| {
         const K_CHUNKS: usize = 32;
         let a = fill_small(1, TILE_M * K_CHUNKS * TILE_K);
         let b = fill_small(2, TILE_N * K_CHUNKS * TILE_K);
@@ -978,15 +1138,15 @@ pub fn measure_peak_macs(pool: &WorkerPool, lane: Lane, kernel: MatKernel) -> Re
         }
         std::hint::black_box(sum);
         let rate = calls as f64 * macs_per_call / start.elapsed().as_secs_f64();
-        sink.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        rates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .push(rate);
-    });
-    run_lane(pool, lane, job)?;
+    })?;
     let total = rates
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner)
+        .into_iter()
         .sum();
     Ok(total)
 }
@@ -1000,12 +1160,11 @@ pub fn measure_peak_macs(pool: &WorkerPool, lane: Lane, kernel: MatKernel) -> Re
 #[expect(clippy::cast_precision_loss, reason = "throughput ratio")]
 pub fn measure_memory_bandwidth(pool: &WorkerPool, lane: Lane) -> Result<f64, K3Error> {
     const WORDS: usize = 2 * 1024 * 1024;
-    let buf: Arc<Vec<u64>> = Arc::new((0..WORDS as u64).collect());
-    let rates: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
-    let (b2, sink) = (Arc::clone(&buf), Arc::clone(&rates));
-    let job: Job = Arc::new(move |idx, workers| {
+    let buf: Vec<u64> = (0..WORDS as u64).collect();
+    let rates: Mutex<Vec<f64>> = Mutex::new(Vec::new());
+    run_lane_scoped(pool, lane, |idx, workers| {
         let r = worker_range(&(0..WORDS), idx, workers);
-        let slice = &b2[r.clone()];
+        let slice = &buf[r];
         let start = Instant::now();
         let mut acc = 0_u64;
         for _ in 0..2 {
@@ -1015,17 +1174,31 @@ pub fn measure_memory_bandwidth(pool: &WorkerPool, lane: Lane) -> Result<f64, K3
         }
         std::hint::black_box(acc);
         let rate = (slice.len() * 8 * 2) as f64 / start.elapsed().as_secs_f64().max(1e-9);
-        sink.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        rates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .push(rate);
-    });
-    run_lane(pool, lane, job)?;
+    })?;
     let total = rates
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner)
+        .into_iter()
         .sum();
     Ok(total)
+}
+
+/// Measures dual-cluster DRAM streaming bandwidth via [`measure_memory_bandwidth`] on both
+/// `Lane::X100` and `Lane::A100` and returns `(x100_bytes_per_sec, a100_bytes_per_sec, x100_share)`.
+///
+/// # Errors
+///
+/// Returns [`K3Error::AffinityError`] if `pool` lacks workers for either cluster, or
+/// [`K3Error::CapabilityMismatch`] if either measured bandwidth is non-positive.
+pub fn calibrate_bandwidth_split_ratio(pool: &WorkerPool) -> Result<(f64, f64, f64), K3Error> {
+    let x100_bw = measure_memory_bandwidth(pool, Lane::X100)?;
+    let a100_bw = measure_memory_bandwidth(pool, Lane::A100)?;
+    let share = row_split_share(x100_bw, a100_bw)?;
+    Ok((x100_bw, a100_bw, share))
 }
 
 /// Reports whether the CPU `core` executes the `SpacemiT` IME `XSMTVDotII` (`smt.vmadot`, `VLEN=1024`)
@@ -1855,5 +2028,122 @@ mod tests {
         let err = verify_model_capabilities(&q4_gguf)
             .expect_err("Q4_K_M deberta-v3 must be rejected below Q8_0 precision floor");
         assert!(matches!(err, K3Error::CapabilityMismatch { .. }));
+    }
+
+    #[test]
+    fn test_calibrate_split_row_alignment_and_min_rows_threshold() {
+        assert_eq!(ROW_SPLIT_MIN_ROWS, 256);
+        assert_eq!(GEMV_ROW_ALIGN, 4);
+        assert_eq!(IME_ROW_ALIGN, TILE_N);
+
+        // Matrices smaller than ROW_SPLIT_MIN_ROWS bypass splitting cleanly.
+        assert_eq!(calibrate_split_row(128, 0.75, GEMV_ROW_ALIGN), 128);
+        assert_eq!(calibrate_split_row(128, 0.25, GEMV_ROW_ALIGN), 0);
+        assert_eq!(calibrate_split_row(255, 0.60, IME_ROW_ALIGN), 255);
+        assert_eq!(calibrate_split_row(0, 0.5, GEMV_ROW_ALIGN), 0);
+
+        // Larger matrices align strictly to the requested lane granularity.
+        let gemv_split = calibrate_split_row(513, 0.37, GEMV_ROW_ALIGN);
+        assert_eq!(gemv_split % GEMV_ROW_ALIGN, 0);
+        assert!(gemv_split > 0 && gemv_split <= 513);
+
+        let ime_split = calibrate_split_row(512, 0.31, IME_ROW_ALIGN);
+        assert_eq!(ime_split % IME_ROW_ALIGN, 0);
+        assert!(ime_split > 0 && ime_split <= 512);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_row_split_matmul_bit_identical_and_zero_new_threads() {
+        use crate::affinity::{ClusterPhasePolicy, MockCpuTopology};
+        use jero_core::CoordinationProfile;
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+
+        let bytes = create_synthetic_gguf_v3(
+            "llama",
+            32,
+            &[("output_norm.weight", QuantType::F32, &[16][..])],
+        );
+        let gguf = GgufFile::parse(&bytes).expect("parse gguf");
+        let topo = MockCpuTopology::spacemit_k3();
+        for profile in [CoordinationProfile::Spin, CoordinationProfile::Futex] {
+            let single_pool = WorkerPool::for_phase_policy(
+                ClusterPhasePolicy::X100Only,
+                gguf.metadata(),
+                8,
+                None,
+                Some(2),
+                profile,
+            )
+            .expect("single-cluster pool");
+            let single_exec = ForwardExec::new(&single_pool, MatKernel::Vector);
+
+            let Ok(dual_pool) = WorkerPool::for_phase_policy_with(
+                ClusterPhasePolicy::RowSplit,
+                gguf.metadata(),
+                32,
+                None,
+                Some(2),
+                profile,
+                &topo,
+            ) else {
+                // Skip dual-cluster pin validation on <16-core/cpuset-restricted CI hosts.
+                continue;
+            };
+            let (x100_bw, a100_bw, bw_share) =
+                calibrate_bandwidth_split_ratio(&dual_pool).expect("bandwidth ratio calibration");
+            assert!(bw_share.is_finite() && (0.0..=1.0).contains(&bw_share));
+            assert!(x100_bw > 0.0 && a100_bw > 0.0);
+
+            let split_exec = ForwardExec::new(&dual_pool, MatKernel::Vector);
+            let single_layout = PlacementPlan::single(Lane::X100);
+            let row_split_layout = PlacementPlan::row(bw_share, bw_share);
+
+            // Check both < ROW_SPLIT_MIN_ROWS (128) and >= ROW_SPLIT_MIN_ROWS (512) for m = 1 & m = 4.
+            for (m, n, k) in [(1, 128, 32), (1, 512, 64), (4, 512, 64)] {
+                let w = Matrix::random(0x1234_5678 + n as u64, n, k, 6);
+                let x = fill_small(0xDEAD_BEEF + m as u64, m * k);
+                let ref_out = single_exec
+                    .matmul(&single_layout.decode, &w, &x, m)
+                    .expect("single-cluster reference matmul");
+                let split_out = split_exec
+                    .matmul(&row_split_layout.decode, &w, &x, m)
+                    .expect("row-split matmul");
+                assert_eq!(ref_out, split_out, "bit-identity mismatch for m={m}, n={n}");
+            }
+
+            // 100 consecutive RowSplit GEMV steps must reuse fixed OS worker threads only.
+            let w512 = Matrix::random(0xCAFE_BABE, 512, 64, 6);
+            let x512 = fill_small(0xFACE_B00C, 64);
+            let seen_tids: Mutex<HashSet<std::thread::ThreadId>> = Mutex::new(HashSet::new());
+            for _ in 0..100 {
+                let out = split_exec
+                    .matmul(&row_split_layout.decode, &w512, &x512, 1)
+                    .expect("consecutive row-split matmul");
+                assert_eq!(out.len(), w512.n);
+            }
+            dual_pool.execute_split_scoped(
+                &|_, _| {
+                    seen_tids
+                        .lock()
+                        .expect("seen tids")
+                        .insert(std::thread::current().id());
+                },
+                &|_, _| {
+                    seen_tids
+                        .lock()
+                        .expect("seen tids")
+                        .insert(std::thread::current().id());
+                },
+            );
+            let distinct = seen_tids.lock().expect("seen tids").len();
+            assert!(
+                distinct <= dual_pool.thread_count(),
+                "dual pool with {} workers used {distinct} threads",
+                dual_pool.thread_count()
+            );
+            single_pool.reset_barrier_wait();
+        }
     }
 }
