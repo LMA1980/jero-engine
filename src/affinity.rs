@@ -2347,32 +2347,18 @@ impl WorkerPool {
             PoolBackend::Dual {
                 x100_pool,
                 a100_pool,
-            } => match (policy, phase) {
-                (
-                    ClusterPhasePolicy::A100PrefillX100Decode,
-                    crate::engine::EnginePhase::Prefill,
-                ) => a100_pool.install(op),
-                (ClusterPhasePolicy::X100Only | ClusterPhasePolicy::A100PrefillX100Decode, _)
-                | (
-                    ClusterPhasePolicy::X100PrefillA100Decode,
-                    crate::engine::EnginePhase::Prefill,
-                ) => x100_pool.install(op),
-                (ClusterPhasePolicy::Auto, crate::engine::EnginePhase::Prefill) => {
-                    if has_a100_ime_for_mask(a100_pool.affinity().effective_mask) {
-                        a100_pool.install(op)
-                    } else {
-                        x100_pool.install(op)
-                    }
+            } => {
+                let a100_has_ime = if policy == ClusterPhasePolicy::Auto {
+                    has_a100_ime_for_mask(a100_pool.affinity().effective_mask)
+                } else {
+                    false
+                };
+                if select_dual_cluster_a100(policy, phase, a100_has_ime) {
+                    a100_pool.install(op)
+                } else {
+                    x100_pool.install(op)
                 }
-                (
-                    ClusterPhasePolicy::A100Only
-                    | ClusterPhasePolicy::A100PrefillA100Decode
-                    | ClusterPhasePolicy::X100PrefillA100Decode
-                    | ClusterPhasePolicy::Auto
-                    | ClusterPhasePolicy::RowSplit,
-                    _,
-                ) => a100_pool.install(op),
-            },
+            }
             _ => self.install(op),
         }
     }
@@ -2596,10 +2582,147 @@ fn read_proc_task_cpus_allowed_list(tid: i64) -> Option<String> {
     None
 }
 
+#[cfg(any(test, not(miri)))]
+const fn select_dual_cluster_a100(
+    policy: ClusterPhasePolicy,
+    phase: crate::engine::EnginePhase,
+    a100_has_ime: bool,
+) -> bool {
+    use crate::engine::EnginePhase;
+
+    match policy {
+        ClusterPhasePolicy::A100Only
+        | ClusterPhasePolicy::A100PrefillA100Decode
+        | ClusterPhasePolicy::RowSplit => true,
+        ClusterPhasePolicy::X100Only => false,
+        ClusterPhasePolicy::A100PrefillX100Decode => matches!(phase, EnginePhase::Prefill),
+        ClusterPhasePolicy::X100PrefillA100Decode => !matches!(phase, EnginePhase::Prefill),
+        ClusterPhasePolicy::Auto => a100_has_ime,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn test_select_dual_cluster_a100_gates_auto_decode_on_ime() {
+        use crate::engine::EnginePhase;
+
+        for phase in [EnginePhase::Prefill, EnginePhase::Decode] {
+            assert!(!select_dual_cluster_a100(
+                ClusterPhasePolicy::Auto,
+                phase,
+                false
+            ));
+            assert!(select_dual_cluster_a100(
+                ClusterPhasePolicy::Auto,
+                phase,
+                true
+            ));
+        }
+        assert!(select_dual_cluster_a100(
+            ClusterPhasePolicy::X100PrefillA100Decode,
+            EnginePhase::Decode,
+            false
+        ));
+        assert!(!select_dual_cluster_a100(
+            ClusterPhasePolicy::X100PrefillA100Decode,
+            EnginePhase::Prefill,
+            true
+        ));
+        assert!(select_dual_cluster_a100(
+            ClusterPhasePolicy::A100PrefillX100Decode,
+            EnginePhase::Prefill,
+            false
+        ));
+        assert!(!select_dual_cluster_a100(
+            ClusterPhasePolicy::A100PrefillX100Decode,
+            EnginePhase::Decode,
+            true
+        ));
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn test_dual_pool_install_for_phase_auto_decode_without_ime_routes_to_x100() {
+        use crate::engine::EnginePhase;
+
+        let x100_aff = ResolvedAffinity {
+            cluster: Some(ClusterPreset::X100),
+            selection: Some(ClusterSelection::Single(ClusterPreset::X100)),
+            vlen_domain: VlenDomain::Zvl256b,
+            effective_mask: 1,
+            threads: 1,
+            assigned_cores: vec![0],
+            x100_cores: vec![0],
+            a100_cores: Vec::new(),
+        };
+        let a100_aff = ResolvedAffinity {
+            cluster: Some(ClusterPreset::A100),
+            selection: Some(ClusterSelection::Single(ClusterPreset::A100)),
+            vlen_domain: VlenDomain::Zvl1024b,
+            effective_mask: 1,
+            threads: 1,
+            assigned_cores: vec![0],
+            x100_cores: Vec::new(),
+            a100_cores: vec![0],
+        };
+        let dual_aff = ResolvedAffinity {
+            cluster: None,
+            selection: Some(ClusterSelection::Both {
+                split: SplitStrategy::Phase,
+            }),
+            vlen_domain: VlenDomain::Heterogeneous,
+            effective_mask: 1,
+            threads: 2,
+            assigned_cores: vec![0, 0],
+            x100_cores: vec![0],
+            a100_cores: vec![0],
+        };
+        let mut dual = WorkerPool::new_with_profile(dual_aff, CoordinationProfile::Rayon)
+            .expect("spawn dual pool");
+        let x100_pool = WorkerPool::new_with_profile(x100_aff, CoordinationProfile::Rayon)
+            .expect("spawn single-thread x100 pool");
+        let a100_pool = WorkerPool::new_with_profile(a100_aff, CoordinationProfile::Rayon)
+            .expect("spawn single-thread a100 pool");
+        dual.backend = PoolBackend::Dual {
+            x100_pool: Box::new(x100_pool),
+            a100_pool: Box::new(a100_pool),
+        };
+
+        let x100_tid = dual
+            .x100_pool()
+            .expect("x100 subpool")
+            .install(|| thread::current().id());
+        let a100_tid = dual
+            .a100_pool()
+            .expect("a100 subpool")
+            .install(|| thread::current().id());
+        assert_ne!(x100_tid, a100_tid);
+        assert!(!has_a100_ime_for_mask(
+            dual.a100_pool().expect("a100").affinity().effective_mask
+        ));
+
+        let prefill_tid =
+            dual.install_for_phase(EnginePhase::Prefill, ClusterPhasePolicy::Auto, || {
+                thread::current().id()
+            });
+        let decode_tid =
+            dual.install_for_phase(EnginePhase::Decode, ClusterPhasePolicy::Auto, || {
+                thread::current().id()
+            });
+        let explicit_decode_tid = dual.install_for_phase(
+            EnginePhase::Decode,
+            ClusterPhasePolicy::X100PrefillA100Decode,
+            || thread::current().id(),
+        );
+
+        assert_eq!(prefill_tid, x100_tid);
+        assert_eq!(decode_tid, x100_tid);
+        assert_eq!(explicit_decode_tid, a100_tid);
+    }
 
     #[test]
     fn test_cluster_preset_resolution_x100_and_a100_us01_5_1() {

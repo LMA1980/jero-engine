@@ -79,7 +79,7 @@ pub struct DiagConfig {
     pub prompt: Option<String>,
     /// Target processor cluster ("both", "x100" or "a100").
     pub cluster: Option<String>,
-    /// Execution-phase cluster scheduling policy (`auto`, `x100-prefill-a100-decode`, `a100-only`, `x100-only`, `row-split`).
+    /// Execution-phase cluster scheduling policy (`auto`, `x100-prefill-a100-decode`, `a100-prefill-x100-decode`, `a100-prefill-a100-decode`, `a100-only`, `x100-only`, `row-split`).
     pub phase_policy: Option<ClusterPhasePolicy>,
     /// Cross-cluster workload split policy, valid only with `--cluster both` (US-03).
     pub split: Option<SplitStrategy>,
@@ -179,11 +179,11 @@ impl DiagConfig {
                 }
                 "--phase-policy" => {
                     let val = args.next().ok_or_else(|| {
-                        "--phase-policy requires 'auto', 'x100-prefill-a100-decode', 'a100-only', 'x100-only', or 'row-split'".to_owned()
+                        "--phase-policy requires 'auto', 'x100-prefill-a100-decode', 'a100-prefill-x100-decode', 'a100-prefill-a100-decode', 'a100-only', 'x100-only', or 'row-split'".to_owned()
                     })?;
                     let policy = ClusterPhasePolicy::parse(&val).map_err(|_| {
                         format!(
-                            "invalid --phase-policy '{val}': expected 'auto', 'x100-prefill-a100-decode', 'a100-only', 'x100-only', or 'row-split'"
+                            "invalid --phase-policy '{val}': expected 'auto', 'x100-prefill-a100-decode', 'a100-prefill-x100-decode', 'a100-prefill-a100-decode', 'a100-only', 'x100-only', or 'row-split'"
                         )
                     })?;
                     config.phase_policy = Some(policy);
@@ -612,7 +612,7 @@ fn print_usage() {
            -m, --model <path>     Path to local model file (GGUF)\n  \
            -p, --prompt <text>    Input prompt to tokenize and evaluate\n  \
                --cluster <id>     Target processor cluster ('both', 'x100' or 'a100')\n  \
-               --phase-policy <p> Phase cluster policy ('auto', 'x100-prefill-a100-decode', 'a100-only', 'x100-only', 'row-split')\n  \
+               --phase-policy <p> Phase cluster policy ('auto', 'x100-prefill-a100-decode', 'a100-prefill-x100-decode', 'a100-prefill-a100-decode', 'a100-only', 'x100-only', 'row-split')\n  \
                --split <policy>   Cross-cluster split for '--cluster both' ('phase', 'op', 'row')\n  \
                --ime <on|off>     SpacemiT IME matrix acceleration ('on' also measures the 'off' baseline)\n  \
            -t, --threads <n>      Number of execution worker threads\n  \

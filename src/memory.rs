@@ -1177,7 +1177,7 @@ fn estimate_repack_and_scratch_bytes(
 
     for tensor in metadata.tensors() {
         let dims = tensor.shape();
-        if dims.len() < 2 {
+        if dims.len() != 2 {
             continue;
         }
 
@@ -1189,15 +1189,32 @@ fn estimate_repack_and_scratch_bytes(
             continue;
         }
 
-        let elems = tensor.num_elements();
+        let Some((rows, cols)) = crate::weights::matrix_dims_for_repack(dims, tensor.quant())
+        else {
+            continue;
+        };
+        let padded_rows = rows.div_ceil(8).saturating_mul(8);
+        let k_padded = cols.next_multiple_of(32);
+        let Some(padded_elems) = padded_rows.checked_mul(k_padded) else {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: name.to_owned(),
+                offset: 0,
+                byte_len: usize::MAX,
+                buffer_len: usize::MAX,
+                reason: "padded repack element count overflowed usize".to_owned(),
+            });
+        };
         let tensor_repack = match tensor.quant() {
             // Compact 4-bit nibble layout (`smt.vpack.vv` / `PackedNibbleMatrix`):
-            // 0.5 bytes/element payload + f16 block scale per 32 weights (~0.5625x elems).
-            QuantType::Q4_0 | QuantType::Q4_1 | QuantType::Q4_K_M | QuantType::IQ4_NL => {
-                align_up(elems.div_ceil(2) + elems.div_ceil(32) * 2, 64)
+            // 0.5 bytes/padded-element + f16 scales (or Q4_K_M 16B headers) per 32 weights.
+            QuantType::Q4_0 | QuantType::IQ4_NL | QuantType::Q4_K_M => {
+                align_up(padded_elems / 2 + padded_elems.div_ceil(32) * 2, 64)
             }
+            // Compact 4-bit nibble layout (`PackedNibbleMeta::Q4_1`):
+            // stores both `scales_f16` and `mins_f16` per 32 padded elements.
+            QuantType::Q4_1 => align_up(padded_elems / 2 + padded_elems.div_ceil(32) * 4, 64),
             // Expanded i8 block-scaled tile layout (`RepackedWeight`):
-            // 1 byte/element i8 payload + f32 scale & min per 32 weights (~1.25x elems).
+            // 1 byte/padded-element + f32 scale (16B-group for K2/K3/K6, 32B-group otherwise) + optional f32 mins.
             QuantType::Q8_0
             | QuantType::Q5_0
             | QuantType::Q5_1
@@ -1207,7 +1224,23 @@ fn estimate_repack_and_scratch_bytes(
             | QuantType::Q6_K
             | QuantType::TQ1_0
             | QuantType::TQ2_0
-            | QuantType::I2_S => align_up(elems + elems.div_ceil(32) * 8, 64),
+            | QuantType::I2_S => {
+                let group = if matches!(
+                    tensor.quant(),
+                    QuantType::Q6_K | QuantType::Q3_K | QuantType::Q2_K
+                ) {
+                    16
+                } else {
+                    32
+                };
+                let scale_bytes = padded_elems.div_ceil(group) * size_of::<f32>();
+                let min_bytes = if crate::weights::block_scaled_quant_has_mins(tensor.quant()) {
+                    scale_bytes
+                } else {
+                    0
+                };
+                align_up(padded_elems + scale_bytes + min_bytes, 64)
+            }
             QuantType::F32
             | QuantType::F16
             | QuantType::BF16

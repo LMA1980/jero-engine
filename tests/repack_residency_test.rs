@@ -93,10 +93,22 @@ fn test_wave3_repeat3_model_view_repack_residency_and_drop_cleanup() {
     assert_eq!(final_repack.build_count, 1);
     assert_eq!(final_repack.hit_count, 3);
 
-    locked_weights.repack_store().clear();
-    assert_eq!(locked_weights.repack_summary().resident_bytes, 0);
-    assert_eq!(locked_weights.repack_summary().tensors_repacked, 0);
+    let weak_entry = locked_weights
+        .metadata()
+        .tensors()
+        .iter()
+        .find_map(|desc| locked_weights.repacked_tensor(desc.name()))
+        .map(|entry| std::sync::Arc::downgrade(&entry))
+        .expect("at least one repacked tensor entry must exist before drop");
+    assert!(
+        weak_entry.upgrade().is_some(),
+        "repacked entry must stay live while LockedModelWeights owns it"
+    );
 
     drop(locked_weights);
+    assert!(
+        weak_entry.upgrade().is_none(),
+        "dropping LockedModelWeights must automatically release all repacked entries without calling clear()"
+    );
     let _ = std::fs::remove_file(&temp_path);
 }
