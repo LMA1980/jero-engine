@@ -248,7 +248,12 @@ fn test_us01_scenario_3_resident_memory_verification_refuses_oversized_run_upfro
             rlimit_memlock_bytes,
         } => {
             assert!(required_bytes > available_bytes);
-            assert_eq!(required_bytes, weight_bytes + kv_bytes);
+            assert!(required_bytes >= weight_bytes + kv_bytes);
+            let model_bytes = std::fs::read(&fixture_path).expect("read fixture for footprint");
+            let gguf = GgufFile::parse(&model_bytes).expect("parse fixture gguf");
+            let expected_fp = jero_engine::estimate_footprint(gguf.metadata(), 64)
+                .expect("estimate fixture footprint");
+            assert_eq!(required_bytes, expected_fp.base_required_bytes());
             assert_eq!(available_bytes, 512);
             assert_eq!(rlimit_memlock_bytes, 100_000_000);
         }

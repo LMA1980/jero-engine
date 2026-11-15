@@ -464,13 +464,22 @@ pub(crate) fn build_plan(
         let has_both = !affinity.x100_cores.is_empty() && !affinity.a100_cores.is_empty();
         return match policy {
             ClusterPhasePolicy::X100Only => Ok((PlacementPlan::single(Lane::X100), None)),
-            ClusterPhasePolicy::A100Only => Ok((PlacementPlan::single(Lane::A100), None)),
+            ClusterPhasePolicy::A100Only | ClusterPhasePolicy::A100PrefillA100Decode => {
+                Ok((PlacementPlan::single(Lane::A100), None))
+            }
+            ClusterPhasePolicy::A100PrefillX100Decode if has_both => {
+                Ok((PlacementPlan::phase(Lane::A100, Lane::X100), None))
+            }
             ClusterPhasePolicy::X100PrefillA100Decode if has_both => {
                 Ok((PlacementPlan::phase(Lane::X100, Lane::A100), None))
             }
             ClusterPhasePolicy::RowSplit if has_both => calibrate_row_plan(pool, kernel),
             ClusterPhasePolicy::Auto if has_both => {
-                Ok((PlacementPlan::phase(Lane::X100, Lane::A100), None))
+                if jero_engine::affinity::has_a100_ime_for_mask(affinity.effective_mask) {
+                    Ok((PlacementPlan::single(Lane::A100), None))
+                } else {
+                    Ok((PlacementPlan::single(Lane::X100), None))
+                }
             }
             _ => Ok((PlacementPlan::single(default_single_lane), None)),
         };
@@ -511,7 +520,10 @@ fn mean(values: impl Iterator<Item = f64>) -> f64 {
 }
 
 fn sample_prefill_tps(s: &ArmSample) -> f64 {
-    if s.timing.prefill_ms > 0.0 {
+    let tps = s.timing.prefill_tokens_per_sec();
+    if tps > 0.0 {
+        tps
+    } else if s.timing.prefill_ms > 0.0 && s.prompt_tokens > 0 {
         s.prompt_tokens as f64 / (s.timing.prefill_ms / 1000.0)
     } else {
         0.0
@@ -558,8 +570,8 @@ pub(crate) fn executed_phase_plan(
     if !has_decode {
         let prefill = if single_cluster_phases && plan.prefill.matmul.len() > 1 {
             PhaseLayout {
-                matmul: vec![(Lane::X100, 1.0)],
-                vector: Lane::X100,
+                matmul: vec![(Lane::A100, 1.0)],
+                vector: Lane::A100,
             }
         } else {
             plan.prefill.clone()
@@ -570,8 +582,8 @@ pub(crate) fn executed_phase_plan(
         };
     }
     if single_cluster_phases && plan.prefill.matmul.len() > 1 {
-        // In SinglePromptEngine RowSplit mode, prefill runs on X100 and decode on A100.
-        return PlacementPlan::phase(Lane::X100, Lane::A100);
+        // In SinglePromptEngine RowSplit mode, prefill and decode both run on A100.
+        return PlacementPlan::single(Lane::A100);
     }
     plan.clone()
 }
@@ -747,6 +759,7 @@ pub(crate) fn build_telemetry_and_stats(
             run_index: i,
             ttft_ms: s.timing.ttft_ms,
             prefill_ms: s.timing.prefill_ms,
+            prefill_tokens_per_sec: sample_prefill_tps(s),
             decode_ms: s.timing.decode_ms,
             decode_tokens_per_sec: s.timing.decode_tokens_per_sec,
             total_wall_time_ms: s.timing.total_wall_time_ms,
@@ -763,6 +776,7 @@ pub(crate) fn build_telemetry_and_stats(
     };
     let statistics = StatisticsSummary {
         ttft_ms: col(|r| r.ttft_ms),
+        prefill_tokens_per_sec: col(|r| r.prefill_tokens_per_sec),
         decode_tokens_per_sec: col(|r| r.decode_tokens_per_sec),
         cumulative_barrier_wait_ms: col(|r| r.cumulative_barrier_wait_ms),
         total_wall_time_ms: col(|r| r.total_wall_time_ms),
@@ -788,7 +802,8 @@ pub(crate) fn build_telemetry_and_stats(
         .map(|s| s.as_str().to_owned())
         .or_else(|| {
             inputs.config.phase_policy.and_then(|p| match p {
-                ClusterPhasePolicy::X100PrefillA100Decode => Some("phase".to_owned()),
+                ClusterPhasePolicy::X100PrefillA100Decode
+                | ClusterPhasePolicy::A100PrefillX100Decode => Some("phase".to_owned()),
                 ClusterPhasePolicy::RowSplit => Some("row".to_owned()),
                 _ => None,
             })
@@ -1398,14 +1413,15 @@ pub(crate) fn write_benchmark_table<W: Write>(
     let _ = writeln!(out, "Iteration Breakdown:");
     let _ = writeln!(
         out,
-        "  Run | TTFT (ms) | Decode (tokens/s) | Barrier Wait (ms) | Total Wall (ms)"
+        "  Run | TTFT (ms) | Prefill (tok/s) | Decode (tokens/s) | Barrier Wait (ms) | Total Wall (ms)"
     );
     for r in runs {
         let _ = writeln!(
             out,
-            "  {:3} | {:9.2} | {:17.2} | {:17.2} | {:15.2}",
+            "  {:3} | {:9.2} | {:15.2} | {:17.2} | {:17.2} | {:15.2}",
             r.run_index + 1,
             r.ttft_ms,
+            r.prefill_tokens_per_sec,
             r.decode_tokens_per_sec,
             r.cumulative_barrier_wait_ms,
             r.total_wall_time_ms
@@ -1415,47 +1431,64 @@ pub(crate) fn write_benchmark_table<W: Write>(
         out,
         "----------------------------------------------------------"
     );
-    let _ = writeln!(out, "Statistical Jitter Summary (Mean, Min, Max, StdDev):");
     let _ = writeln!(
         out,
-        "  Metric                      |      Mean |       Min |       Max |    StdDev"
+        "Statistical Jitter Summary (Mean, Median, Min, Max, StdDev):"
     );
     let _ = writeln!(
         out,
-        "  TTFT (Time to First Token)  | {:9.2} | {:9.2} | {:9.2} | {:9.2}",
+        "  Metric                      |      Mean |    Median |       Min |       Max |    StdDev"
+    );
+    let _ = writeln!(
+        out,
+        "  TTFT (Time to First Token)  | {:9.2} | {:9.2} | {:9.2} | {:9.2} | {:9.2}",
         statistics.ttft_ms.mean,
+        statistics.ttft_ms.median,
         statistics.ttft_ms.min,
         statistics.ttft_ms.max,
         statistics.ttft_ms.stddev
     );
     let _ = writeln!(
         out,
-        "  Decode Throughput (tokens/s)| {:9.2} | {:9.2} | {:9.2} | {:9.2}",
+        "  Prefill Throughput (tok/s)  | {:9.2} | {:9.2} | {:9.2} | {:9.2} | {:9.2}",
+        statistics.prefill_tokens_per_sec.mean,
+        statistics.prefill_tokens_per_sec.median,
+        statistics.prefill_tokens_per_sec.min,
+        statistics.prefill_tokens_per_sec.max,
+        statistics.prefill_tokens_per_sec.stddev
+    );
+    let _ = writeln!(
+        out,
+        "  Decode Throughput (tokens/s)| {:9.2} | {:9.2} | {:9.2} | {:9.2} | {:9.2}",
         statistics.decode_tokens_per_sec.mean,
+        statistics.decode_tokens_per_sec.median,
         statistics.decode_tokens_per_sec.min,
         statistics.decode_tokens_per_sec.max,
         statistics.decode_tokens_per_sec.stddev
     );
     let _ = writeln!(
         out,
-        "  Barrier Wait Overhead (ms)  | {:9.2} | {:9.2} | {:9.2} | {:9.2}",
+        "  Barrier Wait Overhead (ms)  | {:9.2} | {:9.2} | {:9.2} | {:9.2} | {:9.2}",
         statistics.cumulative_barrier_wait_ms.mean,
+        statistics.cumulative_barrier_wait_ms.median,
         statistics.cumulative_barrier_wait_ms.min,
         statistics.cumulative_barrier_wait_ms.max,
         statistics.cumulative_barrier_wait_ms.stddev
     );
     let _ = writeln!(
         out,
-        "  Total Wall Time (ms)        | {:9.2} | {:9.2} | {:9.2} | {:9.2}",
+        "  Total Wall Time (ms)        | {:9.2} | {:9.2} | {:9.2} | {:9.2} | {:9.2}",
         statistics.total_wall_time_ms.mean,
+        statistics.total_wall_time_ms.median,
         statistics.total_wall_time_ms.min,
         statistics.total_wall_time_ms.max,
         statistics.total_wall_time_ms.stddev
     );
     let _ = writeln!(
         out,
-        "  Compute Utilization Ratio   | {:9.4} | {:9.4} | {:9.4} | {:9.4}",
+        "  Compute Utilization Ratio   | {:9.4} | {:9.4} | {:9.4} | {:9.4} | {:9.4}",
         statistics.compute_utilization_ratio.mean,
+        statistics.compute_utilization_ratio.median,
         statistics.compute_utilization_ratio.min,
         statistics.compute_utilization_ratio.max,
         statistics.compute_utilization_ratio.stddev
@@ -1520,8 +1553,14 @@ mod tests {
         let with_decode = executed_phase_plan(&plan, true, true);
         assert_eq!(expected_phase_masks(&with_decode), (0xFFFF, 0xFFFF));
 
+        let a100_prefill_plan = PlacementPlan::phase(Lane::A100, Lane::X100);
+        let a100_prefill_only = executed_phase_plan(&a100_prefill_plan, true, false);
+        assert_eq!(expected_phase_masks(&a100_prefill_only), (0xFF00, 0xFF00));
+        let a100_x100_decode = executed_phase_plan(&a100_prefill_plan, true, true);
+        assert_eq!(expected_phase_masks(&a100_x100_decode), (0xFFFF, 0xFFFF));
+
         let row = PlacementPlan::row(0.5, 0.5);
         let row_engine = executed_phase_plan(&row, true, true);
-        assert_eq!(expected_phase_masks(&row_engine), (0xFFFF, 0xFFFF));
+        assert_eq!(expected_phase_masks(&row_engine), (0xFF00, 0xFF00));
     }
 }

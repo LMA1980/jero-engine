@@ -9,16 +9,330 @@ use std::fs::File;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
+#[cfg(feature = "jero-kernels-rvv")]
+use jero_core::QuantType;
 use jero_core::ipc::shm::DEFAULT_LIMIT_MEMLOCK_BYTES;
 use jero_core::{
     ArchRecipe, GgufFile, K3Error, ModelMetadata, ModelWeights, TensorDescriptor, TensorView,
 };
+#[cfg(feature = "jero-kernels-rvv")]
+use jero_kernels_rvv::repack::{
+    Aligned128, BlockScaledTileLayout, PackedNibbleMatrix, RepackedWeight, repack_into_tile_range,
+    repack_nibble_into_tile_range,
+};
+#[cfg(feature = "jero-kernels-rvv")]
+use rayon::prelude::*;
 
+use crate::affinity::WorkerPool;
 use crate::capability::verify_model_capabilities;
 use crate::memory::{
     MemoryFootprint, MemoryInspector, SystemMemoryInspector, check_memory_admission_with,
 };
+
+static ACTIVE_LOCKED_MODEL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Telemetry summary describing model-scoped repacked weight residency and reuse counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RepackSummary {
+    /// Number of 2D linear matrices currently retained in the model-scoped repack store.
+    pub tensors_repacked: usize,
+    /// Total resident heap bytes held by repacked matrix buffers (`0` when cleared or downgraded).
+    pub resident_bytes: usize,
+    /// Number of full load/prepare repack passes executed for this model instance (`<= 1` across repeated prompts).
+    pub build_count: usize,
+    /// Number of lookup/prepare calls satisfied from already-resident repacked tensors.
+    pub hit_count: usize,
+    /// Number of lookup/prepare calls that missed before population.
+    pub miss_count: usize,
+    /// `true` when eager repacking was disabled under memory/memlock pressure (`eager_repack_enabled == false`).
+    pub downgraded: bool,
+}
+
+/// Model-scoped repacked weight representation retained for a single [`LockedModelWeights`] instance.
+#[cfg(feature = "jero-kernels-rvv")]
+#[derive(Debug)]
+pub enum RepackedTensorEntry {
+    /// Compact 4-bit nibble tile layout (`Q4_0`, `IQ4_NL`, `Q4_1`, `Q4_K_M`) for `XSMTVDotII` / `smt.vpack.vv`.
+    Nibble(PackedNibbleMatrix),
+    /// Block-scaled `i8` tile layout (`Q8_0`, `Q5_0`, `Q5_1`, `Q2_K`, `Q3_K`, `Q5_K`, `Q6_K`, etc.).
+    BlockScaled(RepackedWeight),
+}
+
+/// Returns whether a `BlockScaled` repacked representation for `quant` allocates
+/// an asymmetric block-`mins` `f32` buffer alongside `scales`.
+#[must_use]
+pub(crate) const fn block_scaled_quant_has_mins(quant: QuantType) -> bool {
+    matches!(
+        quant,
+        QuantType::Q4_K_M | QuantType::Q5_K | QuantType::Q4_1 | QuantType::Q5_1 | QuantType::Q2_K
+    )
+}
+
+/// Disambiguates `(rows, cols)` for a 2D weight tensor using GGUF `[cols, rows]` layout rules.
+#[must_use]
+pub(crate) fn matrix_dims_for_repack(shape: &[usize], quant: QuantType) -> Option<(usize, usize)> {
+    if shape.len() != 2 {
+        return None;
+    }
+    let (d0, d1) = (shape[0], shape[1]);
+    let blk = quant.block_elements().max(1);
+    if d1 % blk == 0 && d0 % blk != 0 {
+        Some((d0, d1))
+    } else {
+        Some((d1, d0))
+    }
+}
+
+/// Returns whether a tensor descriptor should be included in model repack estimation/preparation.
+#[must_use]
+pub(crate) fn is_repackable_tensor_spec(name: &str, shape: &[usize], quant: QuantType) -> bool {
+    if shape.len() != 2 {
+        return false;
+    }
+    if name.contains("token_embd")
+        || name.contains("position_embd")
+        || name.ends_with("norm.weight")
+    {
+        return false;
+    }
+    let supported_quant = matches!(
+        quant,
+        QuantType::Q4_0
+            | QuantType::IQ4_NL
+            | QuantType::Q4_1
+            | QuantType::Q4_K_M
+            | QuantType::Q8_0
+            | QuantType::Q5_0
+            | QuantType::Q5_1
+            | QuantType::Q2_K
+            | QuantType::Q3_K
+            | QuantType::Q5_K
+            | QuantType::Q6_K
+            | QuantType::TQ1_0
+            | QuantType::TQ2_0
+            | QuantType::I2_S
+    );
+    if !supported_quant {
+        return false;
+    }
+    let blk = quant.block_elements().max(1);
+    shape[0] % blk == 0 || shape[1] % blk == 0
+}
+
+#[cfg(feature = "jero-kernels-rvv")]
+impl RepackedTensorEntry {
+    /// Returns the approximate resident heap payload size in bytes for this entry.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        match self {
+            Self::Nibble(m) => m.resident_bytes(),
+            Self::BlockScaled(w) => {
+                let group = w.group_size();
+                if w.n_tiles() == 0 || group == 0 {
+                    return w.aligned_bytes();
+                }
+                let meta_scales = w.n_tiles() * (w.k_padded() / group) * 8 * size_of::<f32>();
+                let meta_mins = if block_scaled_quant_has_mins(w.quant()) {
+                    meta_scales
+                } else {
+                    0
+                };
+                w.aligned_bytes()
+                    .saturating_add(meta_scales)
+                    .saturating_add(meta_mins)
+            }
+        }
+    }
+
+    /// Returns a reference to the compact [`PackedNibbleMatrix`] if present.
+    #[must_use]
+    pub const fn as_nibble(&self) -> Option<&PackedNibbleMatrix> {
+        match self {
+            Self::Nibble(m) => Some(m),
+            Self::BlockScaled(_) => None,
+        }
+    }
+
+    /// Returns a reference to the [`RepackedWeight`] if present.
+    #[must_use]
+    pub const fn as_block_scaled(&self) -> Option<&RepackedWeight> {
+        match self {
+            Self::Nibble(_) => None,
+            Self::BlockScaled(w) => Some(w),
+        }
+    }
+}
+
+/// Placeholder entry when the crate is built with `--no-default-features`.
+#[cfg(not(feature = "jero-kernels-rvv"))]
+#[derive(Debug)]
+pub struct RepackedTensorEntry {
+    bytes: usize,
+}
+
+#[cfg(not(feature = "jero-kernels-rvv"))]
+impl RepackedTensorEntry {
+    /// Returns the resident byte count (`0`).
+    #[must_use]
+    pub const fn resident_bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+/// Thread-safe, lifetime-bound repacked tensor store owned by a single [`LockedModelWeights`].
+///
+/// Keyed by both tensor index (`Vec<Option<Arc<RepackedTensorEntry>>>`) and tensor name (`tensor_index`),
+/// allowing multiple prompt passes (`--repeat N` or worker requests) to reuse load-time repacked weights
+/// without redundant rebuilds and releasing 100% of repacked memory when dropped.
+#[derive(Debug)]
+pub struct RepackedTensorStore {
+    slots: RwLock<Vec<Option<Arc<RepackedTensorEntry>>>>,
+    build_lock: Mutex<()>,
+    populated: AtomicBool,
+    eager_admitted: bool,
+    budget_downgraded: AtomicBool,
+    repack_arena_budget: Option<usize>,
+    build_count: AtomicUsize,
+    hit_count: AtomicUsize,
+    miss_count: AtomicUsize,
+    resident_bytes: AtomicUsize,
+    tensors_repacked: AtomicUsize,
+}
+
+impl RepackedTensorStore {
+    fn new(tensor_count: usize, eager_admitted: bool, repack_arena_budget: Option<usize>) -> Self {
+        Self {
+            slots: RwLock::new(vec![None; tensor_count]),
+            build_lock: Mutex::new(()),
+            populated: AtomicBool::new(false),
+            eager_admitted,
+            budget_downgraded: AtomicBool::new(false),
+            repack_arena_budget,
+            build_count: AtomicUsize::new(0),
+            hit_count: AtomicUsize::new(0),
+            miss_count: AtomicUsize::new(0),
+            resident_bytes: AtomicUsize::new(0),
+            tensors_repacked: AtomicUsize::new(0),
+        }
+    }
+
+    /// Returns whether eager repacking was admitted by pre-flight memory/memlock checks.
+    #[must_use]
+    pub const fn eager_admitted(&self) -> bool {
+        self.eager_admitted
+    }
+
+    /// Returns the optional admitted repack arena ceiling in bytes.
+    #[must_use]
+    pub const fn repack_arena_budget(&self) -> Option<usize> {
+        self.repack_arena_budget
+    }
+
+    /// Returns a snapshot of residency and cache reuse telemetry.
+    #[must_use]
+    pub fn summary(&self) -> RepackSummary {
+        RepackSummary {
+            tensors_repacked: self.tensors_repacked.load(Ordering::Acquire),
+            resident_bytes: self.resident_bytes.load(Ordering::Acquire),
+            build_count: self.build_count.load(Ordering::Acquire),
+            hit_count: self.hit_count.load(Ordering::Acquire),
+            miss_count: self.miss_count.load(Ordering::Acquire),
+            downgraded: !self.eager_admitted || self.budget_downgraded.load(Ordering::Acquire),
+        }
+    }
+
+    /// Retrieves a repacked tensor entry by canonical GGUF tensor index.
+    #[must_use]
+    pub fn get_by_index(&self, index: usize) -> Option<Arc<RepackedTensorEntry>> {
+        let guard = self
+            .slots
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = guard
+            .get(index)
+            .and_then(|slot| slot.as_ref().map(Arc::clone));
+        if found.is_some() {
+            self.hit_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.miss_count.fetch_add(1, Ordering::Relaxed);
+        }
+        found
+    }
+
+    /// Clears all retained repacked tensor buffers immediately and resets resident byte accounting to `0`.
+    pub fn clear(&self) {
+        let mut guard = self
+            .slots
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for slot in guard.iter_mut() {
+            *slot = None;
+        }
+        self.populated.store(false, Ordering::Release);
+        self.budget_downgraded.store(false, Ordering::Release);
+        self.resident_bytes.store(0, Ordering::Release);
+        self.tensors_repacked.store(0, Ordering::Release);
+    }
+}
+
+/// Lifetime-bound model view pairing [`LockedModelWeights`] with its [`RepackedTensorStore`].
+///
+/// Implements [`ModelWeights`] so recipes and evaluation loops share a single model-scoped
+/// cache across repeated prompts and release all cached allocations atomically when the owning
+/// [`LockedModelWeights`] drops.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelView<'a> {
+    weights: &'a LockedModelWeights,
+}
+
+impl<'a> ModelView<'a> {
+    /// Returns the backing [`LockedModelWeights`].
+    #[must_use]
+    pub const fn weights(&self) -> &'a LockedModelWeights {
+        self.weights
+    }
+
+    /// Returns parsed GGUF [`ModelMetadata`].
+    #[must_use]
+    pub const fn metadata(&self) -> &'a ModelMetadata {
+        self.weights.metadata()
+    }
+
+    /// Returns the model-scoped [`RepackedTensorStore`].
+    #[must_use]
+    pub const fn repack_store(&self) -> &'a RepackedTensorStore {
+        self.weights.repack_store()
+    }
+
+    /// Looks up a repacked tensor entry by canonical tensor name, incrementing hit/miss telemetry.
+    #[must_use]
+    pub fn repacked_tensor(&self, name: &str) -> Option<Arc<RepackedTensorEntry>> {
+        self.weights.repacked_tensor(name)
+    }
+
+    /// Returns the current [`RepackSummary`] snapshot.
+    #[must_use]
+    pub fn repack_summary(&self) -> RepackSummary {
+        self.weights.repack_summary()
+    }
+}
+
+impl ModelWeights for ModelView<'_> {
+    fn tensor(&self, name: &str) -> Result<TensorView<'_>, K3Error> {
+        self.weights.tensor(name)
+    }
+
+    fn tensor_count(&self) -> usize {
+        self.weights.tensor_count()
+    }
+
+    fn total_weight_bytes(&self) -> usize {
+        self.weights.total_weight_bytes()
+    }
+}
 
 /// Locked in-memory resident model weights backed by a read-only `mmap` mapping
 /// with an active shared file lock (`flock(LOCK_SH)`).
@@ -30,6 +344,7 @@ pub struct LockedModelWeights {
     is_locked: bool,
     metadata: ModelMetadata,
     tensor_index: BTreeMap<String, usize>,
+    repack_store: RepackedTensorStore,
 }
 
 // SAFETY: LockedModelWeights holds a read-only mapped buffer (PROT_READ) locked in physical memory.
@@ -230,6 +545,17 @@ fn open_from_file_inner<I: MemoryInspector>(
         tensor_index.insert(desc.name().to_owned(), i);
     }
 
+    let eager_admitted = footprint_opt
+        .as_ref()
+        .is_none_or(|fp| fp.eager_repack_enabled);
+    let repack_arena_budget = footprint_opt.as_ref().map(|fp| fp.repack_arena_bytes);
+    let repack_store = RepackedTensorStore::new(
+        metadata.tensors().len(),
+        eager_admitted,
+        repack_arena_budget,
+    );
+    ACTIVE_LOCKED_MODEL_COUNT.fetch_add(1, Ordering::Relaxed);
+
     Ok((
         LockedModelWeights {
             file,
@@ -238,6 +564,7 @@ fn open_from_file_inner<I: MemoryInspector>(
             is_locked,
             metadata,
             tensor_index,
+            repack_store,
         },
         recipe_opt,
         footprint_opt,
@@ -413,6 +740,372 @@ impl LockedModelWeights {
     pub const fn file(&self) -> &File {
         &self.file
     }
+
+    /// Returns a reference to the model-scoped [`RepackedTensorStore`].
+    #[must_use]
+    pub const fn repack_store(&self) -> &RepackedTensorStore {
+        &self.repack_store
+    }
+
+    /// Returns a lifetime-bound [`ModelView`] pairing these weights with their repacked store.
+    #[must_use]
+    pub const fn model_view(&self) -> ModelView<'_> {
+        ModelView { weights: self }
+    }
+
+    /// Returns the current [`RepackSummary`] residency and reuse snapshot.
+    #[must_use]
+    pub fn repack_summary(&self) -> RepackSummary {
+        self.repack_store.summary()
+    }
+
+    /// Looks up a repacked tensor by canonical tensor name, incrementing hit/miss telemetry.
+    #[must_use]
+    pub fn repacked_tensor(&self, name: &str) -> Option<Arc<RepackedTensorEntry>> {
+        let idx = self.tensor_index.get(name).copied()?;
+        self.repack_store.get_by_index(idx)
+    }
+
+    /// Eagerly repacks eligible 2D quantized weight matrices in parallel across `pool` once per
+    /// model instance, respecting `#163` memory admission (`eager_repack_enabled`).
+    ///
+    /// Subsequent calls reuse already-resident tensors and increment `hit_count` with zero
+    /// redundant rebuilds (`build_count == 1`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error`] if any eligible weight tensor fails bounds validation or repacking.
+    #[allow(clippy::too_many_lines)]
+    pub fn prepare_repacked_weights(
+        &self,
+        pool: Option<&WorkerPool>,
+    ) -> Result<RepackSummary, K3Error> {
+        if !self.repack_store.eager_admitted
+            || self.repack_store.budget_downgraded.load(Ordering::Acquire)
+        {
+            return Ok(self.repack_store.summary());
+        }
+        if self.repack_store.populated.load(Ordering::Acquire) {
+            self.repack_store.hit_count.fetch_add(1, Ordering::Relaxed);
+            return Ok(self.repack_store.summary());
+        }
+
+        let _build_guard = self
+            .repack_store
+            .build_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.repack_store.budget_downgraded.load(Ordering::Acquire) {
+            return Ok(self.repack_store.summary());
+        }
+        if self.repack_store.populated.load(Ordering::Acquire) {
+            self.repack_store.hit_count.fetch_add(1, Ordering::Relaxed);
+            return Ok(self.repack_store.summary());
+        }
+
+        self.repack_store.miss_count.fetch_add(1, Ordering::Relaxed);
+
+        #[cfg(feature = "jero-kernels-rvv")]
+        {
+            let budget = self.repack_store.repack_arena_budget;
+            let mut built: Vec<(usize, Arc<RepackedTensorEntry>)> = Vec::new();
+            let mut total_bytes = 0_usize;
+            let mut budget_exceeded = false;
+
+            for (idx, desc) in self.metadata.tensors().iter().enumerate() {
+                if !is_repackable_matrix_descriptor(desc) {
+                    continue;
+                }
+                if budget == Some(0) {
+                    budget_exceeded = true;
+                    break;
+                }
+                let view = self.tensor(desc.name())?;
+                let entry = Arc::new(repack_tensor_parallel(&view, pool)?);
+                total_bytes = total_bytes.saturating_add(entry.resident_bytes());
+                if budget.is_some_and(|cap| total_bytes > cap) {
+                    budget_exceeded = true;
+                    break;
+                }
+                built.push((idx, entry));
+            }
+
+            if budget_exceeded {
+                drop(built);
+                self.repack_store.clear();
+                self.repack_store
+                    .budget_downgraded
+                    .store(true, Ordering::Release);
+                self.repack_store.populated.store(true, Ordering::Release);
+                return Ok(self.repack_store.summary());
+            }
+
+            let count = built.len();
+            let mut slots = self
+                .repack_store
+                .slots
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (idx, entry) in built {
+                if let Some(slot) = slots.get_mut(idx) {
+                    *slot = Some(entry);
+                }
+            }
+            self.repack_store
+                .tensors_repacked
+                .store(count, Ordering::Release);
+            self.repack_store
+                .resident_bytes
+                .store(total_bytes, Ordering::Release);
+        }
+
+        #[cfg(not(feature = "jero-kernels-rvv"))]
+        let _ = pool;
+
+        self.repack_store
+            .build_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.repack_store.populated.store(true, Ordering::Release);
+        Ok(self.repack_store.summary())
+    }
+}
+
+#[cfg(feature = "jero-kernels-rvv")]
+fn infer_matrix_rows_cols(view: &TensorView<'_>) -> Result<(usize, usize), K3Error> {
+    matrix_dims_for_repack(view.shape(), view.quant()).ok_or_else(|| K3Error::TensorBoundsError {
+        tensor_name: view.name().to_owned(),
+        offset: view.offset(),
+        byte_len: view.byte_len(),
+        buffer_len: view.as_bytes().len(),
+        reason: format!(
+            "expected 2D tensor for parallel repack, got {}D",
+            view.shape().len()
+        ),
+    })
+}
+
+#[cfg(feature = "jero-kernels-rvv")]
+fn is_repackable_matrix_descriptor(desc: &TensorDescriptor) -> bool {
+    is_repackable_tensor_spec(desc.name(), desc.shape(), desc.quant())
+}
+
+#[cfg(feature = "jero-kernels-rvv")]
+fn run_on_pool<OP, R>(pool: Option<&WorkerPool>, op: OP) -> R
+where
+    OP: FnOnce() -> R + Send,
+    R: Send,
+{
+    match pool {
+        Some(p) => {
+            if let Some(a100) = p.a100_pool() {
+                a100.install(op)
+            } else {
+                p.install(op)
+            }
+        }
+        None => op(),
+    }
+}
+
+/// Repacks an eligible 2D quantized tensor into a compact nibble or block-scaled `i8` entry using
+/// disjoint tile-range slices across `pool` worker threads.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if the tensor is not 2D or fails bounds validation, or
+/// [`K3Error::CapabilityMismatch`] if the quantization format does not support tile repacking.
+#[cfg(feature = "jero-kernels-rvv")]
+pub fn repack_tensor_parallel(
+    view: &TensorView<'_>,
+    pool: Option<&WorkerPool>,
+) -> Result<RepackedTensorEntry, K3Error> {
+    let (rows, cols) = infer_matrix_rows_cols(view)?;
+    let worker_threads = pool
+        .map_or(1, |p| {
+            p.a100_pool()
+                .map_or_else(|| p.thread_count(), WorkerPool::thread_count)
+        })
+        .max(1);
+
+    match view.quant() {
+        QuantType::Q4_0 | QuantType::IQ4_NL => {
+            repack_nibble_scale_f16_parallel(view, rows, cols, worker_threads, pool)
+        }
+        QuantType::Q4_K_M => repack_nibble_q4_k_m_parallel(view, rows, cols, worker_threads, pool),
+        QuantType::Q4_1 => {
+            PackedNibbleMatrix::from_tensor(view, rows, cols).map(RepackedTensorEntry::Nibble)
+        }
+        QuantType::Q8_0
+        | QuantType::Q5_0
+        | QuantType::Q5_1
+        | QuantType::Q2_K
+        | QuantType::Q3_K
+        | QuantType::Q5_K
+        | QuantType::Q6_K
+        | QuantType::TQ1_0
+        | QuantType::TQ2_0
+        | QuantType::I2_S => repack_block_scaled_parallel(view, rows, cols, worker_threads, pool),
+        QuantType::F32 | QuantType::F16 | QuantType::BF16 | QuantType::Q8_1 | QuantType::MXFP4 => {
+            Err(K3Error::CapabilityMismatch {
+                architecture: view.quant().as_str().to_owned(),
+                reason: format!(
+                    "tensor '{}' quant {:?} does not support tiled repacking",
+                    view.name(),
+                    view.quant()
+                ),
+            })
+        }
+    }
+}
+
+#[cfg(feature = "jero-kernels-rvv")]
+fn repack_nibble_scale_f16_parallel(
+    view: &TensorView<'_>,
+    rows: usize,
+    cols: usize,
+    worker_threads: usize,
+    pool: Option<&WorkerPool>,
+) -> Result<RepackedTensorEntry, K3Error> {
+    const TILE_N: usize = 8;
+    const GROUP_ELEMS: usize = 32;
+    if rows == 0 || cols == 0 || cols % view.quant().block_elements() != 0 {
+        return PackedNibbleMatrix::from_tensor(view, rows, cols).map(RepackedTensorEntry::Nibble);
+    }
+    let n_tiles = rows.div_ceil(TILE_N);
+    let k_blocks32 = cols / GROUP_ELEMS;
+    let chunk_tiles = n_tiles.div_ceil(worker_threads).max(1);
+    let mut nibble_tiles = vec![Aligned128::zeroed(); n_tiles * k_blocks32];
+    let mut scales_f16 = vec![0_u16; n_tiles * k_blocks32 * TILE_N];
+
+    let work: Vec<(usize, usize, &mut [Aligned128], &mut [u16])> = nibble_tiles
+        .chunks_mut(chunk_tiles * k_blocks32)
+        .zip(scales_f16.chunks_mut(chunk_tiles * k_blocks32 * TILE_N))
+        .enumerate()
+        .map(|(idx, (tile_sub, scale_sub))| {
+            let t0 = idx * chunk_tiles;
+            let t1 = (t0 + chunk_tiles).min(n_tiles);
+            (t0, t1, tile_sub, scale_sub)
+        })
+        .collect();
+
+    run_on_pool(pool, || {
+        work.into_par_iter()
+            .try_for_each(|(t0, t1, tile_sub, scale_sub)| {
+                repack_nibble_into_tile_range(
+                    view,
+                    rows,
+                    cols,
+                    t0..t1,
+                    tile_sub,
+                    scale_sub,
+                    None,
+                    None,
+                )
+            })
+    })?;
+
+    PackedNibbleMatrix::from_scale_f16_buffers(view.quant(), rows, cols, nibble_tiles, scales_f16)
+        .map(RepackedTensorEntry::Nibble)
+}
+
+#[cfg(feature = "jero-kernels-rvv")]
+fn repack_nibble_q4_k_m_parallel(
+    view: &TensorView<'_>,
+    rows: usize,
+    cols: usize,
+    worker_threads: usize,
+    pool: Option<&WorkerPool>,
+) -> Result<RepackedTensorEntry, K3Error> {
+    type NibbleChunkWork<'a> = (usize, usize, &'a mut [Aligned128], &'a mut [[u8; 16]]);
+    const TILE_N: usize = 8;
+    const GROUP_ELEMS: usize = 32;
+    const Q4_K_ELEMS: usize = 256;
+    if rows == 0 || cols == 0 || cols % Q4_K_ELEMS != 0 {
+        return PackedNibbleMatrix::from_tensor(view, rows, cols).map(RepackedTensorEntry::Nibble);
+    }
+    let n_tiles = rows.div_ceil(TILE_N);
+    let k_blocks32 = cols / GROUP_ELEMS;
+    let n_sblks = cols / Q4_K_ELEMS;
+    let chunk_tiles = n_tiles.div_ceil(worker_threads).max(1);
+    let mut nibble_tiles = vec![Aligned128::zeroed(); n_tiles * k_blocks32];
+    let mut headers = vec![[0_u8; 16]; n_tiles * n_sblks * TILE_N];
+
+    let work: Vec<NibbleChunkWork<'_>> = nibble_tiles
+        .chunks_mut(chunk_tiles * k_blocks32)
+        .zip(headers.chunks_mut(chunk_tiles * n_sblks * TILE_N))
+        .enumerate()
+        .map(|(idx, (tile_sub, hdr_sub))| {
+            let t0 = idx * chunk_tiles;
+            let t1 = (t0 + chunk_tiles).min(n_tiles);
+            (t0, t1, tile_sub, hdr_sub)
+        })
+        .collect();
+
+    run_on_pool(pool, || {
+        work.into_par_iter()
+            .try_for_each(|(t0, t1, tile_sub, hdr_sub)| {
+                repack_nibble_into_tile_range(
+                    view,
+                    rows,
+                    cols,
+                    t0..t1,
+                    tile_sub,
+                    &mut [],
+                    None,
+                    Some(hdr_sub),
+                )
+            })
+    })?;
+
+    PackedNibbleMatrix::from_q4_k_buffers(rows, cols, nibble_tiles, headers)
+        .map(RepackedTensorEntry::Nibble)
+}
+
+#[cfg(feature = "jero-kernels-rvv")]
+fn repack_block_scaled_parallel(
+    view: &TensorView<'_>,
+    rows: usize,
+    cols: usize,
+    worker_threads: usize,
+    pool: Option<&WorkerPool>,
+) -> Result<RepackedTensorEntry, K3Error> {
+    const TILE_N: usize = 8;
+    let layout = BlockScaledTileLayout::for_tensor(view, rows, cols)?;
+    let n_tiles = layout.n_tiles();
+    let chunk_tiles = n_tiles.div_ceil(worker_threads).max(1);
+    let mut tiles = vec![Aligned128::zeroed(); layout.total_tiles()];
+    let mut scales = vec![0.0_f32; layout.total_scales()];
+    let mut mins = if layout.has_mins() {
+        Some(vec![0.0_f32; layout.total_mins()])
+    } else {
+        None
+    };
+
+    let mut tile_chunks = tiles.chunks_mut(chunk_tiles * layout.k_chunks());
+    let mut scale_chunks = scales.chunks_mut(chunk_tiles * layout.scale_groups() * TILE_N);
+    let mut min_chunks = mins
+        .as_deref_mut()
+        .map(|m| m.chunks_mut(chunk_tiles * layout.scale_groups() * TILE_N));
+
+    let mut work = Vec::new();
+    let mut idx = 0_usize;
+    while let (Some(tile_sub), Some(scale_sub)) = (tile_chunks.next(), scale_chunks.next()) {
+        let min_sub = min_chunks.as_mut().and_then(Iterator::next);
+        let t0 = idx * chunk_tiles;
+        let t1 = (t0 + chunk_tiles).min(n_tiles);
+        work.push((t0, t1, tile_sub, scale_sub, min_sub));
+        idx += 1;
+    }
+
+    run_on_pool(pool, || {
+        work.into_par_iter()
+            .try_for_each(|(t0, t1, tile_sub, scale_sub, min_sub)| {
+                repack_into_tile_range(view, rows, cols, t0..t1, tile_sub, scale_sub, min_sub)
+            })
+    })?;
+
+    RepackedWeight::from_tile_buffers(layout, tiles, scales, mins)
+        .map(RepackedTensorEntry::BlockScaled)
 }
 
 impl ModelWeights for LockedModelWeights {
@@ -466,6 +1159,14 @@ impl ModelWeights for LockedModelWeights {
 
 impl Drop for LockedModelWeights {
     fn drop(&mut self) {
+        self.repack_store.clear();
+        if ACTIVE_LOCKED_MODEL_COUNT.fetch_sub(1, Ordering::AcqRel) == 1 {
+            #[cfg(feature = "jero-arch-llama")]
+            jero_arch_llama::clear_repack_cache();
+            #[cfg(feature = "jero-arch-mistral")]
+            jero_arch_mistral::clear_global_layer_cache();
+        }
+
         let fd = self.file.as_raw_fd();
         let ptr = self.ptr.cast::<libc::c_void>();
         let len = self.len;
@@ -652,5 +1353,303 @@ mod tests {
         drop(untied);
         let _ = std::fs::remove_file(&tied_path);
         let _ = std::fs::remove_file(&untied_path);
+    }
+
+    #[test]
+    fn test_repacked_tensor_store_lifecycle_and_clear() {
+        let store = RepackedTensorStore::new(4, true, Some(4096));
+        assert!(store.eager_admitted());
+        assert_eq!(store.repack_arena_budget(), Some(4096));
+        assert!(store.get_by_index(0).is_none());
+        let snap = store.summary();
+        assert_eq!(snap.tensors_repacked, 0);
+        assert_eq!(snap.resident_bytes, 0);
+        assert_eq!(snap.miss_count, 1);
+        assert!(!snap.downgraded);
+
+        store.clear();
+        let after_clear = store.summary();
+        assert_eq!(after_clear.tensors_repacked, 0);
+        assert_eq!(after_clear.resident_bytes, 0);
+    }
+
+    #[test]
+    #[cfg(all(feature = "jero-kernels-rvv", not(miri)))]
+    fn test_parallel_slice_repack_equivalence_across_worker_pool() {
+        use crate::affinity::resolve_affinity;
+        use jero_core::{CoordinationProfile, GgufFile};
+
+        let tensor_specs = [
+            ("blk.0.attn_q.weight", QuantType::Q4_K_M, &[256, 16][..]),
+            ("blk.0.attn_k.weight", QuantType::Q4_0, &[32, 16][..]),
+            ("blk.0.attn_v.weight", QuantType::Q8_0, &[32, 16][..]),
+        ];
+        let mut bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
+        // Deterministic non-zero block pattern in payload tail to exercise every tile/scale path.
+        let tail = bytes.len();
+        for (i, byte) in bytes[tail.saturating_sub(2048)..].iter_mut().enumerate() {
+            *byte ^= u8::try_from((i * 17 + 3) % 251).unwrap_or(0);
+        }
+        let gguf = GgufFile::parse(&bytes).expect("parse synthetic gguf");
+
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(2));
+        let affinity = resolve_affinity(None, None, Some(threads)).expect("host affinity");
+        let pool = WorkerPool::with_coordination(affinity, CoordinationProfile::Rayon)
+            .expect("spawn worker pool");
+
+        // 1. Q4_K_M compact nibble parallel vs sequential reference + i8 parallel slices check
+        let q4k = gguf.tensor("blk.0.attn_q.weight").expect("q4_k tensor");
+        let par_q4k = repack_tensor_parallel(&q4k, Some(&pool)).expect("parallel q4_k nibble");
+        let seq_q4k = PackedNibbleMatrix::repack(&q4k).expect("seq q4_k nibble");
+        let par_nibble = par_q4k.as_nibble().expect("nibble variant");
+        assert_eq!(par_nibble.rows(), seq_q4k.rows());
+        assert_eq!(par_nibble.cols(), seq_q4k.cols());
+        assert_eq!(par_nibble.packed_bytes(), seq_q4k.packed_bytes());
+
+        let mut i8_tiles = vec![0_i8; 2 * 16 * 128];
+        let mut i8_scales = vec![0.0_f32; 2 * 8 * 8];
+        let mut i8_mins = vec![0.0_f32; 2 * 8 * 8];
+        jero_kernels_rvv::repack::repack_q4_k_m_parallel_slices(
+            &q4k,
+            16,
+            256,
+            0..2,
+            &mut i8_tiles,
+            &mut i8_scales,
+            &mut i8_mins,
+        )
+        .expect("repack_q4_k_m_parallel_slices succeeds");
+        assert!(i8_scales.iter().any(|&v| v != 0.0));
+
+        // 2. Q4_0 compact nibble parallel vs sequential reference via QuantizedActQ8::quantize
+        let q4_0 = gguf.tensor("blk.0.attn_k.weight").expect("q4_0 tensor");
+        let par_q4_0 = repack_tensor_parallel(&q4_0, Some(&pool)).expect("parallel q4_0 nibble");
+        let seq_q4_0 = PackedNibbleMatrix::repack(&q4_0).expect("seq q4_0 nibble");
+        let par_q4_0_nib = par_q4_0.as_nibble().expect("q4_0 nibble");
+        let acts = vec![0.25_f32; 2 * seq_q4_0.cols()];
+        let q_act = jero_kernels_rvv::repack::QuantizedActQ8::quantize(&acts, 2, seq_q4_0.cols())
+            .expect("quantize acts");
+        let mut out_par = vec![0.0_f32; 2 * par_q4_0_nib.rows()];
+        let mut out_seq = vec![0.0_f32; 2 * seq_q4_0.rows()];
+        par_q4_0_nib
+            .gemm(&mut out_par, &q_act)
+            .expect("par nibble gemm");
+        seq_q4_0
+            .gemm(&mut out_seq, &q_act)
+            .expect("seq nibble gemm");
+        assert_eq!(out_par, out_seq);
+
+        // 3. Q8_0 block-scaled i8 parallel vs sequential row dequantization
+        let q8_0 = gguf.tensor("blk.0.attn_v.weight").expect("q8_0 tensor");
+        let par_q8 = repack_tensor_parallel(&q8_0, Some(&pool)).expect("parallel q8_0");
+        let seq_q8 = RepackedWeight::repack(&q8_0).expect("seq q8_0");
+        let par_bs = par_q8.as_block_scaled().expect("block scaled variant");
+        assert_eq!(par_bs.rows(), seq_q8.rows());
+        assert_eq!(par_bs.cols(), seq_q8.cols());
+        for row in 0..seq_q8.rows() {
+            let mut r_par = vec![0.0_f32; seq_q8.cols()];
+            let mut r_seq = vec![0.0_f32; seq_q8.cols()];
+            par_bs.dequantize_row(row, &mut r_par).expect("dequant par");
+            seq_q8.dequantize_row(row, &mut r_seq).expect("dequant seq");
+            assert_eq!(r_par, r_seq, "row {row} mismatch");
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_locked_weights_repeat_repack_reuse_and_drop_cleanup() {
+        use crate::affinity::resolve_affinity;
+        use crate::memory::MockMemoryInspector;
+        use jero_core::CoordinationProfile;
+
+        let tensor_specs = [
+            ("blk.0.attn_q.weight", QuantType::Q4_K_M, &[256, 16][..]),
+            ("blk.0.attn_v.weight", QuantType::Q4_K_M, &[256, 16][..]),
+            ("output_norm.weight", QuantType::F32, &[16][..]),
+        ];
+        let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
+        let temp_path =
+            std::env::temp_dir().join(format!("test_repack_reuse_{}.gguf", std::process::id()));
+        std::fs::write(&temp_path, &bytes).expect("write model");
+
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(2));
+        let affinity = resolve_affinity(None, None, Some(threads)).expect("host affinity");
+        let pool = WorkerPool::with_coordination(affinity, CoordinationProfile::Rayon)
+            .expect("worker pool");
+
+        let inspector = MockMemoryInspector::new(256 * 1024 * 1024, 256 * 1024 * 1024);
+        let (locked, _recipe, footprint) =
+            LockedModelWeights::open_with_admission(&temp_path, 64, &inspector)
+                .expect("open with generous admission");
+        assert!(footprint.eager_repack_enabled);
+
+        let before = ACTIVE_LOCKED_MODEL_COUNT.load(Ordering::Acquire);
+        assert!(before >= 1);
+
+        // Repeat 3 prompt passes reuse the same load-time repacked matrices without rebuilds
+        let first = locked
+            .prepare_repacked_weights(Some(&pool))
+            .expect("initial repack");
+        let second = locked
+            .prepare_repacked_weights(Some(&pool))
+            .expect("second pass reuse");
+        let third = locked
+            .prepare_repacked_weights(Some(&pool))
+            .expect("third pass reuse");
+
+        assert_eq!(first.build_count, 1);
+        assert_eq!(second.build_count, 1);
+        assert_eq!(third.build_count, 1);
+        assert_eq!(third.miss_count, 1);
+        assert_eq!(third.hit_count, 2);
+        #[cfg(feature = "jero-kernels-rvv")]
+        {
+            assert_eq!(first.tensors_repacked, 2);
+            assert!(first.resident_bytes > 0);
+            let view = locked.model_view();
+            assert!(view.repacked_tensor("blk.0.attn_q.weight").is_some());
+            assert!(view.repacked_tensor("blk.0.attn_v.weight").is_some());
+            assert_eq!(view.repack_summary().hit_count, 4);
+        }
+
+        // Verify automatic Drop frees 100% of repacked store allocations without calling clear()
+        #[cfg(feature = "jero-kernels-rvv")]
+        let weak_entry = {
+            let entry = locked
+                .repacked_tensor("blk.0.attn_q.weight")
+                .expect("repacked entry exists before drop");
+            let weak = Arc::downgrade(&entry);
+            assert!(weak.upgrade().is_some());
+            weak
+        };
+        drop(locked);
+        #[cfg(feature = "jero-kernels-rvv")]
+        assert!(
+            weak_entry.upgrade().is_none(),
+            "dropping LockedModelWeights must automatically free all repacked entries"
+        );
+
+        // Tight budget that fits base but downgrades optional repack arena keeps eager_admitted = false
+        let exact_base = footprint.base_required_bytes();
+        let tight = MockMemoryInspector::new(exact_base, exact_base);
+        let (downgraded_weights, _, downgraded_fp) =
+            LockedModelWeights::open_with_admission(&temp_path, 64, &tight)
+                .expect("admit downgraded footprint");
+        assert!(!downgraded_fp.eager_repack_enabled);
+        let downgraded_summary = downgraded_weights
+            .prepare_repacked_weights(Some(&pool))
+            .expect("downgraded prepare succeeds as no-op");
+        assert!(downgraded_summary.downgraded);
+        assert_eq!(downgraded_summary.tensors_repacked, 0);
+        assert_eq!(downgraded_summary.resident_bytes, 0);
+        drop(downgraded_weights);
+
+        let _ = std::fs::remove_file(&temp_path);
+    }
+
+    #[test]
+    #[cfg(all(feature = "jero-kernels-rvv", not(miri)))]
+    fn test_repack_arena_budget_enforced_and_block_scaled_mins_accounted() {
+        use crate::memory::{SystemMemoryInspector, calculate_footprint_with_slots};
+        use std::io::Write;
+
+        let tensor_specs = [
+            ("blk.0.attn_q.weight", QuantType::Q5_K, &[256, 5][..]),
+            ("blk.0.attn_k.weight", QuantType::Q4_K_M, &[256, 5][..]),
+            ("blk.0.attn_v.weight", QuantType::Q8_0, &[32, 16][..]),
+        ];
+        let bytes = create_synthetic_gguf_v3("llama", 32, &tensor_specs);
+
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let path = dir.join(format!("jero_repack_budget_test_{pid}_{ts}.gguf"));
+        {
+            let mut file = File::create(&path).expect("create temp gguf");
+            file.write_all(&bytes).expect("write temp gguf");
+            file.sync_all().expect("sync temp gguf");
+        }
+
+        let file = File::open(&path).expect("open temp gguf");
+        let (mut locked, _recipe, footprint) = LockedModelWeights::from_file_with_admission(
+            file,
+            Some(64),
+            &SystemMemoryInspector,
+            true,
+        )
+        .expect("admit synthetic gguf");
+
+        let q5k_view = locked.tensor("blk.0.attn_q.weight").expect("q5_k view");
+        let q5k_entry = repack_tensor_parallel(&q5k_view, None).expect("repack q5_k");
+        let q5k_bs = q5k_entry.as_block_scaled().expect("q5_k is block scaled");
+        let expected_meta =
+            q5k_bs.n_tiles() * (q5k_bs.k_padded() / q5k_bs.group_size()) * 8 * size_of::<f32>();
+        assert_eq!(
+            q5k_entry.resident_bytes(),
+            q5k_bs.aligned_bytes() + expected_meta * 2,
+            "Q5_K BlockScaled resident_bytes must include both scales and mins"
+        );
+
+        let full_summary = locked.prepare_repacked_weights(None).expect("prepare full");
+        assert!(!full_summary.downgraded);
+        assert_eq!(full_summary.tensors_repacked, 3);
+        assert!(
+            full_summary.resident_bytes <= footprint.repack_arena_bytes,
+            "actual resident bytes ({}) must not exceed admitted repack arena ({})",
+            full_summary.resident_bytes,
+            footprint.repack_arena_bytes
+        );
+
+        // Verify unpadded TILE_N=8 + Q4_1 scales_f16/mins_f16 estimate bounds exact PackedNibbleMatrix residency
+        let q4_1_specs = [("blk.0.attn_k.weight", QuantType::Q4_1, &[32, 5][..])];
+        let q4_1_bytes = create_synthetic_gguf_v3("qwen2", 32, &q4_1_specs);
+        let q4_1_path = dir.join(format!("jero_repack_q4_1_test_{pid}_{ts}.gguf"));
+        {
+            let mut file = File::create(&q4_1_path).expect("create q4_1 temp gguf");
+            file.write_all(&q4_1_bytes).expect("write q4_1 temp gguf");
+            file.sync_all().expect("sync q4_1 temp gguf");
+        }
+        let q4_1_locked = LockedModelWeights::open(&q4_1_path).expect("open q4_1 gguf");
+        let q4_1_view = q4_1_locked
+            .tensor("blk.0.attn_k.weight")
+            .expect("q4_1 view");
+        let q4_1_entry = repack_tensor_parallel(&q4_1_view, None).expect("repack q4_1");
+        assert_eq!(q4_1_entry.resident_bytes(), 160);
+        let q4_1_fp =
+            calculate_footprint_with_slots(q4_1_locked.metadata(), 64, 1).expect("q4_1 footprint");
+        assert!(
+            q4_1_fp.repack_arena_bytes >= q4_1_entry.resident_bytes(),
+            "Q4_1 unpadded TILE_N=8 estimate ({}) must cover exact residency ({})",
+            q4_1_fp.repack_arena_bytes,
+            q4_1_entry.resident_bytes()
+        );
+        drop(q4_1_locked);
+        let _ = std::fs::remove_file(&q4_1_path);
+
+        // Enforce tight budget cap smaller than total_bytes -> reject & downgrade without over-budget retention
+        locked.repack_store().clear();
+        locked.repack_store = RepackedTensorStore::new(
+            locked.metadata().tensors().len(),
+            true,
+            Some(full_summary.resident_bytes.saturating_sub(1)),
+        );
+        let rejected = locked
+            .prepare_repacked_weights(None)
+            .expect("over-budget repack downgrades cleanly without error");
+        assert!(rejected.downgraded);
+        assert_eq!(rejected.tensors_repacked, 0);
+        assert_eq!(rejected.resident_bytes, 0);
+        assert!(locked.repacked_tensor("blk.0.attn_q.weight").is_none());
+        assert!(locked.repacked_tensor("blk.0.attn_k.weight").is_none());
+        let repeat_rejected = locked
+            .prepare_repacked_weights(None)
+            .expect("repeat over-budget stays downgraded");
+        assert!(repeat_rejected.downgraded);
+        assert_eq!(repeat_rejected.resident_bytes, 0);
+
+        drop(locked);
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -840,15 +840,19 @@ impl ForwardModel {
         let logits = self.forward(&exec, &plan.prefill, &mut state, prompt, 0)?;
         let mut generated = Vec::with_capacity(max_tokens);
         let mut decode_steps = 0_usize;
-        let (ttft_ms, prefill_ms);
+        let (ttft_ms, prefill_ms, prefill_nanos);
         let mut decode_ms = 0.0;
         if max_tokens == 0 {
-            prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+            let prefill_elapsed = prefill_start.elapsed();
+            prefill_ms = prefill_elapsed.as_secs_f64() * 1000.0;
+            prefill_nanos = u64::try_from(prefill_elapsed.as_nanos()).unwrap_or(u64::MAX);
             ttft_ms = prefill_ms;
         } else {
             let mut tok = self.sample(&logits);
             generated.push(tok);
-            prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+            let prefill_elapsed = prefill_start.elapsed();
+            prefill_ms = prefill_elapsed.as_secs_f64() * 1000.0;
+            prefill_nanos = u64::try_from(prefill_elapsed.as_nanos()).unwrap_or(u64::MAX);
             ttft_ms = prefill_ms;
             let decode_start = Instant::now();
             while generated.len() < max_tokens {
@@ -867,6 +871,8 @@ impl ForwardModel {
         };
         let timing = compute_pass_timing(
             pass_start,
+            prompt.len(),
+            prefill_nanos,
             ttft_ms,
             prefill_ms,
             decode_ms,

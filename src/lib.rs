@@ -31,8 +31,10 @@ pub use affinity::{
     CpuTopologyInspector, FutexBarrier, IntoClusterPreset, MockCpuTopology,
     PHASE_SPLIT_MIN_PROMPT_TOKENS, ResolvedAffinity, SpinBarrier, SystemCpuTopology, VlenDomain,
     WorkerAffinityStatus, WorkerPool, WorkerWaitSlot, X100_CLUSTER_MASK,
-    X100_DEFAULT_MAX_COMPUTE_THREADS, parse_cpu_list_mask, resolve_affinity, resolve_affinity_with,
-    resolve_phase_policy, select_phase_policy, select_phase_policy_for_arch,
+    X100_DEFAULT_MAX_COMPUTE_THREADS, has_a100_ime_for_mask, parse_cpu_list_mask, resolve_affinity,
+    resolve_affinity_with, resolve_phase_policy, resolve_phase_policy_with_ime,
+    select_phase_policy, select_phase_policy_for_arch, select_phase_policy_for_arch_with_ime,
+    select_phase_policy_with_ime,
 };
 pub use capability::{
     GgufHyperparams, RecipeRegistry, verify_metadata_capabilities, verify_model_capabilities,
@@ -68,7 +70,7 @@ pub use memory::{
     MemoryFootprint, MemoryInspector, MockMemoryInspector, SystemMemoryInspector,
     architecture_requires_kv_cache, calculate_footprint, calculate_footprint_with_slots,
     check_memory_admission, check_memory_admission_for_weight_bytes, check_memory_admission_with,
-    check_memory_admission_with_slots, estimate_dory_kv_cache_bytes,
+    check_memory_admission_with_slots, estimate_dory_kv_cache_bytes, estimate_footprint,
     estimate_hybrid_kv_cache_bytes, estimate_hybrid_ssm_arena_bytes, estimate_kv_cache_bytes,
     estimate_mla_kv_cache_bytes, gemma_layer_kv_policies, system_page_size,
 };
@@ -78,7 +80,11 @@ pub use ssm::{
     lfm2_shortconv_step, resolve_hybrid_layer_schedule,
     resolve_hybrid_layer_schedule_with_metadata,
 };
-pub use weights::LockedModelWeights;
+#[cfg(feature = "jero-kernels-rvv")]
+pub use weights::repack_tensor_parallel;
+pub use weights::{
+    LockedModelWeights, ModelView, RepackSummary, RepackedTensorEntry, RepackedTensorStore,
+};
 
 #[cfg(feature = "jero-arch-llama")]
 pub use jero_arch_llama as arch_llama;
