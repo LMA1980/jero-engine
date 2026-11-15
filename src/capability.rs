@@ -628,9 +628,45 @@ impl RecipeRegistry {
             return Some(&DEBERTA_V3);
         }
 
+        if let Some(recipe) = Self::find_machine_model_recipe(architecture) {
+            return Some(recipe);
+        }
+
         #[cfg(feature = "jero-kernels-rvv")]
         if let Some(recipe) = Self::find_ssm_or_granite_recipe(architecture) {
             return Some(recipe);
+        }
+
+        let _ = architecture;
+        None
+    }
+
+    fn find_machine_model_recipe(architecture: &str) -> Option<&'static dyn ArchRecipe> {
+        #[cfg(feature = "jero-arch-ttm")]
+        if architecture == "ttm" {
+            static TTM: crate::machine_models::TtmRecipe = crate::machine_models::TtmRecipe::new();
+            return Some(&TTM);
+        }
+
+        #[cfg(feature = "jero-arch-ft-transformer")]
+        if architecture == "ft-transformer" {
+            static FT_TRANSFORMER: crate::machine_models::FtTransformerRecipe =
+                crate::machine_models::FtTransformerRecipe::new();
+            return Some(&FT_TRANSFORMER);
+        }
+
+        #[cfg(feature = "jero-arch-tabpfn-v2")]
+        if architecture == "tabpfn-v2" {
+            static TABPFN_V2: crate::machine_models::TabPfnV2Recipe =
+                crate::machine_models::TabPfnV2Recipe::new();
+            return Some(&TABPFN_V2);
+        }
+
+        #[cfg(feature = "jero-arch-decision-transformer")]
+        if architecture == "decision-transformer" {
+            static DECISION_TRANSFORMER: crate::machine_models::DecisionTransformerRecipe =
+                crate::machine_models::DecisionTransformerRecipe::new();
+            return Some(&DECISION_TRANSFORMER);
         }
 
         let _ = architecture;
@@ -765,6 +801,14 @@ impl RecipeRegistry {
             "bert",
             #[cfg(feature = "jero-arch-modernbert")]
             "deberta-v3",
+            #[cfg(feature = "jero-arch-ttm")]
+            "ttm",
+            #[cfg(feature = "jero-arch-ft-transformer")]
+            "ft-transformer",
+            #[cfg(feature = "jero-arch-tabpfn-v2")]
+            "tabpfn-v2",
+            #[cfg(feature = "jero-arch-decision-transformer")]
+            "decision-transformer",
         ];
         ARCHS
     }
@@ -1291,6 +1335,38 @@ impl RecipeRegistry {
             return Some(Box::new(recipe));
         }
 
+        #[cfg(feature = "jero-arch-ttm")]
+        if arch == "ttm" {
+            return Some(Box::new(metadata.map_or_else(
+                crate::machine_models::TtmRecipe::new,
+                crate::machine_models::TtmRecipe::from_metadata,
+            )));
+        }
+
+        #[cfg(feature = "jero-arch-ft-transformer")]
+        if arch == "ft-transformer" {
+            return Some(Box::new(metadata.map_or_else(
+                crate::machine_models::FtTransformerRecipe::new,
+                crate::machine_models::FtTransformerRecipe::from_metadata,
+            )));
+        }
+
+        #[cfg(feature = "jero-arch-tabpfn-v2")]
+        if arch == "tabpfn-v2" {
+            return Some(Box::new(metadata.map_or_else(
+                crate::machine_models::TabPfnV2Recipe::new,
+                crate::machine_models::TabPfnV2Recipe::from_metadata,
+            )));
+        }
+
+        #[cfg(feature = "jero-arch-decision-transformer")]
+        if arch == "decision-transformer" {
+            return Some(Box::new(metadata.map_or_else(
+                crate::machine_models::DecisionTransformerRecipe::new,
+                crate::machine_models::DecisionTransformerRecipe::from_metadata,
+            )));
+        }
+
         let _ = (arch, metadata);
         None
     }
@@ -1752,6 +1828,32 @@ impl RecipeRegistry {
             && let Ok(recipe) = jero_arch_mistral::MistralRecipe::from_gguf(gguf)
         {
             return Some(Box::new(recipe));
+        }
+
+        #[cfg(feature = "jero-arch-ttm")]
+        if params.architecture == "ttm" {
+            return Some(Box::new(crate::machine_models::TtmRecipe::from_gguf(gguf)));
+        }
+
+        #[cfg(feature = "jero-arch-ft-transformer")]
+        if params.architecture == "ft-transformer" {
+            return Some(Box::new(
+                crate::machine_models::FtTransformerRecipe::from_gguf(gguf),
+            ));
+        }
+
+        #[cfg(feature = "jero-arch-tabpfn-v2")]
+        if params.architecture == "tabpfn-v2" {
+            return Some(Box::new(crate::machine_models::TabPfnV2Recipe::from_gguf(
+                gguf,
+            )));
+        }
+
+        #[cfg(feature = "jero-arch-decision-transformer")]
+        if params.architecture == "decision-transformer" {
+            return Some(Box::new(
+                crate::machine_models::DecisionTransformerRecipe::from_gguf(gguf),
+            ));
         }
 
         Self::instantiate_from_hyperparams(&params, Some(gguf.metadata()))

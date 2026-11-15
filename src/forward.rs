@@ -47,6 +47,24 @@ pub use crate::gemma::{
     gemma_norm_lane, select_top_k_experts,
 };
 
+#[cfg(feature = "jero-arch-decision-transformer")]
+pub use crate::machine_models::DecisionTransformerRecipe;
+#[cfg(feature = "jero-arch-ft-transformer")]
+pub use crate::machine_models::FtTransformerRecipe;
+#[cfg(feature = "jero-arch-tabpfn-v2")]
+pub use crate::machine_models::TabPfnV2Recipe;
+#[cfg(feature = "jero-arch-ttm")]
+pub use crate::machine_models::TtmRecipe;
+#[cfg(any(
+    feature = "jero-arch-ttm",
+    feature = "jero-arch-ft-transformer",
+    feature = "jero-arch-tabpfn-v2",
+    feature = "jero-arch-decision-transformer",
+    feature = "jero-kernels-rvv",
+))]
+pub use crate::machine_models::{
+    MmprojLatentBridge, forward_with_soft_prompt, project_machine_latent_to_soft_prompt,
+};
 #[cfg(feature = "jero-arch-modernbert")]
 pub use crate::modernbert::ModernBertRecipe;
 
