@@ -857,10 +857,14 @@ pub fn calculate_footprint(
 }
 
 /// Returns `true` if `arch` requires an autoregressive KV cache allocation (`false` for
-/// single-pass bidirectional encoders such as `modernbert`, `bert`, and `deberta-v3`).
+/// single-pass encoders such as `modernbert`, `bert`, and `deberta-v3`, and non-autoregressive
+/// machine models such as `ttm`, `ft-transformer`, and `tabpfn-v2`).
 #[must_use]
 pub const fn architecture_requires_kv_cache(arch: &str) -> bool {
-    !matches!(arch.as_bytes(), b"modernbert" | b"bert" | b"deberta-v3")
+    !matches!(
+        arch.as_bytes(),
+        b"modernbert" | b"bert" | b"deberta-v3" | b"ttm" | b"ft-transformer" | b"tabpfn-v2"
+    )
 }
 
 /// Computes the raw unaligned KV cache size in bytes across `slots` concurrency slots.

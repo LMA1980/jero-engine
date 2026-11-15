@@ -1223,11 +1223,41 @@ fn execute_token_standard(
     logits: &mut [f32],
     weights: &dyn ModelWeights,
 ) -> Result<(), K3Error> {
+    let hidden_dim = exec.attn.hidden_dim.max(8);
+    let hidden = embed_token(step.token_id, hidden_dim, weights)?;
+    execute_token_standard_with_hidden(
+        exec,
+        hidden,
+        step.pos,
+        step.seq_len,
+        kv_cache,
+        logits,
+        weights,
+    )
+}
+
+fn execute_token_standard_with_hidden(
+    exec: StandardExecSpec,
+    mut hidden: Vec<f32>,
+    pos: usize,
+    seq_len: usize,
+    kv_cache: &mut [f32],
+    logits: &mut [f32],
+    weights: &dyn ModelWeights,
+) -> Result<(), K3Error> {
     validate_model_weights_adr023(exec.arch, weights)?;
     let layers = exec.num_layers.max(1);
     let hidden_dim = exec.attn.hidden_dim.max(8);
     let eps = exec.attn.rms_eps.max(1e-6);
-    let mut hidden = embed_token(step.token_id, hidden_dim, weights)?;
+    if hidden.len() != hidden_dim {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: exec.arch.to_owned(),
+            reason: format!(
+                "layer-0 hidden length {} does not match hidden_dim {hidden_dim}",
+                hidden.len()
+            ),
+        });
+    }
     let layer_stride = kv_cache.len() / layers;
 
     for layer in 0..layers {
@@ -1239,8 +1269,8 @@ fn execute_token_standard(
         run_dense_attention_sublayer(
             exec.attn,
             layer,
-            step.pos,
-            step.seq_len,
+            pos,
+            seq_len,
             &mut hidden,
             layer_kv,
             weights,
@@ -1324,19 +1354,15 @@ impl ArchRecipe for Qwen2Recipe {
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
         let exec = self.exec_spec();
-        run_prefill_with(ctx, "qwen2", |token_id, pos, seq_len, kv, logits| {
-            execute_token_standard(
-                exec,
-                TokenStep {
-                    token_id,
-                    pos,
-                    seq_len,
-                },
-                kv,
-                logits,
-                weights,
-            )
-        })
+        run_prefill_with_hidden(
+            ctx,
+            "qwen2",
+            exec.attn.hidden_dim.max(8),
+            weights,
+            |hidden, pos, seq_len, kv, logits| {
+                execute_token_standard_with_hidden(exec, hidden, pos, seq_len, kv, logits, weights)
+            },
+        )
     }
 
     fn decode_step(
@@ -1401,19 +1427,15 @@ impl ArchRecipe for Qwen3Recipe {
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
         let exec = self.exec_spec();
-        run_prefill_with(ctx, "qwen3", |token_id, pos, seq_len, kv, logits| {
-            execute_token_standard(
-                exec,
-                TokenStep {
-                    token_id,
-                    pos,
-                    seq_len,
-                },
-                kv,
-                logits,
-                weights,
-            )
-        })
+        run_prefill_with_hidden(
+            ctx,
+            "qwen3",
+            exec.attn.hidden_dim.max(8),
+            weights,
+            |hidden, pos, seq_len, kv, logits| {
+                execute_token_standard_with_hidden(exec, hidden, pos, seq_len, kv, logits, weights)
+            },
+        )
     }
 
     fn decode_step(
@@ -1483,19 +1505,15 @@ impl ArchRecipe for Qwen3MoeRecipe {
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
         let exec = self.exec_spec();
-        run_prefill_with(ctx, "qwen3moe", |token_id, pos, seq_len, kv, logits| {
-            execute_token_standard(
-                exec,
-                TokenStep {
-                    token_id,
-                    pos,
-                    seq_len,
-                },
-                kv,
-                logits,
-                weights,
-            )
-        })
+        run_prefill_with_hidden(
+            ctx,
+            "qwen3moe",
+            exec.attn.hidden_dim.max(8),
+            weights,
+            |hidden, pos, seq_len, kv, logits| {
+                execute_token_standard_with_hidden(exec, hidden, pos, seq_len, kv, logits, weights)
+            },
+        )
     }
 
     fn decode_step(
@@ -1520,13 +1538,27 @@ impl ArchRecipe for Qwen3MoeRecipe {
     }
 }
 
+fn execute_deepseek2_token(
+    recipe: &DeepSeek2Recipe,
+    token_id: u32,
+    pos: usize,
+    seq_len: usize,
+    kv_cache: &mut [f32],
+    logits: &mut [f32],
+    weights: &dyn ModelWeights,
+) -> Result<(), K3Error> {
+    let hidden_dim = recipe.hidden_dim.max(8);
+    let hidden = embed_token(token_id, hidden_dim, weights)?;
+    execute_deepseek2_token_with_hidden(recipe, hidden, pos, seq_len, kv_cache, logits, weights)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "single-token DeepSeek2 MLA compression, absorbed attention, and shared+routed MoE pass"
 )]
-fn execute_deepseek2_token(
+fn execute_deepseek2_token_with_hidden(
     recipe: &DeepSeek2Recipe,
-    token_id: u32,
+    mut hidden: Vec<f32>,
     pos: usize,
     seq_len: usize,
     kv_cache: &mut [f32],
@@ -1543,7 +1575,15 @@ fn execute_deepseek2_token(
     let d_v = recipe.mla.v_head_dim.max(1);
     let latent_dim = d_c + d_r;
 
-    let mut hidden = embed_token(token_id, hidden_dim, weights)?;
+    if hidden.len() != hidden_dim {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "deepseek2".to_owned(),
+            reason: format!(
+                "layer-0 hidden length {} does not match hidden_dim {hidden_dim}",
+                hidden.len()
+            ),
+        });
+    }
     let layer_stride = kv_cache.len() / layers;
 
     for layer in 0..layers {
@@ -1724,9 +1764,15 @@ impl ArchRecipe for DeepSeek2Recipe {
         ctx: &mut ExecutionContext<'_>,
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
-        run_prefill_with(ctx, "deepseek2", |tok, pos, seq_len, kv, logits| {
-            execute_deepseek2_token(self, tok, pos, seq_len, kv, logits, weights)
-        })
+        run_prefill_with_hidden(
+            ctx,
+            "deepseek2",
+            self.hidden_dim.max(8),
+            weights,
+            |hidden, pos, seq_len, kv, logits| {
+                execute_deepseek2_token_with_hidden(self, hidden, pos, seq_len, kv, logits, weights)
+            },
+        )
     }
 
     fn decode_step(
@@ -1928,9 +1974,46 @@ fn execute_qwen35_token(
     logits: &mut [f32],
     weights: &dyn ModelWeights,
 ) -> Result<(), K3Error> {
+    let hidden_dim = base.hidden_dim.max(8);
+    let hidden = embed_token(step.token_id, hidden_dim, weights)?;
+    execute_qwen35_token_with_hidden(
+        base,
+        moe,
+        hidden,
+        step.pos,
+        step.seq_len,
+        kv_cache,
+        logits,
+        weights,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared Gated-DeltaNet + full-attention Qwen3.5 step supporting Layer-0 soft prompts"
+)]
+fn execute_qwen35_token_with_hidden(
+    base: &Qwen35Recipe,
+    moe: Option<MoeDispatchSpec>,
+    mut hidden: Vec<f32>,
+    pos: usize,
+    seq_len: usize,
+    kv_cache: &mut [f32],
+    logits: &mut [f32],
+    weights: &dyn ModelWeights,
+) -> Result<(), K3Error> {
     let layers = base.num_layers.max(1);
     let hidden_dim = base.hidden_dim.max(8);
     let eps = base.rms_eps.max(1e-6);
+    if hidden.len() != hidden_dim {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "qwen35".to_owned(),
+            reason: format!(
+                "layer-0 hidden length {} does not match hidden_dim {hidden_dim}",
+                hidden.len()
+            ),
+        });
+    }
     let spec = DenseAttnLayerSpec {
         hidden_dim,
         ffn_dim: base.ffn_dim,
@@ -1943,7 +2026,6 @@ fn execute_qwen35_token(
         use_qk_norm: true,
     };
 
-    let mut hidden = embed_token(step.token_id, hidden_dim, weights)?;
     let layer_stride = kv_cache.len() / layers;
 
     for layer in 0..layers {
@@ -1959,14 +2041,14 @@ fn execute_qwen35_token(
             run_dense_attention_sublayer(
                 spec,
                 layer,
-                step.pos,
-                step.seq_len,
+                pos,
+                seq_len,
                 &mut hidden,
                 layer_kv,
                 weights,
             )?;
         } else {
-            run_gated_deltanet_sublayer(spec, layer, step.pos, &mut hidden, layer_kv, weights)?;
+            run_gated_deltanet_sublayer(spec, layer, pos, &mut hidden, layer_kv, weights)?;
         }
 
         let ffn_norm_w = read_f32_weight_or_default(
@@ -2024,20 +2106,17 @@ impl ArchRecipe for Qwen35Recipe {
         ctx: &mut ExecutionContext<'_>,
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
-        run_prefill_with(ctx, "qwen35", |token_id, pos, seq_len, kv, logits| {
-            execute_qwen35_token(
-                self,
-                None,
-                TokenStep {
-                    token_id,
-                    pos,
-                    seq_len,
-                },
-                kv,
-                logits,
-                weights,
-            )
-        })
+        run_prefill_with_hidden(
+            ctx,
+            "qwen35",
+            self.hidden_dim.max(8),
+            weights,
+            |hidden, pos, seq_len, kv, logits| {
+                execute_qwen35_token_with_hidden(
+                    self, None, hidden, pos, seq_len, kv, logits, weights,
+                )
+            },
+        )
     }
 
     fn decode_step(
@@ -2092,20 +2171,24 @@ impl ArchRecipe for Qwen35MoeRecipe {
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
         let moe = self.moe_spec();
-        run_prefill_with(ctx, "qwen35moe", |token_id, pos, seq_len, kv, logits| {
-            execute_qwen35_token(
-                &self.base,
-                Some(moe),
-                TokenStep {
-                    token_id,
+        run_prefill_with_hidden(
+            ctx,
+            "qwen35moe",
+            self.base.hidden_dim.max(8),
+            weights,
+            |hidden, pos, seq_len, kv, logits| {
+                execute_qwen35_token_with_hidden(
+                    &self.base,
+                    Some(moe),
+                    hidden,
                     pos,
                     seq_len,
-                },
-                kv,
-                logits,
-                weights,
-            )
-        })
+                    kv,
+                    logits,
+                    weights,
+                )
+            },
+        )
     }
 
     fn decode_step(
@@ -2129,6 +2212,107 @@ impl ArchRecipe for Qwen35MoeRecipe {
             )
         })
     }
+}
+
+pub(crate) fn run_prefill_with_hidden<F>(
+    ctx: &mut ExecutionContext<'_>,
+    architecture: &str,
+    hidden_dim: usize,
+    weights: &dyn ModelWeights,
+    mut step_fn: F,
+) -> Result<(), K3Error>
+where
+    F: FnMut(Vec<f32>, usize, usize, &mut [f32], &mut [f32]) -> Result<(), K3Error>,
+{
+    let prompt = ctx
+        .jump_forward_tokens()
+        .unwrap_or_else(|| ctx.prompt_tokens())
+        .to_vec();
+    let start_pos = ctx.position();
+    let soft_info = if let Some(embeds) = ctx.soft_prompt_embeds() {
+        let (num_soft, sp_dim) =
+            ctx.soft_prompt_dims()
+                .ok_or_else(|| K3Error::CapabilityMismatch {
+                    architecture: architecture.to_owned(),
+                    reason: "soft_prompt_embeds set without soft_prompt_dims".to_owned(),
+                })?;
+        if sp_dim != hidden_dim {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: architecture.to_owned(),
+                reason: format!(
+                    "soft prompt embed_dim {sp_dim} does not match model hidden_dim {hidden_dim}"
+                ),
+            });
+        }
+        Some((embeds.to_vec(), num_soft))
+    } else {
+        None
+    };
+
+    let num_soft = soft_info.as_ref().map_or(0, |(_, n)| *n);
+    let total_new = num_soft
+        .checked_add(prompt.len())
+        .ok_or(K3Error::ContextLengthExceeded {
+            requested_tokens: usize::MAX,
+            max_context_tokens: ctx.n_ctx(),
+        })?;
+    if total_new == 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: architecture.to_owned(),
+            reason: "prefill prompt_tokens cannot be empty".to_owned(),
+        });
+    }
+    let seq_end = start_pos
+        .checked_add(total_new)
+        .ok_or(K3Error::ContextLengthExceeded {
+            requested_tokens: usize::MAX,
+            max_context_tokens: ctx.n_ctx(),
+        })?;
+    if seq_end > ctx.n_ctx() {
+        return Err(K3Error::ContextLengthExceeded {
+            requested_tokens: seq_end,
+            max_context_tokens: ctx.n_ctx(),
+        });
+    }
+
+    let logits_len = ctx.logits().len();
+    let mut step_idx = 0_usize;
+    if let Some((embeds, n_soft)) = soft_info {
+        for s in 0..n_soft {
+            let mut step_logits = vec![0.0_f32; logits_len];
+            let hidden = embeds[s * hidden_dim..(s + 1) * hidden_dim].to_vec();
+            step_fn(
+                hidden,
+                start_pos + step_idx,
+                seq_end,
+                ctx.kv_cache_mut(),
+                &mut step_logits,
+            )?;
+            if step_idx + 1 == total_new {
+                ctx.logits_mut().copy_from_slice(&step_logits);
+            }
+            step_idx += 1;
+        }
+    }
+
+    for tok in prompt {
+        let mut step_logits = vec![0.0_f32; logits_len];
+        let hidden = embed_token(tok, hidden_dim, weights)?;
+        step_fn(
+            hidden,
+            start_pos + step_idx,
+            seq_end,
+            ctx.kv_cache_mut(),
+            &mut step_logits,
+        )?;
+        if step_idx + 1 == total_new {
+            ctx.logits_mut().copy_from_slice(&step_logits);
+        }
+        step_idx += 1;
+    }
+
+    ctx.advance_position(total_new)?;
+    Ok(())
 }
 
 pub(crate) fn run_prefill_with<F>(

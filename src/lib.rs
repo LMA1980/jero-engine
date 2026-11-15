@@ -14,6 +14,14 @@ pub mod forward;
 #[cfg(feature = "jero-kernels-rvv")]
 pub mod gemma;
 pub mod kv;
+#[cfg(any(
+    feature = "jero-arch-ttm",
+    feature = "jero-arch-ft-transformer",
+    feature = "jero-arch-tabpfn-v2",
+    feature = "jero-arch-decision-transformer",
+    feature = "jero-kernels-rvv",
+))]
+pub mod machine_models;
 pub mod memory;
 #[cfg(feature = "jero-arch-modernbert")]
 pub mod modernbert;
@@ -121,6 +129,24 @@ pub use gemma::{
 
 #[cfg(feature = "jero-kernels-rvv")]
 pub use forward::DebertaV3Recipe;
+#[cfg(feature = "jero-arch-decision-transformer")]
+pub use machine_models::DecisionTransformerRecipe;
+#[cfg(feature = "jero-arch-ft-transformer")]
+pub use machine_models::FtTransformerRecipe;
+#[cfg(feature = "jero-arch-tabpfn-v2")]
+pub use machine_models::TabPfnV2Recipe;
+#[cfg(feature = "jero-arch-ttm")]
+pub use machine_models::TtmRecipe;
+#[cfg(any(
+    feature = "jero-arch-ttm",
+    feature = "jero-arch-ft-transformer",
+    feature = "jero-arch-tabpfn-v2",
+    feature = "jero-arch-decision-transformer",
+    feature = "jero-kernels-rvv",
+))]
+pub use machine_models::{
+    MmprojLatentBridge, forward_with_soft_prompt, project_machine_latent_to_soft_prompt,
+};
 #[cfg(feature = "jero-arch-modernbert")]
 pub use modernbert as arch_modernbert;
 #[cfg(feature = "jero-arch-modernbert")]
@@ -165,26 +191,49 @@ pub const HAS_ARCH_PHI3: bool = cfg!(feature = "jero-arch-phi3");
 /// Indicates whether the `jero-arch-synthetic` architecture recipe feature gate is enabled.
 pub const HAS_ARCH_SYNTHETIC: bool = cfg!(feature = "jero-arch-synthetic");
 
+/// Indicates whether the `jero-arch-ttm` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_TTM: bool = cfg!(feature = "jero-arch-ttm");
+
+/// Indicates whether the `jero-arch-ft-transformer` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_FT_TRANSFORMER: bool = cfg!(feature = "jero-arch-ft-transformer");
+
+/// Indicates whether the `jero-arch-tabpfn-v2` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_TABPFN_V2: bool = cfg!(feature = "jero-arch-tabpfn-v2");
+
+/// Indicates whether the `jero-arch-decision-transformer` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_DECISION_TRANSFORMER: bool = cfg!(feature = "jero-arch-decision-transformer");
+
 /// Indicates whether the `jero-kernels-rvv` RVV 1.0 kernel feature gate is enabled.
 pub const HAS_KERNELS_RVV: bool = cfg!(feature = "jero-kernels-rvv");
 
 #[cfg(test)]
 mod tests {
     use super::{
-        HAS_ARCH_BITNET, HAS_ARCH_DORY, HAS_ARCH_GEMMA, HAS_ARCH_LLAMA, HAS_ARCH_MISTRAL,
-        HAS_ARCH_MODERNBERT, HAS_ARCH_PHI3, HAS_ARCH_SYNTHETIC, HAS_KERNELS_RVV, QuantType,
+        HAS_ARCH_BITNET, HAS_ARCH_DECISION_TRANSFORMER, HAS_ARCH_DORY, HAS_ARCH_FT_TRANSFORMER,
+        HAS_ARCH_GEMMA, HAS_ARCH_LLAMA, HAS_ARCH_MISTRAL, HAS_ARCH_MODERNBERT, HAS_ARCH_PHI3,
+        HAS_ARCH_SYNTHETIC, HAS_ARCH_TABPFN_V2, HAS_ARCH_TTM, HAS_KERNELS_RVV, QuantType,
     };
 
     #[test]
     fn feature_gates_match_cfg() {
         assert_eq!(HAS_ARCH_BITNET, cfg!(feature = "jero-arch-bitnet"));
+        assert_eq!(
+            HAS_ARCH_DECISION_TRANSFORMER,
+            cfg!(feature = "jero-arch-decision-transformer")
+        );
         assert_eq!(HAS_ARCH_DORY, cfg!(feature = "jero-arch-dory"));
+        assert_eq!(
+            HAS_ARCH_FT_TRANSFORMER,
+            cfg!(feature = "jero-arch-ft-transformer")
+        );
         assert_eq!(HAS_ARCH_GEMMA, cfg!(feature = "jero-arch-gemma"));
         assert_eq!(HAS_ARCH_LLAMA, cfg!(feature = "jero-arch-llama"));
         assert_eq!(HAS_ARCH_MISTRAL, cfg!(feature = "jero-arch-mistral"));
         assert_eq!(HAS_ARCH_MODERNBERT, cfg!(feature = "jero-arch-modernbert"));
         assert_eq!(HAS_ARCH_PHI3, cfg!(feature = "jero-arch-phi3"));
         assert_eq!(HAS_ARCH_SYNTHETIC, cfg!(feature = "jero-arch-synthetic"));
+        assert_eq!(HAS_ARCH_TABPFN_V2, cfg!(feature = "jero-arch-tabpfn-v2"));
+        assert_eq!(HAS_ARCH_TTM, cfg!(feature = "jero-arch-ttm"));
         assert_eq!(HAS_KERNELS_RVV, cfg!(feature = "jero-kernels-rvv"));
         assert_eq!(QuantType::Q4_K_M.as_str(), "Q4_K_M");
     }
@@ -212,6 +261,43 @@ mod tests {
             "functiongemma"
         );
         assert_eq!(Gemma4Recipe::new().architecture_id(), "gemma4");
+    }
+
+    #[cfg(all(
+        feature = "jero-arch-ttm",
+        feature = "jero-arch-ft-transformer",
+        feature = "jero-arch-tabpfn-v2",
+        feature = "jero-arch-decision-transformer"
+    ))]
+    #[test]
+    fn arch_machine_models_recipes_wired() {
+        use super::{
+            ArchRecipe, DecisionTransformerRecipe, FtTransformerRecipe, MmprojLatentBridge,
+            TabPfnV2Recipe, TtmRecipe,
+        };
+
+        let ttm = TtmRecipe::new();
+        assert_eq!(ttm.architecture_id(), "ttm");
+        assert!(!ttm.requires_kv_cache());
+
+        let ft = FtTransformerRecipe::new();
+        assert_eq!(ft.architecture_id(), "ft-transformer");
+        assert!(!ft.requires_kv_cache());
+
+        let tabpfn = TabPfnV2Recipe::new();
+        assert_eq!(tabpfn.architecture_id(), "tabpfn-v2");
+        assert!(!tabpfn.requires_kv_cache());
+
+        let dt = DecisionTransformerRecipe::new();
+        assert_eq!(dt.architecture_id(), "decision-transformer");
+        assert!(dt.requires_kv_cache());
+
+        let bridge = MmprojLatentBridge::new("qwen2", "1.0.0", 8, 16, 2);
+        assert!(
+            bridge
+                .verify_target_compatibility("qwen2", "1.0.0", 16)
+                .is_ok()
+        );
     }
 
     #[cfg(feature = "jero-arch-modernbert")]
