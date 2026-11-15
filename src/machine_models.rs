@@ -8,12 +8,19 @@
 //! structured [`K3Error`] rather than synthesizing dummy or identity tensors.
 
 use jero_core::{
-    ArchRecipe, ExecutionContext, GgufFile, GgufValue, K3Error, ModelMetadata, ModelWeights,
-    QuantType, TensorView,
+    ArchRecipe, ExecutionContext, K3Error, ModelMetadata, ModelWeights, QuantType, TensorView,
 };
+#[cfg(any(
+    test,
+    feature = "jero-arch-ttm",
+    feature = "jero-arch-ft-transformer",
+    feature = "jero-arch-tabpfn-v2",
+    feature = "jero-arch-decision-transformer",
+))]
+use jero_core::{GgufFile, GgufValue};
 use jero_kernels_rvv::{dequantize_token_row, gelu_inplace_f32, layernorm_f32};
 
-#[cfg(any(feature = "jero-arch-ft-transformer", feature = "jero-arch-tabpfn-v2",))]
+#[cfg(any(feature = "jero-arch-ft-transformer", feature = "jero-arch-tabpfn-v2"))]
 use jero_kernels_rvv::tokenize_continuous_features_f32;
 #[cfg(feature = "jero-arch-ttm")]
 use jero_kernels_rvv::{
@@ -23,6 +30,12 @@ use jero_kernels_rvv::{
 use jero_kernels_rvv::{TabPfnAttentionAxis, TabPfnAttentionShape, tabpfn_dual_axis_attention_f32};
 
 use crate::gemma::matvec_any;
+#[cfg(any(
+    feature = "jero-arch-ttm",
+    feature = "jero-arch-ft-transformer",
+    feature = "jero-arch-tabpfn-v2",
+    feature = "jero-arch-decision-transformer",
+))]
 use crate::qwen_deepseek::is_supported_quant;
 #[cfg(feature = "jero-arch-decision-transformer")]
 use crate::qwen_deepseek::{
@@ -2330,9 +2343,10 @@ impl DecisionTransformerRecipe {
             || self.num_layers == 0
             || self.n_heads_q == 0
             || self.n_heads_kv == 0
+            || self.n_heads_q % self.n_heads_kv != 0
             || self.head_dim < 2
             || self.head_dim % 2 != 0
-            || self.ffn_dim == 0
+            || self.ffn_dim < 4
             || self.max_ep_len == 0
             || !self.rms_eps.is_finite()
             || self.rms_eps <= 0.0
@@ -2341,7 +2355,7 @@ impl DecisionTransformerRecipe {
         {
             return Err(mismatch_err(
                 "decision-transformer",
-                "invalid DecisionTransformer hyperparameters",
+                "invalid DecisionTransformer hyperparameters (requires hidden_dim >= 4, ffn_dim >= 4, even head_dim >= 2, and n_heads_q divisible by n_heads_kv)",
             ));
         }
         // Fail closed upfront if ANY required weight tensor is missing or wrongly shaped.
@@ -2712,7 +2726,26 @@ impl ArchRecipe for DecisionTransformerRecipe {
 )]
 mod tests {
     use super::*;
-    use crate::capability::{RecipeRegistry, verify_model_capabilities};
+    #[cfg(all(
+        feature = "jero-arch-ttm",
+        feature = "jero-arch-ft-transformer",
+        feature = "jero-arch-tabpfn-v2",
+        feature = "jero-arch-decision-transformer"
+    ))]
+    use crate::capability::RecipeRegistry;
+    #[cfg(any(
+        feature = "jero-arch-ttm",
+        feature = "jero-arch-ft-transformer",
+        feature = "jero-arch-tabpfn-v2",
+        feature = "jero-arch-decision-transformer",
+    ))]
+    use crate::capability::verify_model_capabilities;
+    #[cfg(all(
+        feature = "jero-arch-ttm",
+        feature = "jero-arch-ft-transformer",
+        feature = "jero-arch-tabpfn-v2",
+        feature = "jero-arch-decision-transformer"
+    ))]
     use crate::memory::{architecture_requires_kv_cache, estimate_kv_cache_bytes};
     use crate::qwen_deepseek::Qwen2Recipe;
     use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
@@ -3566,6 +3599,54 @@ mod tests {
         verified.decode_step(&mut ctx, &gguf).expect("dt decode");
         assert_eq!(ctx.position(), 6);
         assert!(ctx.logits().iter().all(|v| v.is_finite()));
+    }
+
+    #[cfg(feature = "jero-arch-decision-transformer")]
+    #[test]
+    fn test_decision_transformer_rejects_small_ffn_dim_and_indivisible_gqa_heads() {
+        let small_ffn = DecisionTransformerRecipe {
+            state_dim: 3,
+            act_dim: 4,
+            hidden_dim: 8,
+            num_layers: 1,
+            n_heads_q: 2,
+            n_heads_kv: 2,
+            head_dim: 4,
+            ffn_dim: 3,
+            max_ep_len: 16,
+            rms_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let bytes = build_dt_gguf(&small_ffn);
+        let gguf = GgufFile::parse(&bytes).unwrap();
+        let traj = [10.0_f32, 0.1, 0.2, 0.3];
+        let mut logits = [0.0_f32; 4];
+        let mut kv_cache = vec![0.0_f32; 64 * 2 * 8 * 2];
+        let mut ctx = ExecutionContext::new(&[1_u32], 64, &mut logits, &mut kv_cache)
+            .unwrap()
+            .with_feature_input(&traj, 1, 4)
+            .unwrap();
+        assert!(matches!(
+            small_ffn.prefill_step(&mut ctx, &gguf),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+
+        let bad_gqa = DecisionTransformerRecipe {
+            n_heads_q: 3,
+            n_heads_kv: 2,
+            ffn_dim: 16,
+            ..small_ffn
+        };
+        let bad_bytes = build_dt_gguf(&bad_gqa);
+        let bad_gguf = GgufFile::parse(&bad_bytes).unwrap();
+        let mut ctx_gqa = ExecutionContext::new(&[1_u32], 64, &mut logits, &mut kv_cache)
+            .unwrap()
+            .with_feature_input(&traj, 1, 4)
+            .unwrap();
+        assert!(matches!(
+            bad_gqa.prefill_step(&mut ctx_gqa, &bad_gguf),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
     }
 
     #[cfg(all(
