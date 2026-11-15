@@ -382,64 +382,203 @@ pub(crate) fn estimate_pure_recurrent_raw_bytes_per_slot(
 /// Counts `(attention_layers, recurrent_layers)` across a hybrid checkpoint using GGUF per-layer
 /// `head_count_kv` arrays or layer tensor names (`blk.{i}.attn_q.weight` vs SSM/shortconv).
 #[must_use]
+const fn even_kv_head_dim(raw: usize) -> usize {
+    let clamped = if raw < 2 { 2 } else { raw };
+    if clamped % 2 == 0 {
+        clamped
+    } else {
+        clamped - 1
+    }
+}
+
+/// Classifies layers `0..num_layers` into compact [`HybridLayerKind`] execution slots by inspecting
+/// GGUF naming across `blk.{i}.attn_q.weight` / `blk.{i}.attn_k.weight`
+/// ([`HybridLayerKind::GqaAttention`]), `blk.{i}.shortconv.*` ([`HybridLayerKind::Lfm2ShortConv`]),
+/// and `blk.{i}.ssm_*` ([`HybridLayerKind::Mamba2Ssd`]). Layers lacking distinguishing tensors
+/// default to [`HybridLayerKind::GqaAttention`] with monotonically assigned compact slot indices.
+pub(crate) fn resolve_hybrid_schedule_by_probe(
+    num_layers: usize,
+    mut contains: impl FnMut(&str) -> bool,
+) -> (Vec<HybridLayerKind>, bool) {
+    let mut schedule = Vec::with_capacity(num_layers);
+    let mut next_kv_slot = 0_usize;
+    let mut next_recurrent_slot = 0_usize;
+    let mut saw_known_tensor = false;
+
+    for layer in 0..num_layers {
+        let is_attn = contains(&format!("blk.{layer}.attn_q.weight"))
+            || contains(&format!("blk.{layer}.attn_k.weight"))
+            || contains(&format!("blk.{layer}.attn_qkv.weight"));
+        if is_attn {
+            saw_known_tensor = true;
+            schedule.push(HybridLayerKind::GqaAttention {
+                kv_layer_slot: next_kv_slot,
+            });
+            next_kv_slot += 1;
+            continue;
+        }
+
+        let is_shortconv = contains(&format!("blk.{layer}.shortconv.conv.weight"))
+            || contains(&format!("blk.{layer}.shortconv.in_proj.weight"))
+            || contains(&format!("blk.{layer}.shortconv.out_proj.weight"))
+            || contains(&format!("blk.{layer}.shortconv_conv.weight"));
+        if is_shortconv {
+            saw_known_tensor = true;
+            schedule.push(HybridLayerKind::Lfm2ShortConv {
+                recurrent_layer_slot: next_recurrent_slot,
+            });
+            next_recurrent_slot += 1;
+            continue;
+        }
+
+        let is_ssm = contains(&format!("blk.{layer}.ssm_in.weight"))
+            || contains(&format!("blk.{layer}.ssm_out.weight"))
+            || contains(&format!("blk.{layer}.ssm_conv1d.weight"));
+        if is_ssm {
+            saw_known_tensor = true;
+            schedule.push(HybridLayerKind::Mamba2Ssd {
+                recurrent_layer_slot: next_recurrent_slot,
+            });
+            next_recurrent_slot += 1;
+            continue;
+        }
+
+        schedule.push(HybridLayerKind::GqaAttention {
+            kv_layer_slot: next_kv_slot,
+        });
+        next_kv_slot += 1;
+    }
+
+    (schedule, saw_known_tensor)
+}
+
+#[must_use]
+pub(crate) fn default_hybrid_layer_schedule(arch: &str, num_layers: usize) -> Vec<HybridLayerKind> {
+    let mut schedule = Vec::with_capacity(num_layers);
+    let mut kv_slot = 0_usize;
+    let mut rec_slot = 0_usize;
+    for idx in 0..num_layers {
+        let is_attn = match arch {
+            "jamba" | "zamba2" => idx % 8 == 4,
+            "granitehybrid" => idx % 8 == 7,
+            "lfm2" | "lfm2moe" => matches!(idx % 16, 2 | 5 | 8 | 10 | 12 | 14),
+            _ => true,
+        };
+        if is_attn {
+            schedule.push(HybridLayerKind::GqaAttention {
+                kv_layer_slot: kv_slot,
+            });
+            kv_slot += 1;
+        } else {
+            let kind = if matches!(arch, "lfm2" | "lfm2moe") {
+                HybridLayerKind::Lfm2ShortConv {
+                    recurrent_layer_slot: rec_slot,
+                }
+            } else {
+                HybridLayerKind::Mamba2Ssd {
+                    recurrent_layer_slot: rec_slot,
+                }
+            };
+            schedule.push(kind);
+            rec_slot += 1;
+        }
+    }
+    schedule
+}
+
+/// Resolves a hybrid layer schedule purely from [`ModelMetadata`] (inspecting tensor descriptors,
+/// `head_count_kv_per_layer`, and canonical per-architecture layer templates).
+#[must_use]
+pub fn resolve_hybrid_layer_schedule_for_metadata(
+    arch: &str,
+    num_layers: usize,
+    metadata: Option<&ModelMetadata>,
+) -> Vec<HybridLayerKind> {
+    if let Some(meta) = metadata {
+        if !meta.tensors().is_empty() {
+            let (by_meta_tensors, saw_known) =
+                resolve_hybrid_schedule_by_probe(num_layers, |name| {
+                    meta.find_tensor(name).is_some()
+                });
+            if saw_known
+                && by_meta_tensors
+                    .iter()
+                    .any(|k| !matches!(k, HybridLayerKind::GqaAttention { .. }))
+            {
+                return by_meta_tensors;
+            }
+        }
+
+        let per_layer_kv = meta.head_count_kv_per_layer();
+        if !per_layer_kv.is_empty() {
+            let mut schedule = Vec::with_capacity(num_layers);
+            let mut next_kv_slot = 0_usize;
+            let mut next_recurrent_slot = 0_usize;
+            let use_shortconv = matches!(arch, "lfm2" | "lfm2moe");
+            for idx in 0..num_layers {
+                let kv_heads = per_layer_kv.get(idx).copied().unwrap_or(0);
+                if kv_heads > 0 {
+                    schedule.push(HybridLayerKind::GqaAttention {
+                        kv_layer_slot: next_kv_slot,
+                    });
+                    next_kv_slot += 1;
+                } else {
+                    let kind = if use_shortconv {
+                        HybridLayerKind::Lfm2ShortConv {
+                            recurrent_layer_slot: next_recurrent_slot,
+                        }
+                    } else {
+                        HybridLayerKind::Mamba2Ssd {
+                            recurrent_layer_slot: next_recurrent_slot,
+                        }
+                    };
+                    schedule.push(kind);
+                    next_recurrent_slot += 1;
+                }
+            }
+            return schedule;
+        }
+    }
+
+    default_hybrid_layer_schedule(arch, num_layers)
+}
+
 pub(crate) fn count_hybrid_schedule_layers(metadata: &ModelMetadata) -> (usize, usize) {
     let total_layers = metadata.layer_count().max(1);
-    let per_layer_kv = metadata.head_count_kv_per_layer();
-    if !per_layer_kv.is_empty() {
-        let mut attn = 0_usize;
-        let mut rec = 0_usize;
-        for idx in 0..total_layers {
-            let kv_heads = per_layer_kv.get(idx).copied().unwrap_or(0);
-            if kv_heads > 0 {
-                attn += 1;
-            } else {
-                rec += 1;
-            }
-        }
-        return (attn, rec);
-    }
+    let schedule = resolve_hybrid_layer_schedule_for_metadata(
+        metadata.architecture(),
+        total_layers,
+        Some(metadata),
+    );
+    let attn = schedule
+        .iter()
+        .filter(|k| matches!(k, HybridLayerKind::GqaAttention { .. }))
+        .count();
+    let rec = schedule.len().saturating_sub(attn);
+    (attn, rec)
+}
 
-    let tensors = metadata.tensors();
-    if !tensors.is_empty() {
-        let mut attn = 0_usize;
-        let mut rec = 0_usize;
-        let mut classified = false;
-        for idx in 0..total_layers {
-            let has_attn = metadata
-                .find_tensor(&format!("blk.{idx}.attn_q.weight"))
-                .is_some()
-                || metadata
-                    .find_tensor(&format!("blk.{idx}.attn_k.weight"))
-                    .is_some();
-            let has_rec = metadata
-                .find_tensor(&format!("blk.{idx}.ssm_in.weight"))
-                .is_some()
-                || metadata
-                    .find_tensor(&format!("blk.{idx}.ssm_out.weight"))
-                    .is_some()
-                || metadata
-                    .find_tensor(&format!("blk.{idx}.shortconv.conv.weight"))
-                    .is_some()
-                || metadata
-                    .find_tensor(&format!("blk.{idx}.shortconv.in_proj.weight"))
-                    .is_some()
-                || metadata
-                    .find_tensor(&format!("blk.{idx}.shortconv_conv.weight"))
-                    .is_some();
-            if has_attn {
-                attn += 1;
-                classified = true;
-            } else if has_rec {
-                rec += 1;
-                classified = true;
-            }
-        }
-        if classified {
-            return (attn, rec);
-        }
+/// Computes the per-layer O(1) recurrent state element count (`f32` elements) shared by
+/// pre-flight arena sizing ([`estimate_hybrid_recurrent_bytes_per_layer`]) and hybrid recipe
+/// execution (`crate::ssm::HybridSsmTransformerRecipe`).
+pub(crate) fn hybrid_recurrent_slot_floats(
+    arch: &str,
+    hidden_dim: usize,
+    d_inner: usize,
+    d_conv: usize,
+    d_state: usize,
+    l_cache: usize,
+) -> Option<usize> {
+    if matches!(arch, "lfm2" | "lfm2moe") {
+        let dim = hidden_dim.max(2);
+        let conv_hist = l_cache.max(2) - 1;
+        dim.checked_mul(conv_hist)
+    } else {
+        let inner = d_inner.max(2);
+        let conv_hist = d_conv.max(2) - 1;
+        let state = d_state.max(1);
+        inner.checked_mul(conv_hist.checked_add(state)?)
     }
-
-    (total_layers, 0)
 }
 
 /// Estimates raw per-layer recurrent state bytes for a hybrid model's SSM or shortconv layers.
@@ -453,24 +592,24 @@ pub(crate) fn estimate_hybrid_recurrent_bytes_per_layer(
         buffer_len: usize::MAX,
         reason: reason.to_owned(),
     };
-    if matches!(metadata.architecture(), "lfm2" | "lfm2moe") {
-        let dim = metadata.embedding_dim().max(1);
-        let l_cache = metadata.shortconv_l_cache().unwrap_or(3).max(1);
-        dim.checked_mul(l_cache)
-            .and_then(|v| v.checked_mul(size_of::<f32>()))
-            .ok_or_else(|| overflow("lfm2 shortconv state bytes overflowed usize"))
+    let arch = metadata.architecture();
+    let default_d_state = if arch == "granitehybrid" { 128 } else { 16 };
+    let hidden_dim = metadata.embedding_dim().max(2);
+    let d_inner = metadata
+        .ssm_inner_size()
+        .unwrap_or_else(|| metadata.embedding_dim().saturating_mul(2))
+        .max(2);
+    let d_conv = metadata.ssm_conv_kernel().unwrap_or(4).max(2);
+    let d_state = metadata.ssm_state_size().unwrap_or(default_d_state).max(1);
+    let l_cache = metadata.shortconv_l_cache().unwrap_or(3).max(2);
+    let err_msg = if matches!(arch, "lfm2" | "lfm2moe") {
+        "lfm2 shortconv state bytes overflowed usize"
     } else {
-        let d_inner = metadata
-            .ssm_inner_size()
-            .unwrap_or_else(|| metadata.embedding_dim().saturating_mul(2))
-            .max(1);
-        let d_conv = metadata.ssm_conv_kernel().unwrap_or(4).max(1);
-        let d_state = metadata.ssm_state_size().unwrap_or(16).max(1);
-        d_inner
-            .checked_mul(d_conv.saturating_add(d_state))
-            .and_then(|v| v.checked_mul(size_of::<f32>()))
-            .ok_or_else(|| overflow("hybrid ssm state bytes overflowed usize"))
-    }
+        "hybrid ssm state bytes overflowed usize"
+    };
+    hybrid_recurrent_slot_floats(arch, hidden_dim, d_inner, d_conv, d_state, l_cache)
+        .and_then(|floats| floats.checked_mul(size_of::<f32>()))
+        .ok_or_else(|| overflow(err_msg))
 }
 
 /// Resolves effective `(head_count_kv, head_dim)` for standard/hybrid KV arena sizing.
@@ -483,7 +622,7 @@ pub(crate) fn infer_kv_head_geom(metadata: &ModelMetadata) -> (usize, usize) {
         .filter(|&v| v > 0)
         .max()
         .unwrap_or_else(|| metadata.head_count_kv().max(1));
-    let head_dim = metadata
+    let raw_head_dim = metadata
         .key_length()
         .unwrap_or_else(|| {
             if metadata.head_count() > 0 {
@@ -493,6 +632,7 @@ pub(crate) fn infer_kv_head_geom(metadata: &ModelMetadata) -> (usize, usize) {
             }
         })
         .max(1);
+    let head_dim = even_kv_head_dim(raw_head_dim);
     (head_count_kv, head_dim)
 }
 

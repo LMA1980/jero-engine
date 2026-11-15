@@ -244,6 +244,9 @@ pub fn lfm2_shortconv_step(
     )
 }
 
+pub use crate::memory::resolve_hybrid_layer_schedule_for_metadata;
+use crate::memory::resolve_hybrid_schedule_by_probe;
+
 /// Classifies layers `0..num_layers` into compact [`HybridLayerKind`] execution slots by inspecting
 /// layer tensor presence on `weights` (`#61`).
 ///
@@ -251,158 +254,12 @@ pub fn lfm2_shortconv_step(
 /// `blk.{i}.shortconv.*` ([`HybridLayerKind::Lfm2ShortConv`]), and `blk.{i}.ssm_*`
 /// ([`HybridLayerKind::Mamba2Ssd`]). Layers lacking distinguishing tensors default to
 /// [`HybridLayerKind::GqaAttention`] with monotonically assigned compact slot indices.
-fn resolve_hybrid_schedule_by_probe(
-    num_layers: usize,
-    mut contains: impl FnMut(&str) -> bool,
-) -> (Vec<HybridLayerKind>, bool) {
-    let mut schedule = Vec::with_capacity(num_layers);
-    let mut next_kv_slot = 0_usize;
-    let mut next_recurrent_slot = 0_usize;
-    let mut saw_known_tensor = false;
-
-    for layer in 0..num_layers {
-        let is_attn = contains(&format!("blk.{layer}.attn_q.weight"))
-            || contains(&format!("blk.{layer}.attn_k.weight"))
-            || contains(&format!("blk.{layer}.attn_qkv.weight"));
-        if is_attn {
-            saw_known_tensor = true;
-            schedule.push(HybridLayerKind::GqaAttention {
-                kv_layer_slot: next_kv_slot,
-            });
-            next_kv_slot += 1;
-            continue;
-        }
-
-        let is_shortconv = contains(&format!("blk.{layer}.shortconv.conv.weight"))
-            || contains(&format!("blk.{layer}.shortconv.in_proj.weight"))
-            || contains(&format!("blk.{layer}.shortconv.out_proj.weight"))
-            || contains(&format!("blk.{layer}.shortconv_conv.weight"));
-        if is_shortconv {
-            saw_known_tensor = true;
-            schedule.push(HybridLayerKind::Lfm2ShortConv {
-                recurrent_layer_slot: next_recurrent_slot,
-            });
-            next_recurrent_slot += 1;
-            continue;
-        }
-
-        let is_ssm = contains(&format!("blk.{layer}.ssm_in.weight"))
-            || contains(&format!("blk.{layer}.ssm_out.weight"))
-            || contains(&format!("blk.{layer}.ssm_conv1d.weight"));
-        if is_ssm {
-            saw_known_tensor = true;
-            schedule.push(HybridLayerKind::Mamba2Ssd {
-                recurrent_layer_slot: next_recurrent_slot,
-            });
-            next_recurrent_slot += 1;
-            continue;
-        }
-
-        schedule.push(HybridLayerKind::GqaAttention {
-            kv_layer_slot: next_kv_slot,
-        });
-        next_kv_slot += 1;
-    }
-
-    (schedule, saw_known_tensor)
-}
-
-pub(crate) fn default_hybrid_layer_schedule(arch: &str, num_layers: usize) -> Vec<HybridLayerKind> {
-    let mut schedule = Vec::with_capacity(num_layers);
-    let mut kv_slot = 0_usize;
-    let mut rec_slot = 0_usize;
-    for idx in 0..num_layers {
-        let is_attn = match arch {
-            "jamba" | "zamba2" => idx % 8 == 4,
-            "granitehybrid" => idx % 8 == 7,
-            "lfm2" | "lfm2moe" => matches!(idx % 16, 2 | 5 | 8 | 10 | 12 | 14),
-            _ => true,
-        };
-        if is_attn {
-            schedule.push(HybridLayerKind::GqaAttention {
-                kv_layer_slot: kv_slot,
-            });
-            kv_slot += 1;
-        } else {
-            let kind = if matches!(arch, "lfm2" | "lfm2moe") {
-                HybridLayerKind::Lfm2ShortConv {
-                    recurrent_layer_slot: rec_slot,
-                }
-            } else {
-                HybridLayerKind::Mamba2Ssd {
-                    recurrent_layer_slot: rec_slot,
-                }
-            };
-            schedule.push(kind);
-            rec_slot += 1;
-        }
-    }
-    schedule
-}
-
 #[must_use]
 pub fn resolve_hybrid_layer_schedule(
     num_layers: usize,
     weights: &dyn ModelWeights,
 ) -> Vec<HybridLayerKind> {
     resolve_hybrid_schedule_by_probe(num_layers, |name| weights.contains_tensor(name)).0
-}
-
-/// Resolves a hybrid layer schedule purely from [`ModelMetadata`] (inspecting tensor descriptors,
-/// `head_count_kv_per_layer`, and canonical per-architecture layer templates).
-#[must_use]
-pub fn resolve_hybrid_layer_schedule_for_metadata(
-    arch: &str,
-    num_layers: usize,
-    metadata: Option<&ModelMetadata>,
-) -> Vec<HybridLayerKind> {
-    if let Some(meta) = metadata {
-        if !meta.tensors().is_empty() {
-            let (by_meta_tensors, saw_known) =
-                resolve_hybrid_schedule_by_probe(num_layers, |name| {
-                    meta.find_tensor(name).is_some()
-                });
-            if saw_known
-                && by_meta_tensors
-                    .iter()
-                    .any(|k| !matches!(k, HybridLayerKind::GqaAttention { .. }))
-            {
-                return by_meta_tensors;
-            }
-        }
-
-        let per_layer_kv = meta.head_count_kv_per_layer();
-        if !per_layer_kv.is_empty() {
-            let mut schedule = Vec::with_capacity(num_layers);
-            let mut next_kv_slot = 0_usize;
-            let mut next_recurrent_slot = 0_usize;
-            let use_shortconv = matches!(arch, "lfm2" | "lfm2moe");
-            for idx in 0..num_layers {
-                let kv_heads = per_layer_kv.get(idx).copied().unwrap_or(0);
-                if kv_heads > 0 {
-                    schedule.push(HybridLayerKind::GqaAttention {
-                        kv_layer_slot: next_kv_slot,
-                    });
-                    next_kv_slot += 1;
-                } else {
-                    let kind = if use_shortconv {
-                        HybridLayerKind::Lfm2ShortConv {
-                            recurrent_layer_slot: next_recurrent_slot,
-                        }
-                    } else {
-                        HybridLayerKind::Mamba2Ssd {
-                            recurrent_layer_slot: next_recurrent_slot,
-                        }
-                    };
-                    schedule.push(kind);
-                    next_recurrent_slot += 1;
-                }
-            }
-            return schedule;
-        }
-    }
-
-    default_hybrid_layer_schedule(arch, num_layers)
 }
 
 /// Resolves a hybrid layer schedule combining tensor inspection with GGUF `head_count_kv_per_layer`
@@ -1674,16 +1531,14 @@ impl HybridSsmTransformerRecipe {
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
         let (pos, seq_len) = step;
-        let tokens_per_layer = seq_len.max(pos + 1);
-        let per_kv_layer_elems = 2 * tokens_per_layer * attn_spec.n_heads_kv * attn_spec.head_dim;
+        let layer_stride = kv_region.len().checked_div(num_kv_layers).unwrap_or(0);
         match kind {
             HybridLayerKind::GqaAttention { kv_layer_slot } => {
                 let layer_kv = if kv_layer_slot < num_kv_layers
-                    && per_kv_layer_elems > 0
-                    && (kv_layer_slot + 1) * per_kv_layer_elems <= kv_region.len()
+                    && layer_stride > 0
+                    && (kv_layer_slot + 1) * layer_stride <= kv_region.len()
                 {
-                    &mut kv_region[kv_layer_slot * per_kv_layer_elems
-                        ..(kv_layer_slot + 1) * per_kv_layer_elems]
+                    &mut kv_region[kv_layer_slot * layer_stride..(kv_layer_slot + 1) * layer_stride]
                 } else {
                     &mut kv_region[..0]
                 };
@@ -1732,10 +1587,85 @@ impl HybridSsmTransformerRecipe {
         }
         Ok(())
     }
+}
+
+/// Partitions a flat hybrid workspace slice into step-invariant paged-KV and ping-pong
+/// recurrent sub-slices whose boundary matches `SingleSlotKvArena::from_gguf`.
+fn partition_hybrid_arena(
+    total_floats: usize,
+    num_kv_layers: usize,
+    num_rec_layers: usize,
+    kv_dim: usize,
+    n_ctx: usize,
+    rec_needed: usize,
+) -> (usize, usize) {
+    if num_kv_layers == 0 {
+        return (0, rec_needed.min(total_floats));
+    }
+    if num_rec_layers == 0 {
+        return (total_floats, total_floats);
+    }
+    let kv_tokens_padded =
+        n_ctx.max(1).div_ceil(crate::memory::KV_BLOCK_SIZE) * crate::memory::KV_BLOCK_SIZE;
+    let arena_kv_floats = num_kv_layers
+        .saturating_mul(2)
+        .saturating_mul(kv_dim)
+        .saturating_mul(kv_tokens_padded);
+    if arena_kv_floats > 0 && total_floats >= arena_kv_floats.saturating_add(rec_needed) {
+        return (arena_kv_floats, arena_kv_floats + rec_needed);
+    }
+    if total_floats > rec_needed && kv_dim > 0 {
+        let kv_avail = total_floats - rec_needed;
+        let kv_slot_unit = num_kv_layers.saturating_mul(2).saturating_mul(kv_dim);
+        let per_layer_kv = if kv_slot_unit > 0 && kv_avail >= kv_slot_unit {
+            (kv_avail / kv_slot_unit) * 2 * kv_dim
+        } else {
+            kv_avail / num_kv_layers
+        };
+        let kv_region_len = per_layer_kv * num_kv_layers;
+        return (
+            kv_region_len,
+            (kv_region_len + rec_needed).min(total_floats),
+        );
+    }
+    (0, total_floats)
+}
+
+impl HybridSsmTransformerRecipe {
+    fn resolve_rec_slot_floats(
+        &self,
+        schedule: &[HybridLayerKind],
+        hidden_dim: usize,
+        dims: (usize, usize, usize, usize),
+    ) -> usize {
+        let (d_inner, d_conv, d_state, l_cache) = dims;
+        let mut slot_floats = crate::memory::hybrid_recurrent_slot_floats(
+            self.architecture_id,
+            hidden_dim,
+            d_inner,
+            d_conv,
+            d_state,
+            l_cache,
+        )
+        .unwrap_or(hidden_dim * (l_cache - 1));
+        if schedule
+            .iter()
+            .any(|k| matches!(k, HybridLayerKind::Mamba2Ssd { .. }))
+        {
+            slot_floats = slot_floats.max(d_inner * (d_conv - 1) + d_inner * d_state);
+        }
+        if schedule
+            .iter()
+            .any(|k| matches!(k, HybridLayerKind::Lfm2ShortConv { .. }))
+        {
+            slot_floats = slot_floats.max(hidden_dim * (l_cache - 1));
+        }
+        slot_floats
+    }
 
     fn execute_hybrid_token<Ffn>(
         &self,
-        step: (u32, usize, usize),
+        step: (u32, usize, usize, usize),
         logits: &mut [f32],
         kv_cache: &mut [f32],
         weights: &dyn ModelWeights,
@@ -1744,7 +1674,7 @@ impl HybridSsmTransformerRecipe {
     where
         Ffn: FnMut(usize, &[f32], &dyn ModelWeights) -> Result<Vec<f32>, K3Error>,
     {
-        let (tok, pos, seq_len) = step;
+        let (tok, pos, seq_len, n_ctx) = step;
         let schedule = self.effective_schedule(weights);
         let hidden_dim = self.hidden_dim.max(2);
         let head_d_even = even_head_dim(self.head_dim);
@@ -1779,13 +1709,15 @@ impl HybridSsmTransformerRecipe {
         let (ssm_heads, ssm_head_dim, n_groups) =
             resolve_divisible_ssm_geometry(d_inner, self.n_heads_q, self.n_groups);
 
-        let has_ssm_layers = schedule
-            .iter()
-            .any(|k| matches!(k, HybridLayerKind::Mamba2Ssd { .. }));
-        let rec_slot_floats = if has_ssm_layers {
-            (d_inner * (d_conv - 1) + d_inner * d_state).max(hidden_dim * (l_cache - 1))
+        let rec_slot_floats = self.resolve_rec_slot_floats(
+            &schedule,
+            hidden_dim,
+            (d_inner, d_conv, d_state, l_cache),
+        );
+        let rec_needed = if num_rec_layers > 0 {
+            RECURRENT_HEADER_FLOATS.saturating_add(2 * num_rec_layers * rec_slot_floats)
         } else {
-            hidden_dim * (l_cache - 1)
+            0
         };
 
         let mut hidden = embed_token(tok, hidden_dim, weights)?;
@@ -1795,11 +1727,18 @@ impl HybridSsmTransformerRecipe {
             }
         }
 
-        let per_kv_layer_elems = 2 * seq_len.max(pos + 1) * n_kv * head_d_even;
-        let kv_region_len = num_kv_layers
-            .saturating_mul(per_kv_layer_elems)
-            .min(kv_cache.len());
-        let (kv_region, rec_region) = kv_cache.split_at_mut(kv_region_len);
+        let kv_dim = n_kv * head_d_even;
+        let (kv_region_len, rec_end) = partition_hybrid_arena(
+            kv_cache.len(),
+            num_kv_layers,
+            num_rec_layers,
+            kv_dim,
+            n_ctx,
+            rec_needed,
+        );
+        let (kv_region, rest) = kv_cache.split_at_mut(kv_region_len);
+        let rec_len = rec_end.saturating_sub(kv_region_len).min(rest.len());
+        let rec_region = &mut rest[..rec_len];
 
         let mut rec_arena =
             PingPongRecurrentArena::open(rec_region, num_rec_layers, rec_slot_floats);
@@ -1862,12 +1801,13 @@ impl ArchRecipe for HybridSsmTransformerRecipe {
     ) -> Result<(), K3Error> {
         let hidden_dim = self.hidden_dim.max(2);
         let ffn_dim = self.ffn_dim.max(4);
+        let n_ctx = ctx.n_ctx();
         run_prefill_with(
             ctx,
             self.architecture_id,
             |tok, pos, seq_len, kv, logits| {
                 self.execute_hybrid_token(
-                    (tok, pos, seq_len),
+                    (tok, pos, seq_len, n_ctx),
                     logits,
                     kv,
                     weights,
@@ -1886,9 +1826,10 @@ impl ArchRecipe for HybridSsmTransformerRecipe {
     ) -> Result<(), K3Error> {
         let hidden_dim = self.hidden_dim.max(2);
         let ffn_dim = self.ffn_dim.max(4);
+        let n_ctx = ctx.n_ctx();
         run_decode_with(ctx, self.architecture_id, |tok, pos, kv, logits| {
             self.execute_hybrid_token(
-                (tok, pos, pos + 1),
+                (tok, pos, pos + 1, n_ctx),
                 logits,
                 kv,
                 weights,
@@ -1980,11 +1921,15 @@ impl ArchRecipe for Lfm2MoeRecipe {
         ctx: &mut ExecutionContext<'_>,
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
+        let n_ctx = ctx.n_ctx();
         run_prefill_with(ctx, "lfm2moe", |tok, pos, seq_len, kv, logits| {
-            self.base
-                .execute_hybrid_token((tok, pos, seq_len), logits, kv, weights, |l, n, w| {
-                    self.execute_layer_ffn(l, n, w)
-                })
+            self.base.execute_hybrid_token(
+                (tok, pos, seq_len, n_ctx),
+                logits,
+                kv,
+                weights,
+                |l, n, w| self.execute_layer_ffn(l, n, w),
+            )
         })
     }
 
@@ -1993,11 +1938,15 @@ impl ArchRecipe for Lfm2MoeRecipe {
         ctx: &mut ExecutionContext<'_>,
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
+        let n_ctx = ctx.n_ctx();
         run_decode_with(ctx, "lfm2moe", |tok, pos, kv, logits| {
-            self.base
-                .execute_hybrid_token((tok, pos, pos + 1), logits, kv, weights, |l, n, w| {
-                    self.execute_layer_ffn(l, n, w)
-                })
+            self.base.execute_hybrid_token(
+                (tok, pos, pos + 1, n_ctx),
+                logits,
+                kv,
+                weights,
+                |l, n, w| self.execute_layer_ffn(l, n, w),
+            )
         })
     }
 }
@@ -2074,7 +2023,6 @@ impl GraniteRecipe {
         let hidden_dim = self.hidden_dim.max(2);
         let head_d_even = even_head_dim(self.head_dim);
         let n_kv = self.n_heads_kv.max(1);
-        let kv_dim = n_kv * head_d_even;
         let num_layers = self.num_layers.max(1);
 
         let attn_spec = DenseAttnLayerSpec {
@@ -2096,17 +2044,15 @@ impl GraniteRecipe {
             }
         }
 
-        let tokens_per_layer = seq_len.max(pos + 1);
-        let per_layer_kv_elems = 2 * tokens_per_layer * kv_dim;
+        let layer_stride = kv_cache.len() / num_layers;
         for layer in 0..num_layers {
             let mut layer_spec = attn_spec;
             layer_spec.use_qkv_bias = weights.contains_tensor(&format!("blk.{layer}.attn_q.bias"));
-            let layer_kv =
-                if per_layer_kv_elems > 0 && (layer + 1) * per_layer_kv_elems <= kv_cache.len() {
-                    &mut kv_cache[layer * per_layer_kv_elems..(layer + 1) * per_layer_kv_elems]
-                } else {
-                    &mut kv_cache[..0]
-                };
+            let layer_kv = if layer_stride > 0 && (layer + 1) * layer_stride <= kv_cache.len() {
+                &mut kv_cache[layer * layer_stride..(layer + 1) * layer_stride]
+            } else {
+                &mut kv_cache[..0]
+            };
             run_dense_attention_sublayer_scaled(
                 layer_spec,
                 layer,
@@ -2681,5 +2627,323 @@ mod tests {
             .expect("lfm2 end-to-end prefill");
         assert_eq!(pos, 2);
         assert!(out_logits.iter().all(|v| v.is_finite()));
+    }
+
+    struct DeterministicTestWeights {
+        tensors: std::collections::BTreeMap<String, (Vec<usize>, Vec<u8>)>,
+        total_bytes: usize,
+    }
+
+    impl DeterministicTestWeights {
+        fn new() -> Self {
+            Self {
+                tensors: std::collections::BTreeMap::new(),
+                total_bytes: 0,
+            }
+        }
+
+        fn insert_f32(&mut self, name: &str, shape: &[usize], values: &[f32]) {
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for &v in values {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            self.total_bytes += bytes.len();
+            self.tensors
+                .insert(name.to_owned(), (shape.to_vec(), bytes));
+        }
+
+        fn fill_pattern(&mut self, name: &str, shape: &[usize], base: f32, step: f32) {
+            let len: usize = shape.iter().product();
+            let vals: Vec<f32> = (0..len)
+                .map(|i| base + f32::from(u16::try_from(i).unwrap_or(u16::MAX)) * step)
+                .collect();
+            self.insert_f32(name, shape, &vals);
+        }
+    }
+
+    impl ModelWeights for DeterministicTestWeights {
+        fn tensor(&self, name: &str) -> Result<TensorView<'_>, K3Error> {
+            let (resolved_name, (shape, bytes)) =
+                self.tensors
+                    .get_key_value(name)
+                    .ok_or_else(|| K3Error::TensorBoundsError {
+                        tensor_name: name.to_owned(),
+                        offset: 0,
+                        byte_len: 0,
+                        buffer_len: self.total_bytes,
+                        reason: format!("missing tensor {name}"),
+                    })?;
+            TensorView::from_bytes(resolved_name.as_str(), QuantType::F32, shape, 0, bytes)
+        }
+
+        fn tensor_count(&self) -> usize {
+            self.tensors.len()
+        }
+
+        fn total_weight_bytes(&self) -> usize {
+            self.total_bytes
+        }
+    }
+
+    fn build_deterministic_kv_and_hybrid_weights(
+        num_layers: usize,
+        kv_dim: usize,
+        hidden: usize,
+        d_inner: usize,
+        vocab: usize,
+    ) -> DeterministicTestWeights {
+        let mut w = DeterministicTestWeights::new();
+        w.fill_pattern("token_embd.weight", &[vocab, hidden], 0.15, 0.05);
+        w.fill_pattern("output.weight", &[vocab, hidden], 0.1, 0.03);
+        for layer in 0..num_layers {
+            let scale = 0.08 * f32::from(u8::try_from(layer + 1).unwrap_or(u8::MAX));
+            w.fill_pattern(
+                &format!("blk.{layer}.attn_q.weight"),
+                &[hidden, hidden],
+                scale,
+                0.02,
+            );
+            w.fill_pattern(
+                &format!("blk.{layer}.attn_k.weight"),
+                &[kv_dim, hidden],
+                scale,
+                0.03,
+            );
+            w.fill_pattern(
+                &format!("blk.{layer}.attn_v.weight"),
+                &[kv_dim, hidden],
+                scale * 1.5,
+                0.02,
+            );
+            w.fill_pattern(
+                &format!("blk.{layer}.attn_output.weight"),
+                &[hidden, hidden],
+                0.05,
+                0.01,
+            );
+            w.fill_pattern(
+                &format!("blk.{layer}.shortconv.in_proj.weight"),
+                &[hidden, hidden],
+                scale,
+                0.01,
+            );
+            w.fill_pattern(
+                &format!("blk.{layer}.shortconv.out_proj.weight"),
+                &[hidden, hidden],
+                scale,
+                0.01,
+            );
+            w.fill_pattern(
+                &format!("blk.{layer}.ssm_in.weight"),
+                &[d_inner * 2, hidden],
+                scale,
+                0.01,
+            );
+            w.fill_pattern(
+                &format!("blk.{layer}.ssm_out.weight"),
+                &[hidden, d_inner],
+                scale,
+                0.01,
+            );
+        }
+        w
+    }
+
+    fn snapshot_kv_layer_pair(
+        arena: &[f32],
+        layer_stride: usize,
+        layer: usize,
+        kv_dim: usize,
+        tokens: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let layer_slice = &arena[layer * layer_stride..(layer + 1) * layer_stride];
+        let half = (layer_slice.len() / (2 * kv_dim)) * kv_dim;
+        let k_prefix = layer_slice[..tokens * kv_dim].to_vec();
+        let v_prefix = layer_slice[half..half + tokens * kv_dim].to_vec();
+        (k_prefix, v_prefix)
+    }
+
+    fn run_granite_decode_trace(prompt: &[u32]) -> Vec<f32> {
+        let kvs = [
+            ("granite.block_count", GgufValue::Uint32(2)),
+            ("granite.embedding_length", GgufValue::Uint32(4)),
+            ("granite.feed_forward_length", GgufValue::Uint32(8)),
+            ("granite.attention.head_count", GgufValue::Uint32(2)),
+            ("granite.attention.head_count_kv", GgufValue::Uint32(1)),
+            ("granite.attention.key_length", GgufValue::Uint32(2)),
+            ("granite.vocab_size", GgufValue::Uint32(8)),
+            ("granite.context_length", GgufValue::Uint32(64)),
+        ];
+        let bytes = create_synthetic_gguf_v3_with_kvs("granite", 64, &kvs, &[]);
+        let gguf = GgufFile::parse(&bytes).expect("parse granite gguf");
+        let recipe = verify_model_capabilities(&gguf).expect("granite capability");
+        let weights = build_deterministic_kv_and_hybrid_weights(2, 2, 4, 4, 8);
+        let mut arena = SingleSlotKvArena::from_gguf(&gguf, 64).expect("granite arena");
+        let mut engine = SinglePromptEngine::new();
+        let (prefill_logits, _, mut pos) = engine
+            .prefill_step_with_pool(&*recipe, &weights, &mut arena, None, prompt, 0, 8)
+            .expect("granite prefill");
+        assert_eq!(pos, prompt.len());
+        assert!(prefill_logits.iter().all(|v| v.is_finite()));
+
+        let layer_stride = arena.as_slice().len() / 2;
+        let initial_l0 = snapshot_kv_layer_pair(arena.as_slice(), layer_stride, 0, 2, prompt.len());
+        let initial_l1 = snapshot_kv_layer_pair(arena.as_slice(), layer_stride, 1, 2, prompt.len());
+        assert!(initial_l0.0.iter().any(|&v| v.abs() > 1e-6));
+        assert!(initial_l0.1.iter().any(|&v| v.abs() > 1e-6));
+        assert_ne!(
+            initial_l0, initial_l1,
+            "layer KV projections must remain distinct"
+        );
+
+        let mut last_decode_logits = Vec::new();
+        for tok in [3_u32, 4, 5] {
+            let (dec_logits, _, next_pos) = engine
+                .decode_step_with_pool(&*recipe, &weights, &mut arena, None, tok, pos, 8)
+                .expect("granite decode step");
+            pos = next_pos;
+            assert!(dec_logits.iter().all(|v| v.is_finite()));
+            assert_eq!(
+                snapshot_kv_layer_pair(arena.as_slice(), layer_stride, 0, 2, prompt.len()),
+                initial_l0,
+                "layer 0 prefill KV corrupted at decode pos={pos}"
+            );
+            assert_eq!(
+                snapshot_kv_layer_pair(arena.as_slice(), layer_stride, 1, 2, prompt.len()),
+                initial_l1,
+                "layer 1 prefill KV corrupted at decode pos={pos}"
+            );
+            last_decode_logits = dec_logits;
+        }
+        assert_eq!(pos, prompt.len() + 3);
+        last_decode_logits
+    }
+
+    #[test]
+    fn test_granite_multilayer_multistep_kv_retention_and_causal_decode() {
+        let logits_a = run_granite_decode_trace(&[1_u32, 2]);
+        let logits_b = run_granite_decode_trace(&[6_u32, 2]);
+        assert_ne!(
+            logits_a, logits_b,
+            "decode logits must depend causally on preserved multi-layer prefill KV state"
+        );
+    }
+
+    #[test]
+    fn test_hybrid_multilayer_multistep_arena_and_recurrent_progression() {
+        for arch in ["lfm2", "lfm2moe", "jamba"] {
+            let kvs = [
+                (
+                    format!("{arch}.attention.head_count_kv"),
+                    GgufValue::Array(GgufArray::Uint32(vec![1, 0, 1, 0])),
+                ),
+                (format!("{arch}.block_count"), GgufValue::Uint32(4)),
+                (format!("{arch}.embedding_length"), GgufValue::Uint32(4)),
+                (format!("{arch}.feed_forward_length"), GgufValue::Uint32(8)),
+                (format!("{arch}.attention.head_count"), GgufValue::Uint32(2)),
+                (format!("{arch}.attention.key_length"), GgufValue::Uint32(2)),
+                (format!("{arch}.ssm.inner_size"), GgufValue::Uint32(4)),
+                (format!("{arch}.ssm.conv_kernel"), GgufValue::Uint32(3)),
+                (format!("{arch}.ssm.state_size"), GgufValue::Uint32(2)),
+                (format!("{arch}.shortconv.l_cache"), GgufValue::Uint32(3)),
+                (format!("{arch}.vocab_size"), GgufValue::Uint32(8)),
+                (format!("{arch}.context_length"), GgufValue::Uint32(64)),
+            ];
+            let kvs_owned: Vec<(&str, GgufValue)> =
+                kvs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            let bytes = create_synthetic_gguf_v3_with_kvs(arch, 64, &kvs_owned, &[]);
+            let gguf = GgufFile::parse(&bytes).expect("parse hybrid gguf");
+            let recipe = verify_model_capabilities(&gguf).expect("hybrid capability");
+            let weights = build_deterministic_kv_and_hybrid_weights(4, 2, 4, 4, 8);
+            let mut arena = SingleSlotKvArena::from_gguf(&gguf, 64).expect("hybrid arena");
+            let mut engine = SinglePromptEngine::new();
+            let (prefill_logits, _, mut pos) = engine
+                .prefill_step_with_pool(&*recipe, &weights, &mut arena, None, &[1_u32, 2], 0, 8)
+                .expect("hybrid prefill");
+            assert_eq!(pos, 2);
+            assert!(prefill_logits.iter().all(|v| v.is_finite()));
+
+            // 2 attention layers * 2 (K,V) * kv_dim(2) * padded_n_ctx(64) = 512 floats.
+            let kv_offset = 2 * 2 * 2 * 64;
+            let kv_stride = kv_offset / 2;
+            assert_eq!(
+                inspect_ping_pong_header(&arena.as_slice()[kv_offset..]),
+                Some((0, 2)),
+                "{arch}: prefill header must start cleanly after fixed KV region"
+            );
+            let init_l0 = snapshot_kv_layer_pair(arena.as_slice(), kv_stride, 0, 2, 2);
+            let init_l1 = snapshot_kv_layer_pair(arena.as_slice(), kv_stride, 1, 2, 2);
+            assert!(init_l0.0.iter().any(|&v| v.abs() > 1e-6));
+            assert_ne!(init_l0, init_l1);
+
+            for (step_idx, tok) in [3_u32, 4, 5].into_iter().enumerate() {
+                let (dec_logits, _, next_pos) = engine
+                    .decode_step_with_pool(&*recipe, &weights, &mut arena, None, tok, pos, 8)
+                    .expect("hybrid decode");
+                pos = next_pos;
+                assert!(dec_logits.iter().all(|v| v.is_finite()));
+                let expected_bank = u32::from((step_idx + 1) % 2 == 1);
+                let expected_step = u32::try_from(pos).unwrap();
+                assert_eq!(
+                    inspect_ping_pong_header(&arena.as_slice()[kv_offset..]),
+                    Some((expected_bank, expected_step)),
+                    "{arch}: ping-pong header must advance monotonically without reset"
+                );
+                assert_eq!(
+                    snapshot_kv_layer_pair(arena.as_slice(), kv_stride, 0, 2, 2),
+                    init_l0
+                );
+                assert_eq!(
+                    snapshot_kv_layer_pair(arena.as_slice(), kv_stride, 1, 2, 2),
+                    init_l1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_hybrid_fallback_schedule_and_footprint_parity() {
+        for arch in ["jamba", "granitehybrid", "lfm2", "lfm2moe"] {
+            let kvs = [
+                (format!("{arch}.block_count"), GgufValue::Uint32(8)),
+                (format!("{arch}.embedding_length"), GgufValue::Uint32(4)),
+                (format!("{arch}.attention.head_count"), GgufValue::Uint32(2)),
+                (
+                    format!("{arch}.attention.head_count_kv"),
+                    GgufValue::Uint32(1),
+                ),
+                (format!("{arch}.attention.key_length"), GgufValue::Uint32(2)),
+                (format!("{arch}.ssm.inner_size"), GgufValue::Uint32(8)),
+                (format!("{arch}.ssm.conv_kernel"), GgufValue::Uint32(3)),
+                (format!("{arch}.ssm.state_size"), GgufValue::Uint32(4)),
+                (format!("{arch}.shortconv.l_cache"), GgufValue::Uint32(3)),
+                (format!("{arch}.context_length"), GgufValue::Uint32(64)),
+            ];
+            let kvs_ref: Vec<(&str, GgufValue)> =
+                kvs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            let bytes = create_synthetic_gguf_v3_with_kvs(arch, 64, &kvs_ref, &[]);
+            let gguf = GgufFile::parse(&bytes).expect("parse fallback hybrid gguf");
+            let meta = gguf.metadata();
+            let schedule = resolve_hybrid_layer_schedule_for_metadata(arch, 8, Some(meta));
+            let expected_attn = schedule
+                .iter()
+                .filter(|k| matches!(k, HybridLayerKind::GqaAttention { .. }))
+                .count();
+            let expected_rec = schedule.len() - expected_attn;
+            assert!(
+                expected_rec > 0,
+                "{arch}: fallback must classify recurrent layers"
+            );
+            assert_eq!(
+                crate::memory::count_hybrid_schedule_layers(meta),
+                (expected_attn, expected_rec)
+            );
+            let slot_bytes =
+                crate::memory::estimate_hybrid_recurrent_bytes_per_layer(meta).expect("slot bytes");
+            assert_eq!(
+                slot_bytes / size_of::<f32>(),
+                crate::memory::hybrid_recurrent_slot_floats(arch, 4, 8, 3, 4, 3).unwrap()
+            );
+        }
     }
 }
