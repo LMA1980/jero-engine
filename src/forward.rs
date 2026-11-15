@@ -50,9 +50,15 @@ pub use crate::gemma::{
 #[cfg(feature = "jero-arch-modernbert")]
 pub use crate::modernbert::ModernBertRecipe;
 
+pub use crate::memory::HybridLayerKind;
 pub use crate::qwen_deepseek::{
     DeepSeek2MlaConfig, DeepSeek2Recipe, Qwen2Recipe, Qwen3MoeRecipe, Qwen3Recipe, Qwen35MoeRecipe,
     Qwen35Recipe,
+};
+pub use crate::ssm::{
+    GraniteRecipe, HybridSsmTransformerRecipe, Lfm2MoeRecipe, Mamba2Recipe, Rwkv7Recipe,
+    lfm2_shortconv_step, resolve_hybrid_layer_schedule,
+    resolve_hybrid_layer_schedule_with_metadata,
 };
 
 /// Canonical vocabulary size for `Dory1.0-4B` parallel LM head row-split (`131,072`).

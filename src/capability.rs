@@ -59,6 +59,32 @@ pub struct GgufHyperparams {
     pub expert_count: Option<usize>,
     /// Optional `MoE` active experts per token (`{arch}.expert_used_count`).
     pub expert_used_count: Option<usize>,
+    /// Optional `MoE` shared expert count (`{arch}.expert_shared_count`).
+    pub expert_shared_count: Option<usize>,
+    /// Optional per-expert `MoE` feed-forward dimension (`{arch}.expert.feed_forward_length`).
+    pub expert_feed_forward_length: Option<usize>,
+    /// Optional Mamba SSM conv1d kernel width (`{arch}.ssm.conv_kernel`).
+    pub ssm_conv_kernel: Option<usize>,
+    /// Optional Mamba SSM inner projection width (`{arch}.ssm.inner_size`).
+    pub ssm_inner_size: Option<usize>,
+    /// Optional Mamba SSM state dimension (`{arch}.ssm.state_size`).
+    pub ssm_state_size: Option<usize>,
+    /// Optional Mamba SSM time-step head count / rank (`{arch}.ssm.time_step_rank`).
+    pub ssm_time_step_rank: Option<usize>,
+    /// Optional Mamba-2 SSM group count (`{arch}.ssm.group_count`).
+    pub ssm_group_count: Option<usize>,
+    /// Optional LFM2 short-convolution cache length (`{arch}.shortconv.l_cache`).
+    pub shortconv_l_cache: Option<usize>,
+    /// Optional RWKV WKV head dimension (`{arch}.wkv.head_size`).
+    pub wkv_head_size: Option<usize>,
+    /// Optional embedding multiplier (`{arch}.embedding_scale`).
+    pub embedding_scale: Option<f32>,
+    /// Optional residual branch multiplier (`{arch}.residual_scale`).
+    pub residual_scale: Option<f32>,
+    /// Optional attention score multiplier (`{arch}.attention.scale`).
+    pub attention_scale: Option<f32>,
+    /// Optional output logit divisor (`{arch}.logit_scale`).
+    pub logit_scale: Option<f32>,
 }
 
 fn find_tensor<'a>(tensors: &'a [TensorDescriptor], name: &str) -> Option<&'a TensorDescriptor> {
@@ -260,6 +286,19 @@ impl GgufHyperparams {
             final_logit_softcapping: metadata.final_logit_softcapping(),
             expert_count: metadata.expert_count(),
             expert_used_count: metadata.expert_used_count(),
+            expert_shared_count: metadata.expert_shared_count(),
+            expert_feed_forward_length: metadata.expert_feed_forward_length(),
+            ssm_conv_kernel: metadata.ssm_conv_kernel(),
+            ssm_inner_size: metadata.ssm_inner_size(),
+            ssm_state_size: metadata.ssm_state_size(),
+            ssm_time_step_rank: metadata.ssm_time_step_rank(),
+            ssm_group_count: metadata.ssm_group_count(),
+            shortconv_l_cache: metadata.shortconv_l_cache(),
+            wkv_head_size: metadata.wkv_head_size(),
+            embedding_scale: metadata.embedding_scale(),
+            residual_scale: metadata.residual_scale(),
+            attention_scale: metadata.attention_scale(),
+            logit_scale: metadata.logit_scale(),
         }
     }
 
@@ -400,7 +439,50 @@ impl GgufHyperparams {
             params.expert_used_count = Some(euc);
         }
 
+        Self::populate_optional_hyperparams_from_gguf(gguf, &arch, &mut params);
         params
+    }
+
+    fn populate_optional_hyperparams_from_gguf(gguf: &GgufFile<'_>, arch: &str, params: &mut Self) {
+        for (slot, keys) in [
+            (
+                &mut params.expert_shared_count,
+                &["expert_shared_count", "expert.shared_count"][..],
+            ),
+            (
+                &mut params.expert_feed_forward_length,
+                &["expert.feed_forward_length", "expert_feed_forward_length"][..],
+            ),
+            (&mut params.ssm_conv_kernel, &["ssm.conv_kernel"][..]),
+            (&mut params.ssm_inner_size, &["ssm.inner_size"][..]),
+            (&mut params.ssm_state_size, &["ssm.state_size"][..]),
+            (&mut params.ssm_time_step_rank, &["ssm.time_step_rank"][..]),
+            (&mut params.ssm_group_count, &["ssm.group_count"][..]),
+            (&mut params.shortconv_l_cache, &["shortconv.l_cache"][..]),
+            (&mut params.wkv_head_size, &["wkv.head_size"][..]),
+        ] {
+            if slot.is_none() {
+                *slot = keys.iter().find_map(|key| {
+                    Self::lookup_arch_value(gguf, arch, key)
+                        .and_then(GgufValue::as_usize)
+                        .filter(|&v| v > 0)
+                });
+            }
+        }
+        for (key, slot) in [
+            ("embedding_scale", &mut params.embedding_scale),
+            ("residual_scale", &mut params.residual_scale),
+            ("attention.scale", &mut params.attention_scale),
+            ("logit_scale", &mut params.logit_scale),
+        ] {
+            if slot.is_none()
+                && let Some(val) = Self::lookup_arch_value(gguf, arch, key)
+                    .and_then(GgufValue::as_f32)
+                    .filter(|v| v.is_finite() && *v > 0.0)
+            {
+                *slot = Some(val);
+            }
+        }
     }
 }
 
@@ -546,8 +628,67 @@ impl RecipeRegistry {
             return Some(&DEBERTA_V3);
         }
 
+        #[cfg(feature = "jero-kernels-rvv")]
+        if let Some(recipe) = Self::find_ssm_or_granite_recipe(architecture) {
+            return Some(recipe);
+        }
+
         let _ = architecture;
         None
+    }
+
+    #[cfg(feature = "jero-kernels-rvv")]
+    fn find_ssm_or_granite_recipe(architecture: &str) -> Option<&'static dyn ArchRecipe> {
+        match architecture {
+            "mamba" => {
+                static MAMBA: crate::ssm::Mamba2Recipe = crate::ssm::Mamba2Recipe::new_mamba();
+                Some(&MAMBA)
+            }
+            "mamba2" => {
+                static MAMBA2: crate::ssm::Mamba2Recipe = crate::ssm::Mamba2Recipe::new();
+                Some(&MAMBA2)
+            }
+            "rwkv6" => {
+                static RWKV6: crate::ssm::Rwkv7Recipe = crate::ssm::Rwkv7Recipe::new_rwkv6();
+                Some(&RWKV6)
+            }
+            "rwkv7" => {
+                static RWKV7: crate::ssm::Rwkv7Recipe = crate::ssm::Rwkv7Recipe::new();
+                Some(&RWKV7)
+            }
+            "jamba" => {
+                static JAMBA: std::sync::LazyLock<crate::ssm::HybridSsmTransformerRecipe> =
+                    std::sync::LazyLock::new(crate::ssm::HybridSsmTransformerRecipe::new_jamba);
+                Some(std::sync::LazyLock::force(&JAMBA))
+            }
+            "zamba2" => {
+                static ZAMBA2: std::sync::LazyLock<crate::ssm::HybridSsmTransformerRecipe> =
+                    std::sync::LazyLock::new(crate::ssm::HybridSsmTransformerRecipe::new_zamba2);
+                Some(std::sync::LazyLock::force(&ZAMBA2))
+            }
+            "granitehybrid" => {
+                static GRANITE_HYBRID: std::sync::LazyLock<crate::ssm::HybridSsmTransformerRecipe> =
+                    std::sync::LazyLock::new(
+                        crate::ssm::HybridSsmTransformerRecipe::new_granitehybrid,
+                    );
+                Some(std::sync::LazyLock::force(&GRANITE_HYBRID))
+            }
+            "lfm2" => {
+                static LFM2: std::sync::LazyLock<crate::ssm::HybridSsmTransformerRecipe> =
+                    std::sync::LazyLock::new(crate::ssm::HybridSsmTransformerRecipe::new_lfm2);
+                Some(std::sync::LazyLock::force(&LFM2))
+            }
+            "lfm2moe" => {
+                static LFM2_MOE: std::sync::LazyLock<crate::ssm::Lfm2MoeRecipe> =
+                    std::sync::LazyLock::new(crate::ssm::Lfm2MoeRecipe::new);
+                Some(std::sync::LazyLock::force(&LFM2_MOE))
+            }
+            "granite" => {
+                static GRANITE: crate::ssm::GraniteRecipe = crate::ssm::GraniteRecipe::new();
+                Some(&GRANITE)
+            }
+            _ => None,
+        }
     }
 
     /// Returns a list of architecture identifiers compiled into the current binary.
@@ -572,6 +713,26 @@ impl RecipeRegistry {
             "qwen35",
             #[cfg(feature = "jero-kernels-rvv")]
             "qwen35moe",
+            #[cfg(feature = "jero-kernels-rvv")]
+            "mamba",
+            #[cfg(feature = "jero-kernels-rvv")]
+            "mamba2",
+            #[cfg(feature = "jero-kernels-rvv")]
+            "rwkv6",
+            #[cfg(feature = "jero-kernels-rvv")]
+            "rwkv7",
+            #[cfg(feature = "jero-kernels-rvv")]
+            "jamba",
+            #[cfg(feature = "jero-kernels-rvv")]
+            "zamba2",
+            #[cfg(feature = "jero-kernels-rvv")]
+            "granitehybrid",
+            #[cfg(feature = "jero-kernels-rvv")]
+            "lfm2",
+            #[cfg(feature = "jero-kernels-rvv")]
+            "lfm2moe",
+            #[cfg(feature = "jero-kernels-rvv")]
+            "granite",
             #[cfg(feature = "jero-arch-mistral")]
             "mistral",
             #[cfg(feature = "jero-arch-mistral")]
@@ -1263,6 +1424,232 @@ impl RecipeRegistry {
     }
 
     #[cfg(feature = "jero-kernels-rvv")]
+    fn hydrate_mamba_recipe(arch: &str, params: &GgufHyperparams) -> Box<dyn ArchRecipe> {
+        let mut recipe = if arch == "mamba" {
+            crate::ssm::Mamba2Recipe::new_mamba()
+        } else {
+            crate::ssm::Mamba2Recipe::new()
+        };
+        if params.block_count > 0 {
+            recipe.num_layers = params.block_count;
+        }
+        if params.embedding_length > 0 {
+            recipe.hidden_dim = params.embedding_length;
+        }
+        if let Some(d_inner) = params.ssm_inner_size {
+            recipe.d_inner = d_inner;
+        } else if params.embedding_length > 0 {
+            recipe.d_inner = params.embedding_length.saturating_mul(2);
+        }
+        if let Some(d_conv) = params.ssm_conv_kernel {
+            recipe.d_conv = d_conv;
+        }
+        if let Some(d_state) = params.ssm_state_size {
+            recipe.d_state = d_state;
+        }
+        if let Some(rank) = params.ssm_time_step_rank {
+            recipe.n_heads = rank;
+        } else if params.head_count > 0 {
+            recipe.n_heads = params.head_count;
+        } else {
+            recipe.n_heads = recipe.n_heads.min(recipe.d_inner.max(1)).max(1);
+        }
+        if let Some(groups) = params.ssm_group_count {
+            recipe.n_groups = groups;
+        }
+        if params.vocab_size > 0 {
+            recipe.vocab_size = params.vocab_size;
+        }
+        if let Some(eps) = params.rms_norm_eps {
+            recipe.rms_eps = eps;
+        }
+        Box::new(recipe)
+    }
+
+    #[cfg(feature = "jero-kernels-rvv")]
+    fn hydrate_rwkv_recipe(arch: &str, params: &GgufHyperparams) -> Box<dyn ArchRecipe> {
+        let mut recipe = if arch == "rwkv6" {
+            crate::ssm::Rwkv7Recipe::new_rwkv6()
+        } else {
+            crate::ssm::Rwkv7Recipe::new()
+        };
+        if params.block_count > 0 {
+            recipe.num_layers = params.block_count;
+        }
+        if params.embedding_length > 0 {
+            recipe.hidden_dim = params.embedding_length;
+        }
+        if params.feed_forward_length > 0 {
+            recipe.ffn_dim = params.feed_forward_length;
+        }
+        if let Some(hs) = params.wkv_head_size {
+            recipe.head_size = hs;
+        }
+        if params.head_count > 0 {
+            recipe.n_heads = params.head_count;
+        } else {
+            recipe.n_heads = (recipe.hidden_dim / recipe.head_size.max(1)).max(1);
+        }
+        if params.vocab_size > 0 {
+            recipe.vocab_size = params.vocab_size;
+        }
+        if let Some(eps) = params.rms_norm_eps {
+            recipe.rms_eps = eps;
+        }
+        Box::new(recipe)
+    }
+
+    #[cfg(feature = "jero-kernels-rvv")]
+    fn hydrate_hybrid_ssm_base(
+        arch: &str,
+        params: &GgufHyperparams,
+        metadata: Option<&ModelMetadata>,
+    ) -> crate::ssm::HybridSsmTransformerRecipe {
+        let mut recipe = match arch {
+            "jamba" => crate::ssm::HybridSsmTransformerRecipe::new_jamba(),
+            "zamba2" => crate::ssm::HybridSsmTransformerRecipe::new_zamba2(),
+            "granitehybrid" => crate::ssm::HybridSsmTransformerRecipe::new_granitehybrid(),
+            "lfm2moe" => {
+                let mut base = crate::ssm::HybridSsmTransformerRecipe::new_lfm2();
+                base.architecture_id = "lfm2moe";
+                base
+            }
+            _ => crate::ssm::HybridSsmTransformerRecipe::new_lfm2(),
+        };
+        let num_layers = if params.block_count > 0 {
+            params.block_count
+        } else {
+            recipe.layer_schedule.len()
+        };
+        recipe.layer_schedule =
+            crate::ssm::resolve_hybrid_layer_schedule_for_metadata(arch, num_layers, metadata);
+        if params.embedding_length > 0 {
+            recipe.hidden_dim = params.embedding_length;
+        }
+        if params.feed_forward_length > 0 {
+            recipe.ffn_dim = params.feed_forward_length;
+        }
+        if params.head_count > 0 {
+            recipe.n_heads_q = params.head_count;
+        }
+        if params.head_count_kv > 0 {
+            recipe.n_heads_kv = params.head_count_kv;
+        } else if let Some(meta) = metadata
+            && let Some(first_kv) = meta
+                .head_count_kv_per_layer()
+                .iter()
+                .copied()
+                .find(|&v| v > 0)
+        {
+            recipe.n_heads_kv = first_kv;
+        }
+        recipe.n_heads_kv = recipe.n_heads_kv.min(recipe.n_heads_q).max(1);
+        recipe.head_dim = Self::infer_qwen_head_dim(params, recipe.head_dim);
+        if let Some(d_inner) = params.ssm_inner_size {
+            recipe.d_inner = d_inner;
+        } else if params.embedding_length > 0 && !matches!(arch, "lfm2" | "lfm2moe") {
+            recipe.d_inner = params.embedding_length.saturating_mul(2);
+        }
+        if let Some(d_conv) = params.ssm_conv_kernel {
+            recipe.d_conv = d_conv;
+        }
+        if let Some(d_state) = params.ssm_state_size {
+            recipe.d_state = d_state;
+        }
+        if let Some(groups) = params.ssm_group_count {
+            recipe.n_groups = groups;
+        }
+        if let Some(l_cache) = params.shortconv_l_cache {
+            recipe.shortconv_l_cache = l_cache;
+        }
+        if params.vocab_size > 0 {
+            recipe.vocab_size = params.vocab_size;
+        }
+        if let Some(eps) = params.rms_norm_eps {
+            recipe.rms_eps = eps;
+        }
+        if let Some(freq) = params.rope_freq_base {
+            recipe.rope_theta = freq;
+        }
+        if let Some(es) = params.embedding_scale {
+            recipe.embedding_scale = es;
+        }
+        if let Some(rs) = params.residual_scale {
+            recipe.residual_scale = rs;
+        }
+        if params.attention_scale.is_some() {
+            recipe.attention_scale = params.attention_scale;
+        }
+        if let Some(ls) = params.logit_scale {
+            recipe.logit_scale = ls;
+        }
+        recipe
+    }
+
+    #[cfg(feature = "jero-kernels-rvv")]
+    fn hydrate_lfm2moe_recipe(
+        params: &GgufHyperparams,
+        metadata: Option<&ModelMetadata>,
+    ) -> Box<dyn ArchRecipe> {
+        let mut recipe = crate::ssm::Lfm2MoeRecipe::new();
+        recipe.base = Self::hydrate_hybrid_ssm_base("lfm2moe", params, metadata);
+        if let Some(ec) = params.expert_count {
+            recipe.num_experts = ec;
+        }
+        if let Some(euc) = params.expert_used_count {
+            recipe.num_experts_per_tok = euc;
+        }
+        if let Some(eff) = params.expert_feed_forward_length {
+            recipe.expert_ffn_dim = eff;
+        }
+        Box::new(recipe)
+    }
+
+    #[cfg(feature = "jero-kernels-rvv")]
+    fn hydrate_granite_recipe(params: &GgufHyperparams) -> Box<dyn ArchRecipe> {
+        let mut recipe = crate::ssm::GraniteRecipe::new();
+        if params.block_count > 0 {
+            recipe.num_layers = params.block_count;
+        }
+        if params.embedding_length > 0 {
+            recipe.hidden_dim = params.embedding_length;
+        }
+        if params.feed_forward_length > 0 {
+            recipe.ffn_dim = params.feed_forward_length;
+        }
+        if params.head_count > 0 {
+            recipe.n_heads_q = params.head_count;
+        }
+        if params.head_count_kv > 0 {
+            recipe.n_heads_kv = params.head_count_kv;
+        }
+        recipe.n_heads_kv = recipe.n_heads_kv.min(recipe.n_heads_q).max(1);
+        recipe.head_dim = Self::infer_qwen_head_dim(params, recipe.head_dim);
+        if params.vocab_size > 0 {
+            recipe.vocab_size = params.vocab_size;
+        }
+        if let Some(eps) = params.rms_norm_eps {
+            recipe.rms_eps = eps;
+        }
+        if let Some(freq) = params.rope_freq_base {
+            recipe.rope_theta = freq;
+        }
+        if let Some(es) = params.embedding_scale {
+            recipe.embedding_scale = es;
+        }
+        if let Some(rs) = params.residual_scale {
+            recipe.residual_scale = rs;
+        }
+        if params.attention_scale.is_some() {
+            recipe.attention_scale = params.attention_scale;
+        }
+        if let Some(ls) = params.logit_scale {
+            recipe.logit_scale = ls;
+        }
+        Box::new(recipe)
+    }
+
+    #[cfg(feature = "jero-kernels-rvv")]
     fn hydrate_qwen_deepseek_recipe(
         params: &GgufHyperparams,
         metadata: Option<&ModelMetadata>,
@@ -1324,6 +1711,13 @@ impl RecipeRegistry {
             "deepseek2" => Some(Self::hydrate_deepseek2_recipe(params, metadata)),
             "qwen35" => Some(Self::hydrate_qwen35_recipe(params, metadata, false)),
             "qwen35moe" => Some(Self::hydrate_qwen35_recipe(params, metadata, true)),
+            "mamba" | "mamba2" => Some(Self::hydrate_mamba_recipe(&params.architecture, params)),
+            "rwkv6" | "rwkv7" => Some(Self::hydrate_rwkv_recipe(&params.architecture, params)),
+            "jamba" | "zamba2" | "granitehybrid" | "lfm2" => Some(Box::new(
+                Self::hydrate_hybrid_ssm_base(&params.architecture, params, metadata),
+            )),
+            "lfm2moe" => Some(Self::hydrate_lfm2moe_recipe(params, metadata)),
+            "granite" => Some(Self::hydrate_granite_recipe(params)),
             _ => None,
         }
     }
@@ -1418,12 +1812,61 @@ fn validate_raw_gguf_hyperparams(gguf: &GgufFile<'_>) -> Result<(), K3Error> {
             reason: format!("{arch}.final_logit_softcapping must be a float"),
         });
     }
+    validate_raw_ssm_and_granite_hyperparams(gguf, arch)?;
     if arch == "dory"
         && let Some(val) = gguf.metadata_value("dory.rope.profile")
     {
         #[cfg(feature = "jero-arch-dory")]
         {
             jero_arch_dory::DoryRecipe::parse_rope_profile(val)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_raw_ssm_and_granite_hyperparams(
+    gguf: &GgufFile<'_>,
+    arch: &str,
+) -> Result<(), K3Error> {
+    for key in [
+        "ssm.conv_kernel",
+        "ssm.inner_size",
+        "ssm.state_size",
+        "ssm.time_step_rank",
+        "ssm.group_count",
+        "shortconv.l_cache",
+        "wkv.head_size",
+    ] {
+        if let Some(val) = GgufHyperparams::lookup_arch_value(gguf, arch, key) {
+            let parsed = val.as_u32().ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: arch.to_owned(),
+                reason: format!("{arch}.{key} must be a positive integer"),
+            })?;
+            if parsed == 0 {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: arch.to_owned(),
+                    reason: format!("{arch}.{key} must be greater than 0"),
+                });
+            }
+        }
+    }
+    for key in [
+        "embedding_scale",
+        "residual_scale",
+        "attention.scale",
+        "logit_scale",
+    ] {
+        if let Some(val) = GgufHyperparams::lookup_arch_value(gguf, arch, key) {
+            let parsed = val.as_f32().ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: arch.to_owned(),
+                reason: format!("{arch}.{key} must be a positive float"),
+            })?;
+            if !parsed.is_finite() || parsed <= 0.0 {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: arch.to_owned(),
+                    reason: format!("{arch}.{key} ({parsed}) must be finite and greater than 0"),
+                });
+            }
         }
     }
     Ok(())
@@ -1499,6 +1942,7 @@ fn validate_hyperparams_invariants(
             ),
         });
     }
+    validate_ssm_and_granite_invariants(params, arch)?;
     if arch == "dory"
         && let Some(dory) = metadata.dory()
         && dory.rope_profile().trim().is_empty()
@@ -1507,6 +1951,44 @@ fn validate_hyperparams_invariants(
             architecture: arch.to_owned(),
             reason: "dory.rope.profile must not be empty".to_owned(),
         });
+    }
+    Ok(())
+}
+
+fn validate_ssm_and_granite_invariants(
+    params: &GgufHyperparams,
+    arch: &str,
+) -> Result<(), K3Error> {
+    for (key, value) in [
+        ("ssm.conv_kernel", params.ssm_conv_kernel),
+        ("ssm.inner_size", params.ssm_inner_size),
+        ("ssm.state_size", params.ssm_state_size),
+        ("ssm.time_step_rank", params.ssm_time_step_rank),
+        ("ssm.group_count", params.ssm_group_count),
+        ("shortconv.l_cache", params.shortconv_l_cache),
+        ("wkv.head_size", params.wkv_head_size),
+    ] {
+        if value == Some(0) {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: arch.to_owned(),
+                reason: format!("{key} for '{arch}' must be greater than 0"),
+            });
+        }
+    }
+    for (key, scale) in [
+        ("embedding_scale", params.embedding_scale),
+        ("residual_scale", params.residual_scale),
+        ("attention.scale", params.attention_scale),
+        ("logit_scale", params.logit_scale),
+    ] {
+        if let Some(v) = scale
+            && (!v.is_finite() || v <= 0.0)
+        {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: arch.to_owned(),
+                reason: format!("{key} ({v}) for '{arch}' must be finite and greater than 0"),
+            });
+        }
     }
     Ok(())
 }
@@ -1667,7 +2149,9 @@ mod tests {
     #[cfg(feature = "jero-arch-modernbert")]
     #[test]
     fn test_modernbert_and_bert_classifier_pass() {
-        use jero_core::ExecutionContext;
+        use jero_core::{
+            ExecutionContext, GgufValue, test_helpers::create_synthetic_gguf_v3_with_kvs,
+        };
 
         for arch in ["modernbert", "bert", "deberta-v3"] {
             let tensor_specs = [
@@ -1675,7 +2159,21 @@ mod tests {
                 ("blk.0.attn_q.weight", QuantType::F32, &[8, 8][..]),
                 ("classifier.weight", QuantType::F32, &[8, 3][..]),
             ];
-            let bytes = create_synthetic_gguf_v3(arch, 64, &tensor_specs);
+            let bytes = if cfg!(miri) {
+                let k_blocks = format!("{arch}.block_count");
+                let k_emb = format!("{arch}.embedding_length");
+                let k_ffn = format!("{arch}.feed_forward_length");
+                let k_heads = format!("{arch}.attention.head_count");
+                let kvs = [
+                    (k_blocks.as_str(), GgufValue::Uint32(1)),
+                    (k_emb.as_str(), GgufValue::Uint32(8)),
+                    (k_ffn.as_str(), GgufValue::Uint32(16)),
+                    (k_heads.as_str(), GgufValue::Uint32(2)),
+                ];
+                create_synthetic_gguf_v3_with_kvs(arch, 64, &kvs, &tensor_specs)
+            } else {
+                create_synthetic_gguf_v3(arch, 64, &tensor_specs)
+            };
             let model = GgufFile::parse(&bytes).expect("parse encoder model");
             let recipe = verify_model_capabilities(&model).expect("encoder capability check");
             assert_eq!(recipe.architecture_id(), arch);
@@ -2239,6 +2737,147 @@ mod tests {
                 RecipeRegistry::find_recipe(arch)
                     .expect("recipe")
                     .supports_quant(QuantType::Q5_0)
+            );
+        }
+    }
+
+    #[test]
+    fn test_ssm_shortconv_wkv_and_granite_hyperparams_extraction() {
+        use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
+
+        let mamba_bytes = create_synthetic_gguf_v3_with_kvs(
+            "mamba2",
+            64,
+            &[
+                ("mamba2.block_count", GgufValue::Uint32(4)),
+                ("mamba2.embedding_length", GgufValue::Uint32(16)),
+                ("mamba2.ssm.inner_size", GgufValue::Uint32(32)),
+                ("mamba2.ssm.conv_kernel", GgufValue::Uint32(4)),
+                ("mamba2.ssm.state_size", GgufValue::Uint32(8)),
+                ("mamba2.ssm.time_step_rank", GgufValue::Uint32(4)),
+                ("mamba2.ssm.group_count", GgufValue::Uint32(2)),
+                ("mamba2.context_length", GgufValue::Uint32(64)),
+            ],
+            &[],
+        );
+        let mamba_gguf = GgufFile::parse(&mamba_bytes).unwrap();
+        let mamba_params = GgufHyperparams::from_gguf(&mamba_gguf);
+        assert_eq!(mamba_params.ssm_inner_size, Some(32));
+        assert_eq!(mamba_params.ssm_conv_kernel, Some(4));
+        assert_eq!(mamba_params.ssm_state_size, Some(8));
+        assert_eq!(mamba_params.ssm_time_step_rank, Some(4));
+        assert_eq!(mamba_params.ssm_group_count, Some(2));
+        assert_eq!(
+            verify_model_capabilities(&mamba_gguf)
+                .expect("mamba2 capability")
+                .architecture_id(),
+            "mamba2"
+        );
+
+        let lfm_bytes = create_synthetic_gguf_v3_with_kvs(
+            "lfm2moe",
+            64,
+            &[
+                ("lfm2moe.block_count", GgufValue::Uint32(2)),
+                ("lfm2moe.embedding_length", GgufValue::Uint32(8)),
+                ("lfm2moe.attention.head_count", GgufValue::Uint32(2)),
+                ("lfm2moe.attention.head_count_kv", GgufValue::Uint32(1)),
+                ("lfm2moe.shortconv.l_cache", GgufValue::Uint32(3)),
+                ("lfm2moe.expert_count", GgufValue::Uint32(8)),
+                ("lfm2moe.expert_used_count", GgufValue::Uint32(2)),
+                ("lfm2moe.expert.feed_forward_length", GgufValue::Uint32(16)),
+                ("lfm2moe.expert_shared_count", GgufValue::Uint32(1)),
+                ("lfm2moe.context_length", GgufValue::Uint32(64)),
+            ],
+            &[],
+        );
+        let lfm_gguf = GgufFile::parse(&lfm_bytes).unwrap();
+        let lfm_params = GgufHyperparams::from_gguf(&lfm_gguf);
+        assert_eq!(lfm_params.shortconv_l_cache, Some(3));
+        assert_eq!(lfm_params.expert_feed_forward_length, Some(16));
+        assert_eq!(lfm_params.expert_shared_count, Some(1));
+        assert_eq!(
+            verify_model_capabilities(&lfm_gguf)
+                .expect("lfm2moe capability")
+                .architecture_id(),
+            "lfm2moe"
+        );
+
+        let rwkv_bytes = create_synthetic_gguf_v3_with_kvs(
+            "rwkv7",
+            64,
+            &[
+                ("rwkv7.block_count", GgufValue::Uint32(2)),
+                ("rwkv7.embedding_length", GgufValue::Uint32(8)),
+                ("rwkv7.wkv.head_size", GgufValue::Uint32(4)),
+                ("rwkv7.context_length", GgufValue::Uint32(64)),
+            ],
+            &[],
+        );
+        let rwkv_gguf = GgufFile::parse(&rwkv_bytes).unwrap();
+        assert_eq!(
+            GgufHyperparams::from_gguf(&rwkv_gguf).wkv_head_size,
+            Some(4)
+        );
+        assert_eq!(
+            verify_model_capabilities(&rwkv_gguf)
+                .expect("rwkv7 capability")
+                .architecture_id(),
+            "rwkv7"
+        );
+    }
+
+    #[test]
+    fn test_ssm_shortconv_wkv_and_granite_hyperparams_rejection() {
+        use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
+
+        for (arch, bad_kv) in [
+            ("mamba2", ("mamba2.ssm.conv_kernel", GgufValue::Uint32(0))),
+            ("lfm2", ("lfm2.shortconv.l_cache", GgufValue::String("bad"))),
+            ("rwkv7", ("rwkv7.wkv.head_size", GgufValue::Uint32(0))),
+            ("granite", ("granite.logit_scale", GgufValue::Float32(0.0))),
+            (
+                "granite",
+                ("granite.residual_scale", GgufValue::Float32(-1.0)),
+            ),
+            (
+                "granite",
+                ("granite.embedding_scale", GgufValue::Float32(f32::NAN)),
+            ),
+            (
+                "granite",
+                ("granite.attention.scale", GgufValue::String("bad")),
+            ),
+        ] {
+            let kvs = [
+                (
+                    match arch {
+                        "mamba2" => "mamba2.block_count",
+                        "lfm2" => "lfm2.block_count",
+                        "rwkv7" => "rwkv7.block_count",
+                        _ => "granite.block_count",
+                    },
+                    GgufValue::Uint32(2),
+                ),
+                (
+                    match arch {
+                        "mamba2" => "mamba2.context_length",
+                        "lfm2" => "lfm2.context_length",
+                        "rwkv7" => "rwkv7.context_length",
+                        _ => "granite.context_length",
+                    },
+                    GgufValue::Uint32(64),
+                ),
+                bad_kv,
+            ];
+            let bytes = create_synthetic_gguf_v3_with_kvs(arch, 64, &kvs, &[]);
+            let gguf = GgufFile::parse(&bytes).unwrap();
+            assert!(
+                matches!(
+                    verify_model_capabilities(&gguf),
+                    Err(K3Error::CapabilityMismatch { .. })
+                ),
+                "expected invalid hyperparameter on {arch} to fail closed"
             );
         }
     }

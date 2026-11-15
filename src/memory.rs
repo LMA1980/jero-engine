@@ -215,6 +215,487 @@ pub fn gemma_layer_kv_policies(
         .collect()
 }
 
+/// Disambiguates per-layer state backing across hybrid SSM/short-conv/attention architectures (`#59`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HybridLayerKind {
+    /// Standard transformer GQA attention layer backed by paged KV cache blocks.
+    GqaAttention {
+        /// Compact attention-only KV layer slot index (`0..num_attention_layers`).
+        kv_layer_slot: usize,
+    },
+    /// Mamba-2 Selective State-Space Duality (SSD) layer backed by O(1) ping-pong recurrent slots.
+    Mamba2Ssd {
+        /// Compact recurrent layer slot index (`0..num_recurrent_layers`).
+        recurrent_layer_slot: usize,
+    },
+    /// `LiquidAI` LFM2 gated causal short-convolution layer backed by O(1) ping-pong recurrent slots.
+    Lfm2ShortConv {
+        /// Compact recurrent layer slot index (`0..num_recurrent_layers`).
+        recurrent_layer_slot: usize,
+    },
+}
+
+/// Computes the combined paged-KV + O(1) double-buffered ping-pong recurrent arena byte budget
+/// for a hybrid [`HybridLayerKind`] schedule (`#62`).
+///
+/// Only [`HybridLayerKind::GqaAttention`] layers scale with `kv_bytes_per_attn_layer`, while
+/// [`HybridLayerKind::Mamba2Ssd`] and [`HybridLayerKind::Lfm2ShortConv`] layers reserve fixed O(1)
+/// dual-bank ping-pong slots sized by `state_bytes_per_ssm_layer` plus the checkpoint header.
+///
+/// # Errors
+///
+/// Returns [`K3Error::CapabilityMismatch`] if `n_ctx == 0`, or [`K3Error::TensorBoundsError`] if
+/// byte accumulation overflows `usize`.
+pub fn estimate_hybrid_ssm_arena_bytes(
+    schedule: &[HybridLayerKind],
+    n_ctx: usize,
+    kv_bytes_per_attn_layer: usize,
+    state_bytes_per_ssm_layer: usize,
+) -> Result<usize, K3Error> {
+    if n_ctx == 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "hybrid".to_owned(),
+            reason: "requested context length n_ctx must be greater than zero".to_owned(),
+        });
+    }
+
+    let mut attn_layers = 0_usize;
+    let mut recurrent_layers = 0_usize;
+    for kind in schedule {
+        match kind {
+            HybridLayerKind::GqaAttention { .. } => attn_layers += 1,
+            HybridLayerKind::Mamba2Ssd { .. } | HybridLayerKind::Lfm2ShortConv { .. } => {
+                recurrent_layers += 1;
+            }
+        }
+    }
+
+    let overflow = |reason: &str| K3Error::TensorBoundsError {
+        tensor_name: "hybrid_ssm_arena".to_owned(),
+        offset: 0,
+        byte_len: 0,
+        buffer_len: usize::MAX,
+        reason: reason.to_owned(),
+    };
+
+    let kv_total = attn_layers
+        .checked_mul(kv_bytes_per_attn_layer)
+        .ok_or_else(|| overflow("hybrid KV bytes overflowed usize"))?;
+
+    let recurrent_total = if recurrent_layers == 0 {
+        0
+    } else {
+        let header_bytes = size_of::<jero_core::RecurrentStateSlotHeader>();
+        let banks_bytes = recurrent_layers
+            .checked_mul(2)
+            .and_then(|slots| slots.checked_mul(state_bytes_per_ssm_layer))
+            .ok_or_else(|| overflow("hybrid dual-bank recurrent bytes overflowed usize"))?;
+        header_bytes
+            .checked_add(banks_bytes)
+            .ok_or_else(|| overflow("hybrid recurrent region bytes overflowed usize"))?
+    };
+
+    kv_total
+        .checked_add(recurrent_total)
+        .ok_or_else(|| overflow("combined hybrid arena bytes overflowed usize"))
+}
+
+/// Returns `true` when `arch` is a pure linear-time SSM/RNN architecture (`mamba`, `mamba2`,
+/// `rwkv6`, `rwkv7`) whose persistent state size is strictly O(1) independent of `n_ctx`.
+#[must_use]
+pub(crate) const fn is_pure_recurrent_arch(arch: &str) -> bool {
+    matches!(arch.as_bytes(), b"mamba" | b"mamba2" | b"rwkv6" | b"rwkv7")
+}
+
+/// Returns `true` when `arch` interleaves attention layers with SSM/short-conv layers (`jamba`,
+/// `zamba2`, `granitehybrid`, `lfm2`, `lfm2moe`).
+#[must_use]
+pub(crate) const fn is_hybrid_ssm_arch(arch: &str) -> bool {
+    matches!(
+        arch.as_bytes(),
+        b"jamba" | b"zamba2" | b"granitehybrid" | b"lfm2" | b"lfm2moe"
+    )
+}
+
+/// Computes single-slot O(1) dual-bank ping-pong recurrent state bytes for pure SSM/RWKV checkpoints.
+pub(crate) fn estimate_pure_recurrent_raw_bytes_per_slot(
+    metadata: &ModelMetadata,
+) -> Result<usize, K3Error> {
+    let arch = metadata.architecture();
+    let num_layers = metadata.layer_count().max(1);
+    let overflow = |reason: &str| K3Error::TensorBoundsError {
+        tensor_name: "recurrent_state_arena".to_owned(),
+        offset: 0,
+        byte_len: 0,
+        buffer_len: usize::MAX,
+        reason: reason.to_owned(),
+    };
+
+    let (conv_bytes_per_layer, ssm_bytes_per_layer) = if matches!(arch, "rwkv6" | "rwkv7") {
+        let dim = metadata.embedding_dim().max(1);
+        let head_size = metadata.wkv_head_size().unwrap_or(64).min(dim).max(1);
+        let n_heads = (dim / head_size).max(1);
+        let conv_bytes = 2_usize
+            .checked_mul(dim)
+            .and_then(|v| v.checked_mul(size_of::<f32>()))
+            .ok_or_else(|| overflow("rwkv token-shift state bytes overflowed usize"))?;
+        let ssm_bytes = n_heads
+            .checked_mul(head_size)
+            .and_then(|v| v.checked_mul(head_size))
+            .and_then(|v| v.checked_mul(size_of::<f32>()))
+            .ok_or_else(|| overflow("rwkv wkv state bytes overflowed usize"))?;
+        (conv_bytes, ssm_bytes)
+    } else {
+        let d_inner = metadata
+            .ssm_inner_size()
+            .unwrap_or_else(|| metadata.embedding_dim().saturating_mul(2))
+            .max(1);
+        let d_conv = metadata.ssm_conv_kernel().unwrap_or(4).max(1);
+        let d_state = metadata.ssm_state_size().unwrap_or(16).max(1);
+        let conv_bytes = d_inner
+            .checked_mul(d_conv)
+            .and_then(|v| v.checked_mul(size_of::<f32>()))
+            .ok_or_else(|| overflow("mamba2 conv state bytes overflowed usize"))?;
+        let ssm_bytes = d_inner
+            .checked_mul(d_state)
+            .and_then(|v| v.checked_mul(size_of::<f32>()))
+            .ok_or_else(|| overflow("mamba2 ssm state bytes overflowed usize"))?;
+        (conv_bytes, ssm_bytes)
+    };
+
+    let per_layer = conv_bytes_per_layer
+        .checked_add(ssm_bytes_per_layer)
+        .ok_or_else(|| overflow("recurrent per-layer state bytes overflowed usize"))?;
+    let bank_bytes = num_layers
+        .checked_mul(per_layer)
+        .ok_or_else(|| overflow("recurrent bank bytes overflowed usize"))?;
+    let header_bytes = size_of::<jero_core::RecurrentStateSlotHeader>();
+    header_bytes
+        .checked_add(
+            bank_bytes
+                .checked_mul(2)
+                .ok_or_else(|| overflow("dual-bank recurrent bytes overflowed usize"))?,
+        )
+        .ok_or_else(|| overflow("total recurrent state bytes overflowed usize"))
+}
+
+/// Counts `(attention_layers, recurrent_layers)` across a hybrid checkpoint using GGUF per-layer
+/// `head_count_kv` arrays or layer tensor names (`blk.{i}.attn_q.weight` vs SSM/shortconv).
+#[must_use]
+const fn even_kv_head_dim(raw: usize) -> usize {
+    let clamped = if raw < 2 { 2 } else { raw };
+    if clamped % 2 == 0 {
+        clamped
+    } else {
+        clamped - 1
+    }
+}
+
+/// Classifies layers `0..num_layers` into compact [`HybridLayerKind`] execution slots by inspecting
+/// GGUF naming across `blk.{i}.attn_q.weight` / `blk.{i}.attn_k.weight`
+/// ([`HybridLayerKind::GqaAttention`]), `blk.{i}.shortconv.*` ([`HybridLayerKind::Lfm2ShortConv`]),
+/// and `blk.{i}.ssm_*` ([`HybridLayerKind::Mamba2Ssd`]). Layers lacking distinguishing tensors
+/// default to [`HybridLayerKind::GqaAttention`] with monotonically assigned compact slot indices.
+pub(crate) fn resolve_hybrid_schedule_by_probe(
+    num_layers: usize,
+    mut contains: impl FnMut(&str) -> bool,
+) -> (Vec<HybridLayerKind>, bool) {
+    let mut schedule = Vec::with_capacity(num_layers);
+    let mut next_kv_slot = 0_usize;
+    let mut next_recurrent_slot = 0_usize;
+    let mut saw_known_tensor = false;
+
+    for layer in 0..num_layers {
+        let is_attn = contains(&format!("blk.{layer}.attn_q.weight"))
+            || contains(&format!("blk.{layer}.attn_k.weight"))
+            || contains(&format!("blk.{layer}.attn_qkv.weight"));
+        if is_attn {
+            saw_known_tensor = true;
+            schedule.push(HybridLayerKind::GqaAttention {
+                kv_layer_slot: next_kv_slot,
+            });
+            next_kv_slot += 1;
+            continue;
+        }
+
+        let is_shortconv = contains(&format!("blk.{layer}.shortconv.conv.weight"))
+            || contains(&format!("blk.{layer}.shortconv.in_proj.weight"))
+            || contains(&format!("blk.{layer}.shortconv.out_proj.weight"))
+            || contains(&format!("blk.{layer}.shortconv_conv.weight"));
+        if is_shortconv {
+            saw_known_tensor = true;
+            schedule.push(HybridLayerKind::Lfm2ShortConv {
+                recurrent_layer_slot: next_recurrent_slot,
+            });
+            next_recurrent_slot += 1;
+            continue;
+        }
+
+        let is_ssm = contains(&format!("blk.{layer}.ssm_in.weight"))
+            || contains(&format!("blk.{layer}.ssm_out.weight"))
+            || contains(&format!("blk.{layer}.ssm_conv1d.weight"));
+        if is_ssm {
+            saw_known_tensor = true;
+            schedule.push(HybridLayerKind::Mamba2Ssd {
+                recurrent_layer_slot: next_recurrent_slot,
+            });
+            next_recurrent_slot += 1;
+            continue;
+        }
+
+        schedule.push(HybridLayerKind::GqaAttention {
+            kv_layer_slot: next_kv_slot,
+        });
+        next_kv_slot += 1;
+    }
+
+    (schedule, saw_known_tensor)
+}
+
+#[must_use]
+pub(crate) fn default_hybrid_layer_schedule(arch: &str, num_layers: usize) -> Vec<HybridLayerKind> {
+    let mut schedule = Vec::with_capacity(num_layers);
+    let mut kv_slot = 0_usize;
+    let mut rec_slot = 0_usize;
+    for idx in 0..num_layers {
+        let is_attn = match arch {
+            "jamba" | "zamba2" => idx % 8 == 4,
+            "granitehybrid" => idx % 8 == 7,
+            "lfm2" | "lfm2moe" => matches!(idx % 16, 2 | 5 | 8 | 10 | 12 | 14),
+            _ => true,
+        };
+        if is_attn {
+            schedule.push(HybridLayerKind::GqaAttention {
+                kv_layer_slot: kv_slot,
+            });
+            kv_slot += 1;
+        } else {
+            let kind = if matches!(arch, "lfm2" | "lfm2moe") {
+                HybridLayerKind::Lfm2ShortConv {
+                    recurrent_layer_slot: rec_slot,
+                }
+            } else {
+                HybridLayerKind::Mamba2Ssd {
+                    recurrent_layer_slot: rec_slot,
+                }
+            };
+            schedule.push(kind);
+            rec_slot += 1;
+        }
+    }
+    schedule
+}
+
+/// Resolves a hybrid layer schedule purely from [`ModelMetadata`] (inspecting tensor descriptors,
+/// `head_count_kv_per_layer`, and canonical per-architecture layer templates).
+#[must_use]
+pub fn resolve_hybrid_layer_schedule_for_metadata(
+    arch: &str,
+    num_layers: usize,
+    metadata: Option<&ModelMetadata>,
+) -> Vec<HybridLayerKind> {
+    if let Some(meta) = metadata {
+        if !meta.tensors().is_empty() {
+            let (by_meta_tensors, saw_known) =
+                resolve_hybrid_schedule_by_probe(num_layers, |name| {
+                    meta.find_tensor(name).is_some()
+                });
+            if saw_known
+                && by_meta_tensors
+                    .iter()
+                    .any(|k| !matches!(k, HybridLayerKind::GqaAttention { .. }))
+            {
+                return by_meta_tensors;
+            }
+        }
+
+        let per_layer_kv = meta.head_count_kv_per_layer();
+        if !per_layer_kv.is_empty() {
+            let mut schedule = Vec::with_capacity(num_layers);
+            let mut next_kv_slot = 0_usize;
+            let mut next_recurrent_slot = 0_usize;
+            let use_shortconv = matches!(arch, "lfm2" | "lfm2moe");
+            for idx in 0..num_layers {
+                let kv_heads = per_layer_kv.get(idx).copied().unwrap_or(0);
+                if kv_heads > 0 {
+                    schedule.push(HybridLayerKind::GqaAttention {
+                        kv_layer_slot: next_kv_slot,
+                    });
+                    next_kv_slot += 1;
+                } else {
+                    let kind = if use_shortconv {
+                        HybridLayerKind::Lfm2ShortConv {
+                            recurrent_layer_slot: next_recurrent_slot,
+                        }
+                    } else {
+                        HybridLayerKind::Mamba2Ssd {
+                            recurrent_layer_slot: next_recurrent_slot,
+                        }
+                    };
+                    schedule.push(kind);
+                    next_recurrent_slot += 1;
+                }
+            }
+            return schedule;
+        }
+    }
+
+    default_hybrid_layer_schedule(arch, num_layers)
+}
+
+pub(crate) fn count_hybrid_schedule_layers(metadata: &ModelMetadata) -> (usize, usize) {
+    let total_layers = metadata.layer_count().max(1);
+    let schedule = resolve_hybrid_layer_schedule_for_metadata(
+        metadata.architecture(),
+        total_layers,
+        Some(metadata),
+    );
+    let attn = schedule
+        .iter()
+        .filter(|k| matches!(k, HybridLayerKind::GqaAttention { .. }))
+        .count();
+    let rec = schedule.len().saturating_sub(attn);
+    (attn, rec)
+}
+
+/// Computes the per-layer O(1) recurrent state element count (`f32` elements) shared by
+/// pre-flight arena sizing ([`estimate_hybrid_recurrent_bytes_per_layer`]) and hybrid recipe
+/// execution (`crate::ssm::HybridSsmTransformerRecipe`).
+pub(crate) fn hybrid_recurrent_slot_floats(
+    arch: &str,
+    hidden_dim: usize,
+    d_inner: usize,
+    d_conv: usize,
+    d_state: usize,
+    l_cache: usize,
+) -> Option<usize> {
+    if matches!(arch, "lfm2" | "lfm2moe") {
+        let dim = hidden_dim.max(2);
+        let conv_hist = l_cache.max(2) - 1;
+        dim.checked_mul(conv_hist)
+    } else {
+        let inner = d_inner.max(2);
+        let conv_hist = d_conv.max(2) - 1;
+        let state = d_state.max(1);
+        inner.checked_mul(conv_hist.checked_add(state)?)
+    }
+}
+
+/// Estimates raw per-layer recurrent state bytes for a hybrid model's SSM or shortconv layers.
+pub(crate) fn estimate_hybrid_recurrent_bytes_per_layer(
+    metadata: &ModelMetadata,
+) -> Result<usize, K3Error> {
+    let overflow = |reason: &str| K3Error::TensorBoundsError {
+        tensor_name: "hybrid_recurrent_state".to_owned(),
+        offset: 0,
+        byte_len: 0,
+        buffer_len: usize::MAX,
+        reason: reason.to_owned(),
+    };
+    let arch = metadata.architecture();
+    let default_d_state = if arch == "granitehybrid" { 128 } else { 16 };
+    let hidden_dim = metadata.embedding_dim().max(2);
+    let d_inner = metadata
+        .ssm_inner_size()
+        .unwrap_or_else(|| metadata.embedding_dim().saturating_mul(2))
+        .max(2);
+    let d_conv = metadata.ssm_conv_kernel().unwrap_or(4).max(2);
+    let d_state = metadata.ssm_state_size().unwrap_or(default_d_state).max(1);
+    let l_cache = metadata.shortconv_l_cache().unwrap_or(3).max(2);
+    let err_msg = if matches!(arch, "lfm2" | "lfm2moe") {
+        "lfm2 shortconv state bytes overflowed usize"
+    } else {
+        "hybrid ssm state bytes overflowed usize"
+    };
+    hybrid_recurrent_slot_floats(arch, hidden_dim, d_inner, d_conv, d_state, l_cache)
+        .and_then(|floats| floats.checked_mul(size_of::<f32>()))
+        .ok_or_else(|| overflow(err_msg))
+}
+
+/// Resolves effective `(head_count_kv, head_dim)` for standard/hybrid KV arena sizing.
+#[must_use]
+pub(crate) fn infer_kv_head_geom(metadata: &ModelMetadata) -> (usize, usize) {
+    let head_count_kv = metadata
+        .head_count_kv_per_layer()
+        .iter()
+        .copied()
+        .filter(|&v| v > 0)
+        .max()
+        .unwrap_or_else(|| metadata.head_count_kv().max(1));
+    let raw_head_dim = metadata
+        .key_length()
+        .unwrap_or_else(|| {
+            if metadata.head_count() > 0 {
+                metadata.embedding_dim() / metadata.head_count()
+            } else {
+                metadata.embedding_dim()
+            }
+        })
+        .max(1);
+    let head_dim = even_kv_head_dim(raw_head_dim);
+    (head_count_kv, head_dim)
+}
+
+/// Estimates raw KV + O(1) recurrent arena bytes for a single slot of a hybrid SSM/attention model.
+pub(crate) fn estimate_hybrid_raw_bytes_per_slot(
+    metadata: &ModelMetadata,
+    n_ctx: usize,
+    blocks_per_slot: usize,
+) -> Result<usize, K3Error> {
+    let (attn_layers, rec_layers) = count_hybrid_schedule_layers(metadata);
+    let (head_count_kv, head_dim) = infer_kv_head_geom(metadata);
+    let kv_tokens =
+        blocks_per_slot
+            .checked_mul(KV_BLOCK_SIZE)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "hybrid kv tokens overflowed usize".to_owned(),
+            })?;
+    let kv_bytes_per_attn_layer = 2_usize
+        .checked_mul(head_count_kv)
+        .and_then(|v| v.checked_mul(head_dim))
+        .and_then(|v| v.checked_mul(kv_tokens))
+        .and_then(|v| v.checked_mul(size_of::<f32>()))
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "hybrid kv per-layer bytes overflowed usize".to_owned(),
+        })?;
+    let state_bytes_per_ssm = if rec_layers == 0 {
+        0
+    } else {
+        estimate_hybrid_recurrent_bytes_per_layer(metadata)?
+    };
+    let mut synthetic_schedule = Vec::with_capacity(attn_layers + rec_layers);
+    for slot in 0..attn_layers {
+        synthetic_schedule.push(HybridLayerKind::GqaAttention {
+            kv_layer_slot: slot,
+        });
+    }
+    for slot in 0..rec_layers {
+        if matches!(metadata.architecture(), "lfm2" | "lfm2moe") {
+            synthetic_schedule.push(HybridLayerKind::Lfm2ShortConv {
+                recurrent_layer_slot: slot,
+            });
+        } else {
+            synthetic_schedule.push(HybridLayerKind::Mamba2Ssd {
+                recurrent_layer_slot: slot,
+            });
+        }
+    }
+    estimate_hybrid_ssm_arena_bytes(
+        &synthetic_schedule,
+        n_ctx,
+        kv_bytes_per_attn_layer,
+        state_bytes_per_ssm,
+    )
+}
+
 /// Estimates exact raw KV cache byte requirements across heterogeneous [`LayerKvPolicy`] layers,
 /// bounding each local sliding-window layer to `min(n_ctx, window_tokens)` tokens.
 ///
@@ -473,6 +954,32 @@ fn estimate_raw_kv_bytes_for_slots(
         return estimate_mla_raw_kv_bytes(metadata, blocks_per_slot, slots);
     }
 
+    if is_pure_recurrent_arch(metadata.architecture()) {
+        let single_slot = estimate_pure_recurrent_raw_bytes_per_slot(metadata)?;
+        return single_slot
+            .checked_mul(slots)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "recurrent_state_arena".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "pure recurrent multi-slot bytes overflowed usize".to_owned(),
+            });
+    }
+
+    if is_hybrid_ssm_arch(metadata.architecture()) {
+        let single_slot = estimate_hybrid_raw_bytes_per_slot(metadata, n_ctx, blocks_per_slot)?;
+        return single_slot
+            .checked_mul(slots)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "hybrid_ssm_arena".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "hybrid multi-slot bytes overflowed usize".to_owned(),
+            });
+    }
+
     let kv_allocated_tokens = blocks_per_slot
         .checked_mul(slots)
         .and_then(|blocks| blocks.checked_mul(KV_BLOCK_SIZE))
@@ -672,29 +1179,33 @@ fn calculate_footprint_inner(
         });
     }
 
-    // 2. Standalone KV cache footprint (16-token blocks scaled by active_slots, page-aligned)
+    // 2. Standalone KV cache / O(1) recurrent state footprint
     let blocks_per_slot = n_ctx.div_ceil(KV_BLOCK_SIZE);
     let slots = active_slots.max(1);
-    let kv_block_count =
-        blocks_per_slot
-            .checked_mul(slots)
-            .ok_or_else(|| K3Error::TensorBoundsError {
-                tensor_name: "kv_cache".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: usize::MAX,
-                reason: "kv block count calculation overflowed usize".to_owned(),
-            })?;
-    let kv_allocated_tokens =
-        kv_block_count
-            .checked_mul(KV_BLOCK_SIZE)
-            .ok_or_else(|| K3Error::TensorBoundsError {
+    let (kv_block_count, kv_allocated_tokens) = if is_pure_recurrent_arch(metadata.architecture()) {
+        (0, 0)
+    } else {
+        let kv_block_count =
+            blocks_per_slot
+                .checked_mul(slots)
+                .ok_or_else(|| K3Error::TensorBoundsError {
+                    tensor_name: "kv_cache".to_owned(),
+                    offset: 0,
+                    byte_len: 0,
+                    buffer_len: usize::MAX,
+                    reason: "kv block count calculation overflowed usize".to_owned(),
+                })?;
+        let kv_allocated_tokens = kv_block_count.checked_mul(KV_BLOCK_SIZE).ok_or_else(|| {
+            K3Error::TensorBoundsError {
                 tensor_name: "kv_cache".to_owned(),
                 offset: 0,
                 byte_len: 0,
                 buffer_len: usize::MAX,
                 reason: "kv allocated tokens overflow usize".to_owned(),
-            })?;
+            }
+        })?;
+        (kv_block_count, kv_allocated_tokens)
+    };
 
     let raw_kv_bytes = estimate_raw_kv_bytes_for_slots(metadata, n_ctx, blocks_per_slot, slots)?;
 
@@ -1265,5 +1776,101 @@ mod tests {
             estimate_mla_kv_cache_bytes(0, 27, 512, 64).is_err(),
             "zero n_ctx must fail closed"
         );
+    }
+
+    #[test]
+    fn test_hybrid_ssm_arena_footprint() {
+        use jero_core::GgufValue;
+        use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
+
+        // 1:7 hybrid model (32 layers: 4 GqaAttention + 28 Mamba2Ssd => ~87.5% KV reduction).
+        let mut schedule_hybrid = Vec::with_capacity(32);
+        let mut kv_slot = 0_usize;
+        let mut ssm_slot = 0_usize;
+        for layer in 0..32_usize {
+            if layer % 8 == 0 {
+                schedule_hybrid.push(HybridLayerKind::GqaAttention {
+                    kv_layer_slot: kv_slot,
+                });
+                kv_slot += 1;
+            } else {
+                schedule_hybrid.push(HybridLayerKind::Mamba2Ssd {
+                    recurrent_layer_slot: ssm_slot,
+                });
+                ssm_slot += 1;
+            }
+        }
+        let schedule_dense: Vec<HybridLayerKind> = (0..32)
+            .map(|slot| HybridLayerKind::GqaAttention {
+                kv_layer_slot: slot,
+            })
+            .collect();
+
+        let kv_bytes_per_attn = 4 * 1024 * 1024;
+        let state_bytes_per_ssm = 8 * 1024;
+        let hybrid_bytes = estimate_hybrid_ssm_arena_bytes(
+            &schedule_hybrid,
+            4096,
+            kv_bytes_per_attn,
+            state_bytes_per_ssm,
+        )
+        .expect("hybrid arena bytes");
+        let dense_bytes = estimate_hybrid_ssm_arena_bytes(
+            &schedule_dense,
+            4096,
+            kv_bytes_per_attn,
+            state_bytes_per_ssm,
+        )
+        .expect("dense arena bytes");
+
+        // Hybrid uses ~12.5-15% of all-attention KV footprint (>=85% saved).
+        assert!(
+            hybrid_bytes * 100 <= dense_bytes * 15,
+            "expected ~85% KV reduction on 1:8 hybrid, got hybrid={hybrid_bytes} dense={dense_bytes}"
+        );
+        assert!(
+            estimate_hybrid_ssm_arena_bytes(
+                &schedule_hybrid,
+                0,
+                kv_bytes_per_attn,
+                state_bytes_per_ssm
+            )
+            .is_err(),
+            "zero n_ctx must fail closed"
+        );
+
+        // Verify pure Mamba-2 & RWKV-7 footprints remain strictly O(1) independent of n_ctx.
+        for (arch, extra_kvs) in [
+            (
+                "mamba2",
+                vec![
+                    ("mamba2.block_count", GgufValue::Uint32(4)),
+                    ("mamba2.embedding_length", GgufValue::Uint32(64)),
+                    ("mamba2.ssm.inner_size", GgufValue::Uint32(128)),
+                    ("mamba2.ssm.conv_kernel", GgufValue::Uint32(4)),
+                    ("mamba2.ssm.state_size", GgufValue::Uint32(16)),
+                    ("mamba2.context_length", GgufValue::Uint32(32768)),
+                ],
+            ),
+            (
+                "rwkv7",
+                vec![
+                    ("rwkv7.block_count", GgufValue::Uint32(4)),
+                    ("rwkv7.embedding_length", GgufValue::Uint32(64)),
+                    ("rwkv7.wkv.head_size", GgufValue::Uint32(16)),
+                    ("rwkv7.context_length", GgufValue::Uint32(32768)),
+                ],
+            ),
+        ] {
+            let bytes = create_synthetic_gguf_v3_with_kvs(arch, 32, &extra_kvs, &[]);
+            let gguf = GgufFile::parse(&bytes).expect("parse pure recurrent gguf");
+            let fp_small = calculate_footprint(gguf.metadata(), 64).expect("footprint n_ctx=64");
+            let fp_large =
+                calculate_footprint(gguf.metadata(), 16_384).expect("footprint n_ctx=16384");
+            assert_eq!(fp_small.kv_block_count, 0);
+            assert_eq!(fp_small.kv_bytes, fp_large.kv_bytes);
+            assert_eq!(fp_small.total_required_bytes, fp_large.total_required_bytes);
+            assert!(fp_small.kv_bytes > 0);
+        }
     }
 }
