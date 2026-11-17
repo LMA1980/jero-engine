@@ -13,21 +13,25 @@
   <a href="https://hook.lma1980.duckdns.org/badges/LMA1980/jero-engine/benchmark.svg" alt="Benchmark"/></a>
 </p>
 
----
+______________________________________________________________________
 
 Low-level compute runtime for the SpacemiT K3 AI platform (16 RISC-V cores, 32GB Unified RAM).
 
 ## Overview
-`jero-engine` implements the high-performance execution engine targeted at `riscv64`:
-- **Compute Kernels**: Unified VLA RVV 1.0 loops with A100 IME acceleration.
-- **Quantization**: Qwen/LLaMA Q4_K_M first.
-- **Synchronization**: Thread group scheduling and diagnostic spikes (`spin`, `futex`, `rayon`).
-- **Memory**: Paged KV cache allocator and eviction engine.
 
-## Architecture & Specifications
-For master architecture and detailed component specifications, see the parent [jero-runner](https://github.com/LMA1980/jero-runner) repository:
-- Master Plan: [PLAN.md](https://github.com/LMA1980/jero-runner/blob/main/PLAN.md)
-- Specs: [specs/runtime/](https://github.com/LMA1980/jero-runner/tree/main/specs/runtime)
+`jero-engine` implements the high-performance execution engine targeted at `riscv64`:
+
+- **Binaries**: `jero-worker` (isolated inference worker) and `jero-diag` (hardware/kernel diagnostic harness, gated on `jero-kernels-rvv`).
+- **Compute Kernels**: Unified VLA RVV 1.0 loops with A100 IME acceleration via `jero-kernels-rvv`.
+- **Architecture Recipes**: Wired `jero-arch-*` crates (`synthetic`, `llama`, `mistral`, `phi3`, `bitnet`, `dory`) alongside built-in `gemma` (`gemma2`, `gemma3`, `gemma4`, `functiongemma`), `modernbert`, `qwen_deepseek` (`qwen2`, `qwen3`, `qwen3moe`, `deepseek2`, `qwen35`, `qwen35moe`), `deberta-v3`, `ssm`, and `machine_models` (`ttm`, `ft-transformer`, `tabpfn-v2`, `decision-transformer`) recipes.
+- **Synchronization**: Thread-group scheduling and diagnostic barriers (`SpinBarrier`, `FutexBarrier`, `WorkerPool`).
+- **Memory**: Single-slot KV arena views, sliding-window KV slicing, and `RLIMIT_MEMLOCK` admission checks.
+
+## Ecosystem & Documentation
+
+- **Public Documentation Portal**: [`lma1980.github.io/model-runner`](https://github.com/LMA1980/lma1980.github.io/tree/main/model-runner) ([Reference Manual](https://github.com/LMA1980/lma1980.github.io/blob/main/model-runner/manual.md), [Crate Docs](https://github.com/LMA1980/lma1980.github.io/tree/main/model-runner/docs/crates))
+- **Upstream Dependencies**: [`jero-core`](https://github.com/LMA1980/jero-core), [`jero-kernels-rvv`](https://github.com/LMA1980/jero-kernels-rvv), [`jero-tokenizer`](https://github.com/LMA1980/jero-tokenizer), [`jero-arch-synthetic`](https://github.com/LMA1980/jero-arch-synthetic), [`jero-arch-llama`](https://github.com/LMA1980/jero-arch-llama), [`jero-arch-mistral`](https://github.com/LMA1980/jero-arch-mistral), [`jero-arch-phi3`](https://github.com/LMA1980/jero-arch-phi3), [`jero-arch-bitnet`](https://github.com/LMA1980/jero-arch-bitnet), and [`jero-arch-dory`](https://github.com/LMA1980/jero-arch-dory)
+- **Companion Runtime Crates**: [`jero-kv-cache`](https://github.com/LMA1980/jero-kv-cache) and [`jero-manager`](https://github.com/LMA1980/jero-manager)
 
 ## License
 
