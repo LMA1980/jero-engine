@@ -508,9 +508,6 @@ impl std::str::FromStr for ClusterPhasePolicy {
 #[must_use]
 pub fn has_a100_ime_for_mask(online_cpu_mask: u64) -> bool {
     let a100_mask = online_cpu_mask & A100_CLUSTER_MASK;
-    if a100_mask == 0 {
-        return false;
-    }
     #[cfg(all(
         target_os = "linux",
         target_arch = "riscv64",
@@ -518,6 +515,9 @@ pub fn has_a100_ime_for_mask(online_cpu_mask: u64) -> bool {
         feature = "jero-kernels-rvv"
     ))]
     {
+        if a100_mask == 0 {
+            return false;
+        }
         if std::env::var_os("K3_CPU_ONLINE_MASK").is_some()
             || std::env::var_os("K3_SIMULATE_A100").is_some()
         {
@@ -536,7 +536,7 @@ pub fn has_a100_ime_for_mask(online_cpu_mask: u64) -> bool {
         feature = "jero-kernels-rvv"
     )))]
     {
-        true
+        a100_mask != 0
     }
 }
 
