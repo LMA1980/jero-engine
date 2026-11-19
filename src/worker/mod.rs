@@ -1,4 +1,4 @@
-//! `k3-worker`: Isolated compute worker library and runtime for the `SpacemiT` K3 platform.
+//! `jero-engine`: Isolated compute worker library and runtime for the `SpacemiT` K3 platform.
 //!
 //! Provides CLI parsing, memory-locked read-only weight mapping, cluster affinity pinning
 //! with conditional `/proc/set_ai_thread` registration, and zero-copy forward pass dispatch

@@ -1,5 +1,5 @@
 //! Read-only memory-mapped, GGUF-validated, and `mlock`-backed model weights management
-//! for `k3-worker`.
+//! for `jero-engine`.
 //!
 //! Unifies worker weight admission with [`LockedModelWeights`], `CapabilityVerifier`
 //! (`verify_model_capabilities`), bounded `RLIMIT_MEMLOCK` admission checks
@@ -22,7 +22,7 @@ use crate::weights::{LockedModelWeights, ModelView, RepackSummary};
 
 use super::error::WorkerError;
 
-/// Admitted, read-only memory-mapped, and locked GGUF model weights for `k3-worker`.
+/// Admitted, read-only memory-mapped, and locked GGUF model weights for `jero-engine`.
 #[derive(Debug)]
 pub struct LockedWeights {
     inner: LockedModelWeights,

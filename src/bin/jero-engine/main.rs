@@ -1,4 +1,4 @@
-//! Standalone binary for `k3-worker`: Isolated compute worker for the `SpacemiT` K3 platform.
+//! Standalone binary for `jero-engine`: Isolated compute worker for the `SpacemiT` K3 platform.
 //!
 //! Executes forward passes with zero-copy shared memory tensor dispatch,
 //! enforces read-only model weight residency with advisory locking (`flock(LOCK_SH)`),
@@ -33,15 +33,15 @@ async fn main() -> ExitCode {
         Ok(Some(cfg)) => cfg,
         Ok(None) => return ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("[k3-worker error] {err}");
-            eprintln!("Run 'k3-worker --help' for usage information.");
+            eprintln!("[jero-engine error] {err}");
+            eprintln!("Run 'jero-engine --help' for usage information.");
             return ExitCode::from(EXIT_INVALID_ARGS as u8);
         }
     };
 
     if config.verbose {
         eprintln!(
-            "[k3-worker] starting worker: model={}, cluster={}, threads={:?}, affinity={:?}",
+            "[jero-engine] starting worker: model={}, cluster={}, threads={:?}, affinity={:?}",
             config.model_path.display(),
             config.cluster,
             config.threads,
@@ -56,7 +56,7 @@ async fn main() -> ExitCode {
         config.threads,
         env::var("K3_SIMULATE_A100").ok().as_deref(),
     ) {
-        eprintln!("[k3-worker error] capability verification failed: {e}");
+        eprintln!("[jero-engine error] capability verification failed: {e}");
         return ExitCode::from(e.exit_code() as u8);
     }
 
@@ -64,14 +64,14 @@ async fn main() -> ExitCode {
     let weights = match LockedWeights::open(&config.model_path) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("[k3-worker error] failed to load model weights: {e}");
+            eprintln!("[jero-engine error] failed to load model weights: {e}");
             return ExitCode::from(e.exit_code() as u8);
         }
     };
 
     if config.verbose {
         eprintln!(
-            "[k3-worker] model weights mapped successfully: {} bytes (mlocked: {})",
+            "[jero-engine] model weights mapped successfully: {} bytes (mlocked: {})",
             weights.len(),
             weights.is_locked()
         );
@@ -82,7 +82,7 @@ async fn main() -> ExitCode {
         match parse_affinity_spec(spec) {
             Ok((_, mask)) => mask,
             Err(e) => {
-                eprintln!("[k3-worker error] invalid affinity spec: {e}");
+                eprintln!("[jero-engine error] invalid affinity spec: {e}");
                 return ExitCode::from(EXIT_INVALID_ARGS as u8);
             }
         }
@@ -97,12 +97,12 @@ async fn main() -> ExitCode {
         // SAFETY: Scalar-only thread pinning routine avoids scalable vector register spills.
         let pin_res = unsafe { pin_worker_core(primary_core) };
         if let Err(e) = pin_res {
-            eprintln!("[k3-worker error] failed to pin thread to core {primary_core}: {e}");
+            eprintln!("[jero-engine error] failed to pin thread to core {primary_core}: {e}");
             return ExitCode::from(e.exit_code() as u8);
         }
         if config.verbose {
             eprintln!(
-                "[k3-worker] pinned primary thread to core {primary_core} (mask: 0x{compute_mask:04X})"
+                "[jero-engine] pinned primary thread to core {primary_core} (mask: 0x{compute_mask:04X})"
             );
         }
     }
@@ -120,19 +120,22 @@ async fn main() -> ExitCode {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!(
-                        "[k3-worker error] failed to bind socket {}: {e}",
+                        "[jero-engine error] failed to bind socket {}: {e}",
                         path.display()
                     );
                     return ExitCode::from(EXIT_PROTOCOL_ERROR as u8);
                 }
             };
             if config.verbose {
-                eprintln!("[k3-worker] listening on {}", path.display());
+                eprintln!("[jero-engine] listening on {}", path.display());
             }
             match listener.accept() {
                 Ok((s, _)) => s,
                 Err(e) => {
-                    eprintln!("[k3-worker error] accept failed on {}: {e}", path.display());
+                    eprintln!(
+                        "[jero-engine error] accept failed on {}: {e}",
+                        path.display()
+                    );
                     return ExitCode::from(EXIT_PROTOCOL_ERROR as u8);
                 }
             }
@@ -156,7 +159,7 @@ async fn main() -> ExitCode {
                             Ok(l) => l,
                             Err(e) => {
                                 eprintln!(
-                                    "[k3-worker error] failed to connect or bind socket {}: {e}",
+                                    "[jero-engine error] failed to connect or bind socket {}: {e}",
                                     path.display()
                                 );
                                 return ExitCode::from(EXIT_PROTOCOL_ERROR as u8);
@@ -166,7 +169,7 @@ async fn main() -> ExitCode {
                             Ok((s, _)) => s,
                             Err(e) => {
                                 eprintln!(
-                                    "[k3-worker error] accept failed on {}: {e}",
+                                    "[jero-engine error] accept failed on {}: {e}",
                                     path.display()
                                 );
                                 return ExitCode::from(EXIT_PROTOCOL_ERROR as u8);
@@ -174,7 +177,7 @@ async fn main() -> ExitCode {
                         }
                     } else {
                         eprintln!(
-                            "[k3-worker error] failed to connect to socket {}",
+                            "[jero-engine error] failed to connect to socket {}",
                             path.display()
                         );
                         return ExitCode::from(EXIT_PROTOCOL_ERROR as u8);
@@ -191,7 +194,7 @@ async fn main() -> ExitCode {
     {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[k3-worker error] failed to register SIGINT handler: {e}");
+            eprintln!("[jero-engine error] failed to register SIGINT handler: {e}");
             return ExitCode::from(EXIT_PROTOCOL_ERROR as u8);
         }
     };
@@ -200,7 +203,7 @@ async fn main() -> ExitCode {
     {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[k3-worker error] failed to register SIGTERM handler: {e}");
+            eprintln!("[jero-engine error] failed to register SIGTERM handler: {e}");
             return ExitCode::from(EXIT_PROTOCOL_ERROR as u8);
         }
     };
@@ -208,7 +211,7 @@ async fn main() -> ExitCode {
     let mut engine = match WorkerEngine::try_new(config, weights) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("[k3-worker error] failed to initialize engine: {e}");
+            eprintln!("[jero-engine error] failed to initialize engine: {e}");
             return ExitCode::from(e.exit_code() as u8);
         }
     };
@@ -218,22 +221,22 @@ async fn main() -> ExitCode {
 
     tokio::select! {
         _ = sigint.recv() => {
-            eprintln!("[k3-worker] received SIGINT (Ctrl+C), clean exit");
+            eprintln!("[jero-engine] received SIGINT (Ctrl+C), clean exit");
             std::process::exit(0);
         }
         _ = sigterm.recv() => {
-            eprintln!("[k3-worker] received SIGTERM, clean exit");
+            eprintln!("[jero-engine] received SIGTERM, clean exit");
             std::process::exit(0);
         }
         res = worker_task => {
             match res {
                 Ok(Ok(())) => ExitCode::SUCCESS,
                 Ok(Err(err)) => {
-                    eprintln!("[k3-worker error] event loop failed: {err}");
+                    eprintln!("[jero-engine error] event loop failed: {err}");
                     ExitCode::from(err.exit_code() as u8)
                 }
                 Err(e) => {
-                    eprintln!("[k3-worker error] worker task panicked: {e}");
+                    eprintln!("[jero-engine error] worker task panicked: {e}");
                     ExitCode::from(EXIT_PROTOCOL_ERROR as u8)
                 }
             }

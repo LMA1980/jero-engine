@@ -1,4 +1,4 @@
-//! Standardized error types and process exit code mappings for `k3-worker`.
+//! Standardized error types and process exit code mappings for `jero-engine`.
 
 use std::fmt;
 use std::io;
