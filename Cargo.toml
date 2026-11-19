@@ -24,8 +24,12 @@ path = "src/bin/jero-diag/main.rs"
 required-features = ["jero-kernels-rvv"]
 
 [[bin]]
+name = "jero-engine"
+path = "src/bin/jero-engine/main.rs"
+
+[[bin]]
 name = "jero-worker"
-path = "src/bin/jero-worker/main.rs"
+path = "src/bin/jero-engine/main.rs"
 
 [[test]]
 name = "empirical_challenge_m4_bounds"

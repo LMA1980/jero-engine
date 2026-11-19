@@ -61,7 +61,7 @@ pub fn encode_slab_stop_reason(hdr: &mut OutputSlabHeader, stop_reason: Option<S
     }
 }
 
-/// Decodes a [`StopReason`] previously written to [`OutputSlabHeader::_reserved`] by `jero-worker`.
+/// Decodes a [`StopReason`] previously written to [`OutputSlabHeader::_reserved`] by `jero-engine` (Phase 1 alias `jero-worker`).
 #[must_use]
 pub fn decode_slab_stop_reason(hdr: &OutputSlabHeader) -> Option<StopReason> {
     if hdr._reserved[0..4] != SLAB_STOP_MAGIC {
@@ -334,7 +334,7 @@ impl WorkerEngine {
                 Ok(res) => res,
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                     if self.config.verbose {
-                        eprintln!("[k3-worker] supervisor disconnected (EOF), exiting cleanly");
+                        eprintln!("[jero-engine] supervisor disconnected (EOF), exiting cleanly");
                     }
                     return Ok(());
                 }
@@ -362,7 +362,7 @@ impl WorkerEngine {
 
                     if self.config.verbose {
                         eprintln!(
-                            "[k3-worker] received AttachArenaCommand: id={}, bytes={}, n_ctx={}, blocks={}",
+                            "[jero-engine] received AttachArenaCommand: id={}, bytes={}, n_ctx={}, blocks={}",
                             cmd.arena_id, cmd.arena_bytes, cmd.n_ctx, cmd.max_blocks
                         );
                     }
@@ -405,7 +405,7 @@ impl WorkerEngine {
 
                     if self.config.verbose {
                         eprintln!(
-                            "[k3-worker] executing ForwardPassCommand: req={}, seq={}, offset={}, count={}, prefill={}",
+                            "[jero-engine] executing ForwardPassCommand: req={}, seq={}, offset={}, count={}, prefill={}",
                             cmd.request_id,
                             cmd.sequence_id,
                             cmd.token_offset,
@@ -691,7 +691,7 @@ impl WorkerEngine {
                 // Type ID 206: ShutdownCommand
                 206 => {
                     if self.config.verbose {
-                        eprintln!("[k3-worker] received ShutdownCommand, terminating cleanly");
+                        eprintln!("[jero-engine] received ShutdownCommand, terminating cleanly");
                     }
                     return Ok(());
                 }

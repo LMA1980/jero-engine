@@ -271,7 +271,7 @@ fn test_e2e_worker_engine_socket_loop_and_zerocopy_dispatch() {
 
 #[test]
 fn test_e2e_worker_subprocess_lifecycle_and_shutdown() {
-    let bin_path = env!("CARGO_BIN_EXE_jero-worker");
+    let bin_path = env!("CARGO_BIN_EXE_jero-engine");
 
     // 1. Prepare miniature valid GGUF v3 model file
     let model_path = std::env::temp_dir().join("k3_worker_e2e_subproc_model.gguf");
@@ -601,7 +601,7 @@ fn test_e2e_worker_binary_llama_ipc_matches_single_prompt_engine_bit_for_bit() {
     };
     arena.as_mut_slice()[..size_of::<ArenaHeader>()].copy_from_slice(IntoBytes::as_bytes(&header));
 
-    let worker_bin = env!("CARGO_BIN_EXE_jero-worker");
+    let worker_bin = env!("CARGO_BIN_EXE_jero-engine");
     let mut child = Command::new(worker_bin)
         .args([
             "--model",

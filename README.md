@@ -21,7 +21,7 @@ Low-level compute runtime for the SpacemiT K3 AI platform (16 RISC-V cores, 32GB
 
 `jero-engine` implements the high-performance execution engine targeted at `riscv64`:
 
-- **Binaries**: `jero-worker` (isolated inference worker) and `jero-diag` (hardware/kernel diagnostic harness, gated on `jero-kernels-rvv`).
+- **Binaries**: `jero-engine` (isolated inference worker; Phase 1 alias `jero-worker`) and `jero-diag` (hardware/kernel diagnostic harness, gated on `jero-kernels-rvv`).
 - **Compute Kernels**: Unified VLA RVV 1.0 loops with A100 IME acceleration via `jero-kernels-rvv`.
 - **Architecture Recipes**: Wired `jero-arch-*` crates (`synthetic`, `llama`, `mistral`, `phi3`, `bitnet`, `dory`) alongside built-in `gemma` (`gemma2`, `gemma3`, `gemma4`, `functiongemma`), `modernbert`, `qwen_deepseek` (`qwen2`, `qwen3`, `qwen3moe`, `deepseek2`, `qwen35`, `qwen35moe`), `deberta-v3`, `ssm`, and `machine_models` (`ttm`, `ft-transformer`, `tabpfn-v2`, `decision-transformer`) recipes.
 - **Synchronization**: Thread-group scheduling and diagnostic barriers (`SpinBarrier`, `FutexBarrier`, `WorkerPool`).

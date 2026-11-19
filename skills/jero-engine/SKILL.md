@@ -1,9 +1,9 @@
 ---
 name: jero-engine
-description: "Configure and run the jero-engine compute runtime, RecipeRegistry capability verification, LockedModelWeights mlock bounds, jero-diag diagnostics, and jero-worker process engine."
+description: "Configure and run the jero-engine compute runtime, RecipeRegistry capability verification, LockedModelWeights mlock bounds, jero-diag diagnostics, and jero-engine worker process."
 ---
 
-# `jero-engine` Compute Runtime, Capability Verification, `jero-diag` & `jero-worker` Invariants
+# `jero-engine` Compute Runtime, Capability Verification, `jero-diag` & Worker Invariants
 
 ## 1. `RecipeRegistry` & Capability Verification
 
@@ -21,9 +21,9 @@ description: "Configure and run the jero-engine compute runtime, RecipeRegistry 
 - Passing `--model <path.gguf>` always executes real GGUF weights through the hydrated `ArchRecipe` and reports `"execution_mode": "real_gguf"` with `architecture`, `model_filename`, and `quant_summary`. Synthetic `ForwardModel` hardware calibration requires the explicit `--synthetic-matrix` flag (mutually exclusive with `--model`), emitting `"execution_mode": "synthetic_matrix"`.
 - Pre-validate compilation locally (`cargo check --target riscv64gc-unknown-linux-gnu --workspace --tests`) before dispatching runs to target hardware.
 
-## 3. Worker Execution (`jero-worker`), Phase Scheduling & Repack Residency
+## 3. Worker Execution (`jero-engine` / Phase 1 Alias `jero-worker`), Phase Scheduling & Repack Residency
 
-- Multi-process worker instances (`jero-worker`) handle decoupled matrix and attention evaluation over Unix domain sockets with shared memory weight arenas.
+- Multi-process worker instances (`jero-engine`, with Phase 1 compatibility alias `jero-worker`) handle decoupled matrix and attention evaluation over Unix domain sockets with shared memory weight arenas.
 - Under `ClusterPhasePolicy::Auto` on heterogeneous clusters with `A100` (`VLEN=1024`) and `XSMTVDotII` (`has_ime`), non-guardrail dense, MoE, and BitNet models resolve to `A100Only` (`A100` prefill + `A100` decode); explicit `A100PrefillX100Decode`, `A100PrefillA100Decode`, and `RowSplit` prefill also target `a100_pool`, while guardrails and non-IME / single-cluster hosts stay on `X100Only`.
 - `PassTiming`, `RunMetric`, `StatisticsSummary` (`mean`, `median`, `min`, `max`, `stddev`), and `jero-diag` CLI tables report `prefill_tokens_per_sec` (`pp tok/s`, returning `0.0` when `prefill_ns == 0`) alongside `prefill_ms` (`TTFT`) and `decode_tokens_per_sec`.
 - `estimate_footprint` / `calculate_footprint` tracks `repack_arena_bytes` (compact nibble `smt.vpack.vv` vs `i8` tiles), bounded `prefill_scratch_bytes`, and `eager_repack_enabled`; `check_memory_admission*` fails closed on `weight_bytes + kv_bytes + prefill_scratch_bytes > budget`, and downgrades (`eager_repack_enabled = false`, `repack_arena_bytes = 0`) when only the optional repack arena exceeds headroom.

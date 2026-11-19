@@ -1,4 +1,4 @@
-//! CLI parsing and configuration for `k3-worker`.
+//! CLI parsing and configuration for `jero-engine`.
 
 use std::os::fd::RawFd;
 use std::path::PathBuf;
@@ -66,7 +66,7 @@ impl WorkerConfig {
                     return Ok(None);
                 }
                 "-V" | "--version" => {
-                    println!("k3-worker {}", env!("CARGO_PKG_VERSION"));
+                    println!("jero-engine {}", env!("CARGO_PKG_VERSION"));
                     return Ok(None);
                 }
                 "--socket" | "--socket-path" => {
@@ -202,10 +202,10 @@ impl WorkerConfig {
 /// Prints CLI usage help.
 pub fn print_usage() {
     println!(
-        r"k3-worker: Isolated compute worker binary for the SpacemiT K3 platform.
+        r"jero-engine: Isolated compute worker binary for the SpacemiT K3 platform.
 
 USAGE:
-    k3-worker --model <path> (--socket <path> | --socket-fd <fd>) [OPTIONS]
+    jero-engine --model <path> (--socket <path> | --socket-fd <fd>) [OPTIONS]
 
 REQUIRED:
     --model <path>         Path to local GGUF model weights file
@@ -238,13 +238,13 @@ mod tests {
 
     #[test]
     fn test_help_and_version() {
-        let help_args = vec!["k3-worker".to_owned(), "--help".to_owned()];
+        let help_args = vec!["jero-engine".to_owned(), "--help".to_owned()];
         assert_eq!(
             WorkerConfig::parse_args(help_args.into_iter()).unwrap(),
             None
         );
 
-        let ver_args = vec!["k3-worker".to_owned(), "-V".to_owned()];
+        let ver_args = vec!["jero-engine".to_owned(), "-V".to_owned()];
         assert_eq!(
             WorkerConfig::parse_args(ver_args.into_iter()).unwrap(),
             None
@@ -255,7 +255,7 @@ mod tests {
     fn test_missing_required_args() {
         // Missing --model
         let args = vec![
-            "k3-worker".to_owned(),
+            "jero-engine".to_owned(),
             "--socket".to_owned(),
             "/tmp/test.sock".to_owned(),
         ];
@@ -263,7 +263,7 @@ mod tests {
 
         // Missing --socket and --socket-fd
         let args = vec![
-            "k3-worker".to_owned(),
+            "jero-engine".to_owned(),
             "--model".to_owned(),
             "/tmp/model.gguf".to_owned(),
         ];
@@ -273,7 +273,7 @@ mod tests {
     #[test]
     fn test_valid_args() {
         let args = vec![
-            "k3-worker".to_owned(),
+            "jero-engine".to_owned(),
             "--socket".to_owned(),
             "/tmp/test.sock".to_owned(),
             "--model".to_owned(),
@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn test_invalid_cluster() {
         let args = vec![
-            "k3-worker".to_owned(),
+            "jero-engine".to_owned(),
             "--socket".to_owned(),
             "/tmp/test.sock".to_owned(),
             "--model".to_owned(),

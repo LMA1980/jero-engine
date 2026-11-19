@@ -9,7 +9,8 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const BIN_PATH: &str = env!("CARGO_BIN_EXE_jero-worker");
+const BIN_PATH: &str = env!("CARGO_BIN_EXE_jero-engine");
+const LEGACY_ALIAS_BIN_PATH: &str = env!("CARGO_BIN_EXE_jero-worker");
 
 #[test]
 fn test_cli_help_and_version_exit_0() {
@@ -17,34 +18,44 @@ fn test_cli_help_and_version_exit_0() {
     let output = Command::new(BIN_PATH)
         .arg("--help")
         .output()
-        .expect("run k3-worker --help");
+        .expect("run jero-engine --help");
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("USAGE:"));
     assert!(stdout.contains("--model"));
+    assert!(stdout.contains("jero-engine"));
 
     // -h
     let output_h = Command::new(BIN_PATH)
         .arg("-h")
         .output()
-        .expect("run k3-worker -h");
+        .expect("run jero-engine -h");
     assert_eq!(output_h.status.code(), Some(0));
 
     // --version
     let output_v = Command::new(BIN_PATH)
         .arg("--version")
         .output()
-        .expect("run k3-worker --version");
+        .expect("run jero-engine --version");
     assert_eq!(output_v.status.code(), Some(0));
     let stdout_v = String::from_utf8_lossy(&output_v.stdout);
-    assert!(stdout_v.contains("k3-worker"));
+    assert!(stdout_v.contains("jero-engine"));
 
     // -V
     let output_short_v = Command::new(BIN_PATH)
         .arg("-V")
         .output()
-        .expect("run k3-worker -V");
+        .expect("run jero-engine -V");
     assert_eq!(output_short_v.status.code(), Some(0));
+
+    // Phase 1 compatibility alias binary (jero-worker)
+    let output_alias = Command::new(LEGACY_ALIAS_BIN_PATH)
+        .arg("--version")
+        .output()
+        .expect("run jero-worker --version");
+    assert_eq!(output_alias.status.code(), Some(0));
+    let stdout_alias = String::from_utf8_lossy(&output_alias.stdout);
+    assert!(stdout_alias.contains("jero-engine"));
 }
 
 #[test]
