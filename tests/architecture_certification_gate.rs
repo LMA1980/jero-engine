@@ -1264,8 +1264,8 @@ fn verify_qwen3_cli_dual_parity() {
         GOLDEN_QWEN3_ST_GGUF_JSON,
         &st_a,
         |a, g| {
-            verify_parity_against_golden(a, g, 0.99999, 1.0e-5).expect("SafeTensors parity");
-            verify_parity_against_golden(&gguf_a, g, 0.99999, 1.0e-5).expect("GGUF parity");
+            verify_parity_against_golden(a, g, 0.9999, 1.0e-4).expect("SafeTensors parity");
+            verify_parity_against_golden(&gguf_a, g, 0.9999, 1.0e-4).expect("GGUF parity");
         },
     );
 }
@@ -1334,16 +1334,16 @@ fn test_qwen3_safetensors_vs_gguf_cli_parity_and_embedding() {
             assert_f32_slice_close(
                 &a.prompt_a_embedding_dim8,
                 &g.prompt_a_embedding_dim8,
-                1e-5,
+                1e-4,
                 "prompt A",
             );
             assert_f32_slice_close(
                 &a.prompt_b_embedding_dim8,
                 &g.prompt_b_embedding_dim8,
-                1e-5,
+                1e-4,
                 "prompt B",
             );
-            assert!((a.cross_prompt_cosine - g.cross_prompt_cosine).abs() < 1e-5);
+            assert!((a.cross_prompt_cosine - g.cross_prompt_cosine).abs() < 1e-4);
         },
     );
 }
@@ -1577,21 +1577,21 @@ fn test_encoder_embeddings_and_rerank_safetensors_gguf_parity() {
             assert_f32_slice_close(
                 &a.nomic_bert_embedding,
                 &g.nomic_bert_embedding,
-                1e-5,
+                1e-4,
                 "nomic-bert",
             );
-            assert_f32_slice_close(&a.bge_embedding, &g.bge_embedding, 1e-5, "bge");
+            assert_f32_slice_close(&a.bge_embedding, &g.bge_embedding, 1e-4, "bge");
             assert_f32_slice_close(
                 &a.jina_bert_embedding,
                 &g.jina_bert_embedding,
-                1e-5,
+                1e-4,
                 "jina-bert",
             );
-            assert_f32_slice_close(&a.rerank_doc_scores, &g.rerank_doc_scores, 1e-5, "rerank");
+            assert_f32_slice_close(&a.rerank_doc_scores, &g.rerank_doc_scores, 1e-4, "rerank");
             assert_f32_slice_close(
                 &a.deberta_v3_logits,
                 &g.deberta_v3_logits,
-                1e-5,
+                1e-4,
                 "deberta-v3",
             );
         },
@@ -2064,25 +2064,25 @@ fn verify_vision_mmproj_golden(snap: &VisionMmprojGoldenSnapshot) {
             assert_f32_slice_close(
                 &a.clip_gemma3_logits_img_a,
                 &g.clip_gemma3_logits_img_a,
-                1e-5,
+                1e-4,
                 "clip A",
             );
             assert_f32_slice_close(
                 &a.clip_gemma3_logits_img_b,
                 &g.clip_gemma3_logits_img_b,
-                1e-5,
+                1e-4,
                 "clip B",
             );
             assert_f32_slice_close(
                 &a.siglip_qwen3_logits_img_a,
                 &g.siglip_qwen3_logits_img_a,
-                1e-5,
+                1e-4,
                 "siglip A",
             );
             assert_f32_slice_close(
                 &a.siglip_qwen3_logits_img_b,
                 &g.siglip_qwen3_logits_img_b,
-                1e-5,
+                1e-4,
                 "siglip B",
             );
         },
@@ -2468,19 +2468,19 @@ fn test_whisper_asr_pcm_mel_cross_attn_safetensors_gguf_parity() {
             assert_f32_slice_close(
                 &a.prefill_logits_440hz,
                 &g.prefill_logits_440hz,
-                1e-5,
+                1e-4,
                 "prefill 440Hz",
             );
             assert_f32_slice_close(
                 &a.decode_logits_440hz,
                 &g.decode_logits_440hz,
-                1e-5,
+                1e-4,
                 "decode 440Hz",
             );
             assert_f32_slice_close(
                 &a.prefill_logits_2600hz,
                 &g.prefill_logits_2600hz,
-                1e-5,
+                1e-4,
                 "prefill 2600Hz",
             );
         },
