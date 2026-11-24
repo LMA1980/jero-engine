@@ -17,13 +17,14 @@ const DIAG_BIN: &str = env!("CARGO_BIN_EXE_jero-diag");
 #[cfg(feature = "jero-arch-qwen")]
 fn build_complete_qwen2_1536_gguf(
     vocab_size: usize,
+    ffn_dim: usize,
     extra_kvs: &[(&str, GgufValue<'_>)],
 ) -> Vec<u8> {
     let embd_shape = [1536_usize, vocab_size];
     let q_shape = [1536_usize, 1536_usize];
     let kv_shape = [1536_usize, 256_usize];
-    let ffn_up_shape = [1536_usize, 8960_usize];
-    let ffn_down_shape = [8960_usize, 1536_usize];
+    let ffn_up_shape = [1536_usize, ffn_dim];
+    let ffn_down_shape = [ffn_dim, 1536_usize];
     let norm_shape = [1536_usize];
     let q_bias_shape = [1536_usize];
     let kv_bias_shape = [256_usize];
@@ -134,7 +135,7 @@ fn test_issue_113_qwen25_15b_1536_151936_untied_lm_head_forward_pass() {
             GgufValue::Float32(1e-6),
         ),
     ];
-    let bytes = build_complete_qwen2_1536_gguf(151_936, &extra_kvs);
+    let bytes = build_complete_qwen2_1536_gguf(151_936, 8960, &extra_kvs);
     let gguf = GgufFile::parse(&bytes).expect("parse Qwen2.5-1.5B synthetic GGUF");
     let recipe =
         verify_model_capabilities(&gguf).expect("verify and hydrate Qwen2.5-1.5B capabilities");
@@ -186,11 +187,11 @@ fn test_issue_113_locked_model_weights_and_cli_1536_dim_end_to_end() {
     let extra_kvs = [
         ("qwen2.block_count", GgufValue::Uint32(1)),
         ("qwen2.embedding_length", GgufValue::Uint32(1536)),
-        ("qwen2.feed_forward_length", GgufValue::Uint32(8960)),
+        ("qwen2.feed_forward_length", GgufValue::Uint32(256)),
         ("qwen2.attention.head_count", GgufValue::Uint32(12)),
         ("qwen2.attention.head_count_kv", GgufValue::Uint32(2)),
     ];
-    let bytes = build_complete_qwen2_1536_gguf(16, &extra_kvs);
+    let bytes = build_complete_qwen2_1536_gguf(16, 256, &extra_kvs);
     let model_path = std::env::temp_dir().join(format!(
         "k3_issue113_qwen2_1536_{}.gguf",
         std::process::id()
