@@ -12,11 +12,11 @@
   "first_token_top_k": [
     {
       "token_id": 14,
-      "logit": 7.1278696
+      "logit": 7.127869
     },
     {
       "token_id": 11,
-      "logit": 6.84562
+      "logit": 6.8456182
     },
     {
       "token_id": 9,
@@ -24,15 +24,15 @@
     },
     {
       "token_id": 5,
-      "logit": 2.76883
+      "logit": 2.7688293
     },
     {
       "token_id": 6,
-      "logit": 2.7023337
+      "logit": 2.702333
     },
     {
       "token_id": 10,
-      "logit": 0.26257062
+      "logit": 0.2625711
     },
     {
       "token_id": 0,
@@ -60,19 +60,19 @@
     },
     {
       "token_id": 13,
-      "logit": -2.2726674
+      "logit": -2.272668
     },
     {
       "token_id": 8,
-      "logit": -3.3988888
+      "logit": -3.3988886
     },
     {
       "token_id": 7,
-      "logit": -3.6453357
+      "logit": -3.6453347
     },
     {
       "token_id": 15,
-      "logit": -5.4933205
+      "logit": -5.493319
     }
   ],
   "greedy_token_ids": [

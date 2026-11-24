@@ -11,23 +11,17 @@ pub mod chat_template;
 pub mod engine;
 #[cfg(feature = "jero-kernels-rvv")]
 pub mod forward;
-#[cfg(feature = "jero-kernels-rvv")]
+#[cfg(feature = "jero-arch-gemma")]
 pub mod gemma;
 pub mod kv;
-#[cfg(any(
-    feature = "jero-arch-ttm",
-    feature = "jero-arch-ft-transformer",
-    feature = "jero-arch-tabpfn-v2",
-    feature = "jero-arch-decision-transformer",
-    feature = "jero-kernels-rvv",
-))]
+#[cfg(feature = "jero-arch-machine")]
 pub mod machine_models;
 pub mod memory;
-#[cfg(feature = "jero-arch-modernbert")]
+#[cfg(feature = "jero-arch-encoder")]
 pub mod modernbert;
-#[cfg(feature = "jero-kernels-rvv")]
+#[cfg(feature = "jero-arch-qwen")]
 pub mod qwen_deepseek;
-#[cfg(feature = "jero-kernels-rvv")]
+#[cfg(feature = "jero-arch-ssm")]
 pub mod ssm;
 pub mod weights;
 pub mod worker;
@@ -45,7 +39,8 @@ pub use affinity::{
     select_phase_policy_with_ime,
 };
 pub use capability::{
-    GgufHyperparams, RecipeRegistry, verify_metadata_capabilities, verify_model_capabilities,
+    GgufHyperparams, RecipeRegistry, verify_container_capabilities, verify_metadata_capabilities,
+    verify_model_capabilities, verify_safetensors_capabilities,
 };
 pub use certification::{
     DEFAULT_PARITY_TOP_K, ParityDumpReport, TopKLogitEntry, cosine_similarity_f64,
@@ -70,7 +65,8 @@ pub use jero_core::{
     CONSERVATIVE_DEFAULT_X100_CORES, CONSERVATIVE_TUNING_ADVISORY, CONSTRAINED_TEST_N_CTX,
     ComputePool, CoordinationProfile, ExecutionContext, GgufFile, K3Error, ModelEntry,
     ModelListResponse, ModelLoadAuditEvent, ModelMetadata, ModelProfile, ModelWeights,
-    PriorityClass, ProfileStatus, QuantType, TensorDescriptor, TensorView, TuningProfile,
+    PriorityClass, ProfileStatus, QuantType, SafeTensorsFile, TensorDescriptor, TensorView,
+    TuningProfile,
 };
 pub use kv::{SingleSlotKvArena, SlidingWindowKvView, write_and_slice_sliding_kv};
 pub use memory::{
@@ -82,7 +78,9 @@ pub use memory::{
     estimate_hybrid_kv_cache_bytes, estimate_hybrid_ssm_arena_bytes, estimate_kv_cache_bytes,
     estimate_mla_kv_cache_bytes, gemma_layer_kv_policies, system_page_size,
 };
-#[cfg(feature = "jero-kernels-rvv")]
+#[cfg(feature = "jero-arch-ssm")]
+pub use ssm as arch_ssm;
+#[cfg(feature = "jero-arch-ssm")]
 pub use ssm::{
     GraniteRecipe, HybridSsmTransformerRecipe, Lfm2MoeRecipe, Mamba2Recipe, Rwkv7Recipe,
     lfm2_shortconv_step, resolve_hybrid_layer_schedule,
@@ -91,7 +89,8 @@ pub use ssm::{
 #[cfg(feature = "jero-kernels-rvv")]
 pub use weights::repack_tensor_parallel;
 pub use weights::{
-    LockedModelWeights, ModelView, RepackSummary, RepackedTensorEntry, RepackedTensorStore,
+    LockedModelWeights, ModelContainerFormat, ModelView, ParsedModelContainer, RepackSummary,
+    RepackedTensorEntry, RepackedTensorStore,
 };
 
 #[cfg(feature = "jero-arch-llama")]
@@ -121,40 +120,55 @@ pub use jero_arch_dory::DoryRecipe;
 
 #[cfg(feature = "jero-arch-gemma")]
 pub use gemma as arch_gemma;
+#[cfg(all(feature = "jero-arch-gemma", feature = "jero-kernels-rvv"))]
+pub use gemma::gemma_norm_lane;
 #[cfg(feature = "jero-arch-gemma")]
 pub use gemma::{
     ExpertWeights, Gemma4Recipe, GemmaRecipe, apply_gemma4_ple_residual, dispatch_sparse_moe_layer,
-    gemma_norm_lane, select_top_k_experts,
+    select_top_k_experts,
 };
 
-#[cfg(feature = "jero-kernels-rvv")]
-pub use forward::DebertaV3Recipe;
-#[cfg(feature = "jero-arch-decision-transformer")]
-pub use machine_models::DecisionTransformerRecipe;
-#[cfg(feature = "jero-arch-ft-transformer")]
-pub use machine_models::FtTransformerRecipe;
-#[cfg(feature = "jero-arch-tabpfn-v2")]
-pub use machine_models::TabPfnV2Recipe;
-#[cfg(feature = "jero-arch-ttm")]
-pub use machine_models::TtmRecipe;
-#[cfg(any(
-    feature = "jero-arch-ttm",
-    feature = "jero-arch-ft-transformer",
-    feature = "jero-arch-tabpfn-v2",
-    feature = "jero-arch-decision-transformer",
-    feature = "jero-kernels-rvv",
-))]
+#[cfg(all(feature = "jero-arch-encoder", feature = "jero-kernels-rvv"))]
+pub use forward::DebertaV3PlacementExt;
+#[cfg(feature = "jero-arch-machine")]
+pub use machine_models as arch_machine;
+#[cfg(feature = "jero-arch-machine")]
 pub use machine_models::{
-    MmprojLatentBridge, forward_with_soft_prompt, project_machine_latent_to_soft_prompt,
+    DecisionTransformerRecipe, FtTransformerRecipe, MmprojLatentBridge, TabPfnV2Recipe, TtmRecipe,
+    forward_with_soft_prompt, project_machine_latent_to_soft_prompt,
 };
-#[cfg(feature = "jero-arch-modernbert")]
+#[cfg(feature = "jero-arch-encoder")]
+pub use modernbert as arch_encoder;
+#[cfg(feature = "jero-arch-encoder")]
 pub use modernbert as arch_modernbert;
-#[cfg(feature = "jero-arch-modernbert")]
-pub use modernbert::ModernBertRecipe;
-#[cfg(feature = "jero-kernels-rvv")]
+#[cfg(feature = "jero-arch-encoder")]
+pub use modernbert::{
+    CrossEncoderRerankRecipe, DebertaV3Recipe, EncoderFfnActivation, ModernBertRecipe,
+    RerankScoringMode, resolve_encoder_recipe,
+};
+#[cfg(feature = "jero-arch-qwen")]
+pub use qwen_deepseek as arch_qwen;
+#[cfg(all(feature = "jero-arch-qwen", feature = "jero-kernels-rvv"))]
+pub use qwen_deepseek::Qwen3MoePlacementExt;
+#[cfg(feature = "jero-arch-qwen")]
 pub use qwen_deepseek::{
     DeepSeek2MlaConfig, DeepSeek2Recipe, Qwen2Recipe, Qwen3MoeRecipe, Qwen3Recipe, Qwen35MoeRecipe,
-    Qwen35Recipe,
+    Qwen35Recipe, QwenEmbeddingRecipe,
+};
+
+#[cfg(feature = "jero-arch-vision")]
+pub use jero_arch_vision as arch_vision;
+#[cfg(feature = "jero-arch-vision")]
+pub use jero_arch_vision::{
+    ClipVisionRecipe, SiglipVisionRecipe, VisionEncoderConfig, VisionTokens, VlmMmprojBridge,
+};
+
+#[cfg(feature = "jero-arch-whisper")]
+pub use jero_arch_whisper as arch_whisper;
+#[cfg(feature = "jero-arch-whisper")]
+pub use jero_arch_whisper::{
+    WhisperRecipe, WhisperVariant, build_slaney_mel_filters, pcm_to_log_mel,
+    pcm_to_log_mel_with_filters,
 };
 
 #[cfg(feature = "jero-arch-synthetic")]
@@ -182,14 +196,32 @@ pub const HAS_ARCH_LLAMA: bool = cfg!(feature = "jero-arch-llama");
 /// Indicates whether the `jero-arch-mistral` architecture recipe feature gate is enabled.
 pub const HAS_ARCH_MISTRAL: bool = cfg!(feature = "jero-arch-mistral");
 
+/// Indicates whether the `jero-arch-encoder` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_ENCODER: bool = cfg!(feature = "jero-arch-encoder");
+
+/// Indicates whether the `jero-arch-machine` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_MACHINE: bool = cfg!(feature = "jero-arch-machine");
+
 /// Indicates whether the `jero-arch-modernbert` architecture recipe feature gate is enabled.
 pub const HAS_ARCH_MODERNBERT: bool = cfg!(feature = "jero-arch-modernbert");
 
 /// Indicates whether the `jero-arch-phi3` architecture recipe feature gate is enabled.
 pub const HAS_ARCH_PHI3: bool = cfg!(feature = "jero-arch-phi3");
 
+/// Indicates whether the `jero-arch-qwen` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_QWEN: bool = cfg!(feature = "jero-arch-qwen");
+
+/// Indicates whether the `jero-arch-ssm` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_SSM: bool = cfg!(feature = "jero-arch-ssm");
+
 /// Indicates whether the `jero-arch-synthetic` architecture recipe feature gate is enabled.
 pub const HAS_ARCH_SYNTHETIC: bool = cfg!(feature = "jero-arch-synthetic");
+
+/// Indicates whether the `jero-arch-vision` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_VISION: bool = cfg!(feature = "jero-arch-vision");
+
+/// Indicates whether the `jero-arch-whisper` architecture recipe feature gate is enabled.
+pub const HAS_ARCH_WHISPER: bool = cfg!(feature = "jero-arch-whisper");
 
 /// Indicates whether the `jero-arch-ttm` architecture recipe feature gate is enabled.
 pub const HAS_ARCH_TTM: bool = cfg!(feature = "jero-arch-ttm");
@@ -263,12 +295,7 @@ mod tests {
         assert_eq!(Gemma4Recipe::new().architecture_id(), "gemma4");
     }
 
-    #[cfg(all(
-        feature = "jero-arch-ttm",
-        feature = "jero-arch-ft-transformer",
-        feature = "jero-arch-tabpfn-v2",
-        feature = "jero-arch-decision-transformer"
-    ))]
+    #[cfg(feature = "jero-arch-machine")]
     #[test]
     fn arch_machine_models_recipes_wired() {
         use super::{
@@ -300,7 +327,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "jero-arch-modernbert")]
+    #[cfg(feature = "jero-arch-encoder")]
     #[test]
     fn arch_modernbert_recipe_wired() {
         use super::ArchRecipe;

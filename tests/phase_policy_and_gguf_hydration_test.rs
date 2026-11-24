@@ -14,7 +14,111 @@ use jero_engine::{
 
 const DIAG_BIN: &str = env!("CARGO_BIN_EXE_jero-diag");
 
-#[cfg(feature = "jero-arch-llama")]
+#[cfg(feature = "jero-arch-qwen")]
+fn build_complete_qwen2_1536_gguf(
+    vocab_size: usize,
+    extra_kvs: &[(&str, GgufValue<'_>)],
+) -> Vec<u8> {
+    let embd_shape = [1536_usize, vocab_size];
+    let q_shape = [1536_usize, 1536_usize];
+    let kv_shape = [1536_usize, 256_usize];
+    let ffn_up_shape = [1536_usize, 8960_usize];
+    let ffn_down_shape = [8960_usize, 1536_usize];
+    let norm_shape = [1536_usize];
+    let q_bias_shape = [1536_usize];
+    let kv_bias_shape = [256_usize];
+    let tensor_specs = [
+        (
+            "token_embd.weight",
+            QuantType::Q4_K_M,
+            embd_shape.as_slice(),
+        ),
+        (
+            "blk.0.attn_norm.weight",
+            QuantType::F32,
+            norm_shape.as_slice(),
+        ),
+        ("blk.0.attn_q.weight", QuantType::Q4_K_M, q_shape.as_slice()),
+        ("blk.0.attn_q.bias", QuantType::F32, q_bias_shape.as_slice()),
+        (
+            "blk.0.attn_k.weight",
+            QuantType::Q4_K_M,
+            kv_shape.as_slice(),
+        ),
+        (
+            "blk.0.attn_k.bias",
+            QuantType::F32,
+            kv_bias_shape.as_slice(),
+        ),
+        (
+            "blk.0.attn_v.weight",
+            QuantType::Q4_K_M,
+            kv_shape.as_slice(),
+        ),
+        (
+            "blk.0.attn_v.bias",
+            QuantType::F32,
+            kv_bias_shape.as_slice(),
+        ),
+        (
+            "blk.0.attn_output.weight",
+            QuantType::Q4_K_M,
+            q_shape.as_slice(),
+        ),
+        (
+            "blk.0.ffn_norm.weight",
+            QuantType::F32,
+            norm_shape.as_slice(),
+        ),
+        (
+            "blk.0.ffn_gate.weight",
+            QuantType::Q4_K_M,
+            ffn_up_shape.as_slice(),
+        ),
+        (
+            "blk.0.ffn_up.weight",
+            QuantType::Q4_K_M,
+            ffn_up_shape.as_slice(),
+        ),
+        (
+            "blk.0.ffn_down.weight",
+            QuantType::Q4_K_M,
+            ffn_down_shape.as_slice(),
+        ),
+        ("output_norm.weight", QuantType::F32, norm_shape.as_slice()),
+        ("output.weight", QuantType::Q4_K_M, embd_shape.as_slice()),
+    ];
+
+    let mut bytes = create_synthetic_gguf_v3_with_kvs("qwen2", 32, extra_kvs, &tensor_specs);
+    // Replace synthetic byte pattern in F32 norm/bias tensors with finite weights
+    // so `7.4e+37` byte patterns do not overflow LM-head Q4_K_M dot products to all-NaN.
+    let total_tensor_bytes: usize = tensor_specs
+        .iter()
+        .map(|&(name, quant, shape)| {
+            let elems: usize = shape.iter().product();
+            quant.storage_bytes(name, elems).expect("valid tensor size")
+        })
+        .sum();
+    let mut cursor = bytes.len() - total_tensor_bytes;
+    for &(name, quant, shape) in &tensor_specs {
+        let elems: usize = shape.iter().product();
+        let byte_len = quant.storage_bytes(name, elems).expect("valid tensor size");
+        if quant == QuantType::F32 {
+            let fill = if name.contains("norm") {
+                1.0_f32
+            } else {
+                0.0_f32
+            };
+            for slot in bytes[cursor..cursor + byte_len].chunks_exact_mut(4) {
+                slot.copy_from_slice(&fill.to_le_bytes());
+            }
+        }
+        cursor += byte_len;
+    }
+    bytes
+}
+
+#[cfg(feature = "jero-arch-qwen")]
 #[test]
 fn test_issue_113_qwen25_15b_1536_151936_untied_lm_head_forward_pass() {
     let extra_kvs = [
@@ -30,30 +134,7 @@ fn test_issue_113_qwen25_15b_1536_151936_untied_lm_head_forward_pass() {
             GgufValue::Float32(1e-6),
         ),
     ];
-    let output_shape = [1536_usize, 151_936_usize];
-    let norm_shape = [1536_usize];
-    let tensor_specs = [
-        ("output_norm.weight", QuantType::F32, norm_shape.as_slice()),
-        ("output.weight", QuantType::Q4_K_M, output_shape.as_slice()),
-    ];
-
-    let mut bytes = create_synthetic_gguf_v3_with_kvs("qwen2", 32, &extra_kvs, &tensor_specs);
-    // Replace synthetic byte pattern in F32 `output_norm.weight` with finite 1.0 weights
-    // so `7.4e+37` byte patterns do not overflow LM-head Q4_K_M dot products to all-NaN.
-    let total_tensor_bytes: usize = tensor_specs
-        .iter()
-        .map(|&(name, quant, shape)| {
-            let elems: usize = shape.iter().product();
-            quant.storage_bytes(name, elems).expect("valid tensor size")
-        })
-        .sum();
-    let norm_bytes = QuantType::F32
-        .storage_bytes("output_norm.weight", 1536)
-        .expect("norm bytes");
-    let norm_start = bytes.len() - total_tensor_bytes;
-    for slot in bytes[norm_start..norm_start + norm_bytes].chunks_exact_mut(4) {
-        slot.copy_from_slice(&1.0_f32.to_le_bytes());
-    }
+    let bytes = build_complete_qwen2_1536_gguf(151_936, &extra_kvs);
     let gguf = GgufFile::parse(&bytes).expect("parse Qwen2.5-1.5B synthetic GGUF");
     let recipe =
         verify_model_capabilities(&gguf).expect("verify and hydrate Qwen2.5-1.5B capabilities");
@@ -99,7 +180,7 @@ fn test_issue_113_qwen25_15b_1536_151936_untied_lm_head_forward_pass() {
     assert!((padded_summary.generated_tokens[0] as usize) < 151_665);
 }
 
-#[cfg(feature = "jero-arch-llama")]
+#[cfg(feature = "jero-arch-qwen")]
 #[test]
 fn test_issue_113_locked_model_weights_and_cli_1536_dim_end_to_end() {
     let extra_kvs = [
@@ -109,20 +190,7 @@ fn test_issue_113_locked_model_weights_and_cli_1536_dim_end_to_end() {
         ("qwen2.attention.head_count", GgufValue::Uint32(12)),
         ("qwen2.attention.head_count_kv", GgufValue::Uint32(2)),
     ];
-    let embd_shape = [1536_usize, 16_usize];
-    let norm_shape = [1536_usize];
-    let output_shape = [1536_usize, 16_usize];
-    let tensor_specs = [
-        (
-            "token_embd.weight",
-            QuantType::Q4_K_M,
-            embd_shape.as_slice(),
-        ),
-        ("output_norm.weight", QuantType::F32, norm_shape.as_slice()),
-        ("output.weight", QuantType::Q4_K_M, output_shape.as_slice()),
-    ];
-
-    let bytes = create_synthetic_gguf_v3_with_kvs("qwen2", 32, &extra_kvs, &tensor_specs);
+    let bytes = build_complete_qwen2_1536_gguf(16, &extra_kvs);
     let model_path = std::env::temp_dir().join(format!(
         "k3_issue113_qwen2_1536_{}.gguf",
         std::process::id()

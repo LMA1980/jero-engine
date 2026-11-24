@@ -1471,16 +1471,7 @@ fn test_issue_133_dory_rope_profile_gguf_binary_admission() {
         (Some(GgufValue::Int32(2)), "non-negative i32", "profile_2"),
     ] {
         let kvs = base_dory_kvs(profile_val.map(|v| ("dory.rope.profile", v)));
-        let bytes = create_synthetic_gguf_v3_with_kvs(
-            "dory",
-            32,
-            &kvs,
-            &[
-                ("token_embd.weight", QuantType::Q4_K_M, &[256, 16]),
-                ("blk.0.attn_q.weight", QuantType::Q5_K, &[256, 256]),
-                ("output.weight", QuantType::Q6_K, &[256, 16]),
-            ],
-        );
+        let bytes = create_synthetic_gguf_v3_with_kvs("dory", 32, &kvs, &[]);
         let gguf = GgufFile::parse(&bytes).unwrap_or_else(|e| panic!("parse dory {label}: {e}"));
         assert_eq!(
             gguf.metadata()
@@ -1493,6 +1484,53 @@ fn test_issue_133_dory_rope_profile_gguf_binary_admission() {
             verify_model_capabilities(&gguf).unwrap_or_else(|e| panic!("verify dory {label}: {e}"));
         assert_eq!(recipe.architecture_id(), "dory");
     }
+
+    // Complete 3-physical-sublayer ('S', '-', '*') resident Dory GGUF validates ADR-045 tensors end-to-end.
+    let small_dory_kvs = [
+        ("dory.block_count", GgufValue::Uint32(0)),
+        ("dory.input_layer_count", GgufValue::Uint32(1)),
+        ("dory.recurrent_layer_count", GgufValue::Uint32(1)),
+        ("dory.output_layer_count", GgufValue::Uint32(1)),
+        ("dory.num_loops", GgufValue::Uint32(1)),
+        (
+            "dory.recurrent_kv_cache_mode",
+            GgufValue::String("per_loop"),
+        ),
+        ("dory.layer_pattern", GgufValue::String("S-*")),
+        ("dory.rope.profile", GgufValue::String("neox")),
+        ("dory.rope.freq_base_2", GgufValue::Float32(10_000.0)),
+        ("dory.init_std", GgufValue::Float32(0.02)),
+        ("dory.alpha_init", GgufValue::Float32(0.05)),
+        ("dory.gate_init", GgufValue::Float32(0.0)),
+        ("dory.embedding_length", GgufValue::Uint32(256)),
+        ("dory.feed_forward_length", GgufValue::Uint32(512)),
+        ("dory.attention.head_count", GgufValue::Uint32(4)),
+        ("dory.attention.head_count_kv", GgufValue::Uint32(4)),
+        ("dory.context_length", GgufValue::Uint32(2048)),
+    ];
+    let dory_tensors = [
+        ("token_embd.weight", QuantType::Q4_K_M, &[256usize, 16][..]),
+        ("blk.0.attn_q.weight", QuantType::Q5_K, &[256, 256][..]),
+        ("blk.0.attn_k.weight", QuantType::Q5_K, &[256, 256][..]),
+        ("blk.0.attn_v.weight", QuantType::Q5_K, &[256, 256][..]),
+        ("blk.0.attn_gate.weight", QuantType::Q5_K, &[256, 256][..]),
+        ("blk.0.attn_output.weight", QuantType::Q5_K, &[256, 256][..]),
+        ("blk.1.ffn_gate.weight", QuantType::Q5_K, &[512, 256][..]),
+        ("blk.1.ffn_up.weight", QuantType::Q5_K, &[512, 256][..]),
+        ("blk.1.ffn_down.weight", QuantType::Q5_K, &[256, 512][..]),
+        ("blk.2.attn_q.weight", QuantType::Q5_K, &[256, 256][..]),
+        ("blk.2.attn_k.weight", QuantType::Q5_K, &[256, 256][..]),
+        ("blk.2.attn_v.weight", QuantType::Q5_K, &[256, 256][..]),
+        ("blk.2.attn_gate.weight", QuantType::Q5_K, &[256, 256][..]),
+        ("blk.2.attn_output.weight", QuantType::Q5_K, &[256, 256][..]),
+        ("output.weight", QuantType::Q6_K, &[256, 16][..]),
+    ];
+    let resident_bytes =
+        create_synthetic_gguf_v3_with_kvs("dory", 32, &small_dory_kvs, &dory_tensors);
+    let resident_gguf = GgufFile::parse(&resident_bytes).expect("parse resident dory");
+    let resident_recipe =
+        verify_model_capabilities(&resident_gguf).expect("verify resident dory weights");
+    assert_eq!(resident_recipe.architecture_id(), "dory");
 
     for bad_val in [GgufValue::Bool(true), GgufValue::Int32(-1)] {
         let kvs = base_dory_kvs(Some(("dory.rope.profile", bad_val)));
@@ -1514,24 +1552,60 @@ fn test_issue_133_dory_rope_profile_gguf_binary_admission() {
 
 #[test]
 fn test_issue_120_mixed_quant_gguf_admission_phi3_llama_mistral() {
-    use jero_core::test_helpers::create_synthetic_gguf_v3;
+    use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
     use jero_engine::capability::verify_model_capabilities;
 
-    let mixed_tensors = [
-        ("token_embd.weight", QuantType::Q6_K, &[256usize, 32][..]),
-        ("blk.0.attn_q.weight", QuantType::Q4_K_M, &[256, 256]),
-        ("blk.0.attn_k.weight", QuantType::Q4_0, &[256, 256]),
-        ("blk.0.ffn_gate.weight", QuantType::Q5_K, &[256, 512]),
-        ("output.weight", QuantType::Q8_0, &[256, 32]),
+    let llama_mistral_tensors = [
+        ("token_embd.weight", QuantType::Q6_K, &[256usize, 16][..]),
+        ("blk.0.attn_norm.weight", QuantType::F32, &[256][..]),
+        ("blk.0.attn_q.weight", QuantType::Q4_K_M, &[256, 256][..]),
+        ("blk.0.attn_k.weight", QuantType::Q4_0, &[256, 256][..]),
+        ("blk.0.attn_v.weight", QuantType::Q8_0, &[256, 256][..]),
+        ("blk.0.attn_output.weight", QuantType::Q5_K, &[256, 256][..]),
+        ("blk.0.ffn_norm.weight", QuantType::F32, &[256][..]),
+        ("blk.0.ffn_gate.weight", QuantType::Q5_K, &[256, 512][..]),
+        ("blk.0.ffn_up.weight", QuantType::Q4_K_M, &[256, 512][..]),
+        ("blk.0.ffn_down.weight", QuantType::Q8_0, &[512, 256][..]),
+        ("output_norm.weight", QuantType::F32, &[256][..]),
+        ("output.weight", QuantType::Q8_0, &[256, 16][..]),
     ];
 
-    for arch in ["phi3", "llama", "mistral"] {
-        let bytes = create_synthetic_gguf_v3(arch, 32, &mixed_tensors);
+    for arch in ["llama", "mistral"] {
+        let k_blk = format!("{arch}.block_count");
+        let k_ffn = format!("{arch}.feed_forward_length");
+        let k_kv = format!("{arch}.attention.head_count_kv");
+        let extra_kvs = [
+            (k_blk.as_str(), GgufValue::Uint32(1)),
+            (k_ffn.as_str(), GgufValue::Uint32(512)),
+            (k_kv.as_str(), GgufValue::Uint32(4)),
+        ];
+        let bytes = create_synthetic_gguf_v3_with_kvs(arch, 32, &extra_kvs, &llama_mistral_tensors);
         let model = GgufFile::parse(&bytes).expect("parse mixed quant gguf");
         let recipe = verify_model_capabilities(&model)
             .unwrap_or_else(|e| panic!("admit mixed quant {arch}: {e}"));
         assert_eq!(recipe.architecture_id(), arch);
     }
+
+    let phi3_tensors = [
+        ("token_embd.weight", QuantType::Q6_K, &[256usize, 16][..]),
+        ("blk.0.attn_norm.weight", QuantType::F32, &[256][..]),
+        ("blk.0.attn_qkv.weight", QuantType::Q4_K_M, &[256, 768][..]),
+        ("blk.0.attn_output.weight", QuantType::Q4_0, &[256, 256][..]),
+        ("blk.0.ffn_norm.weight", QuantType::F32, &[256][..]),
+        ("blk.0.ffn_up.weight", QuantType::Q5_K, &[256, 1024][..]),
+        ("blk.0.ffn_down.weight", QuantType::Q8_0, &[512, 256][..]),
+        ("output_norm.weight", QuantType::F32, &[256][..]),
+        ("output.weight", QuantType::Q8_0, &[256, 16][..]),
+    ];
+    let phi3_kvs = [
+        ("phi3.block_count", GgufValue::Uint32(1)),
+        ("phi3.feed_forward_length", GgufValue::Uint32(512)),
+        ("phi3.attention.head_count_kv", GgufValue::Uint32(4)),
+    ];
+    let phi3_bytes = create_synthetic_gguf_v3_with_kvs("phi3", 32, &phi3_kvs, &phi3_tensors);
+    let phi3_model = GgufFile::parse(&phi3_bytes).expect("parse mixed quant phi3");
+    let phi3_recipe = verify_model_capabilities(&phi3_model).expect("admit mixed quant phi3");
+    assert_eq!(phi3_recipe.architecture_id(), "phi3");
 }
 
 struct TempGgufFile(PathBuf);

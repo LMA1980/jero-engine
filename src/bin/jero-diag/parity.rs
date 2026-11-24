@@ -7,14 +7,15 @@
 use std::io::Write;
 use std::path::Path;
 
-use jero_core::{CoordinationProfile, GgufFile, K3Error, QuantizationInfo};
+use jero_core::{CoordinationProfile, K3Error, QuantizationInfo};
 use jero_engine::{
     ClusterPhasePolicy, DEFAULT_PARITY_TOP_K, LockedModelWeights, ParityDumpReport,
     SingleSlotKvArena, StreamAction, SystemMemoryInspector, WorkerPool, evaluate_parity_snapshot,
-    resolve_affinity, tokenize_prompt_utf8_safe,
+    resolve_affinity,
 };
-use jero_tokenizer::{DetokenizeStep, GgufTokenizer};
+use jero_tokenizer::DetokenizeStep;
 
+use crate::container::load_diag_tokenizer;
 use crate::{DiagConfig, is_abort_requested};
 
 /// Executes a single deterministic greedy ($T = 0$) forward pass and writes a [`ParityDumpReport`]
@@ -48,44 +49,41 @@ pub fn run_parity_dump<W: Write>(
     });
 
     let inspector = SystemMemoryInspector::new();
-    let (worker_pool, locked_weights, recipe, resolved_policy) = if let Some(policy) =
-        config.phase_policy
-    {
-        let (locked_weights, recipe, _footprint) =
-            LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
-        let gguf_probe = GgufFile::parse(locked_weights.as_bytes())?;
-        let tokenizer_probe = GgufTokenizer::from_gguf(&gguf_probe)?;
-        let probe_tokens = tokenize_prompt_utf8_safe(&tokenizer_probe, prompt_text, false, n_ctx)?;
-        let worker_pool = WorkerPool::for_phase_policy(
-            policy,
-            locked_weights.metadata(),
-            probe_tokens.len(),
-            config.core_mask,
-            config.threads,
-            profile,
-        )?;
-        worker_pool.verify_live_affinities()?;
-        let effective = worker_pool.phase_policy().unwrap_or(policy);
-        (worker_pool, locked_weights, recipe, effective)
-    } else {
-        let resolved_affinity =
-            resolve_affinity(config.cluster.as_deref(), config.core_mask, config.threads)?;
-        let worker_pool = WorkerPool::with_coordination(resolved_affinity, profile)?;
-        worker_pool.verify_live_affinities()?;
-        let (locked_weights, recipe, _footprint) =
-            LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
-        (
-            worker_pool,
-            locked_weights,
-            recipe,
-            ClusterPhasePolicy::Auto,
-        )
-    };
+    let (worker_pool, locked_weights, recipe, resolved_policy) =
+        if let Some(policy) = config.phase_policy {
+            let (locked_weights, recipe, _footprint) =
+                LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
+            let tokenizer_probe = load_diag_tokenizer(Path::new(model_path), &locked_weights)?;
+            let probe_tokens = tokenizer_probe.tokenize_prompt(prompt_text, false, n_ctx)?;
+            let worker_pool = WorkerPool::for_phase_policy(
+                policy,
+                locked_weights.metadata(),
+                probe_tokens.len(),
+                config.core_mask,
+                config.threads,
+                profile,
+            )?;
+            worker_pool.verify_live_affinities()?;
+            let effective = worker_pool.phase_policy().unwrap_or(policy);
+            (worker_pool, locked_weights, recipe, effective)
+        } else {
+            let resolved_affinity =
+                resolve_affinity(config.cluster.as_deref(), config.core_mask, config.threads)?;
+            let worker_pool = WorkerPool::with_coordination(resolved_affinity, profile)?;
+            worker_pool.verify_live_affinities()?;
+            let (locked_weights, recipe, _footprint) =
+                LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
+            (
+                worker_pool,
+                locked_weights,
+                recipe,
+                ClusterPhasePolicy::Auto,
+            )
+        };
 
-    let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
-    let mut kv_arena = SingleSlotKvArena::from_gguf(&gguf_view, n_ctx)?;
-    let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
-    let prompt_tokens = tokenize_prompt_utf8_safe(&tokenizer, prompt_text, false, n_ctx)?;
+    let mut kv_arena = SingleSlotKvArena::new(locked_weights.metadata(), n_ctx)?;
+    let tokenizer = load_diag_tokenizer(Path::new(model_path), &locked_weights)?;
+    let prompt_tokens = tokenizer.tokenize_prompt(prompt_text, false, n_ctx)?;
     let quant_str = QuantizationInfo::from_descriptors(locked_weights.metadata().tensors()).primary;
 
     let mut detokenizer = tokenizer.streaming_detokenizer();

@@ -13,19 +13,18 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jero_core::{
-    ArchRecipe, CoordinationProfile, ExecutionContext, GgufFile, K3Error, ModelWeights,
-    QuantizationInfo,
+    ArchRecipe, CoordinationProfile, ExecutionContext, K3Error, ModelWeights, QuantizationInfo,
 };
 use jero_engine::{
-    ClusterPhasePolicy, EnginePhase, GenerationConfig, LockedModelWeights, SinglePromptEngine,
-    SingleSlotKvArena, StopReason, StreamAction, SystemMemoryInspector, WorkerPool,
-    discover_stop_token_ids, encode_formatted_prompt_utf8_safe, format_single_turn_prompt,
-    infer_logits_buffer_len, resolve_affinity, sample_greedy_argmax, select_phase_policy_for_arch,
+    ClusterPhasePolicy, EnginePhase, LockedModelWeights, SinglePromptEngine, SingleSlotKvArena,
+    StopReason, StreamAction, SystemMemoryInspector, WorkerPool, infer_logits_buffer_len,
+    resolve_affinity, sample_greedy_argmax, select_phase_policy_for_arch,
 };
-use jero_tokenizer::{DetokenizeStep, GgufTokenizer, Tokenizer};
+use jero_tokenizer::DetokenizeStep;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::container::{DiagTokenizer, load_diag_tokenizer};
 use crate::{DiagConfig, is_abort_requested};
 
 #[derive(Debug)]
@@ -113,11 +112,8 @@ pub fn run_ephemeral_openai_server<W: Write>(
             )
         };
 
-    let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
-    let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
-    engine.set_generation_config(
-        GenerationConfig::from_tokenizer(&tokenizer).with_ignore_eos(config.ignore_eos),
-    );
+    let tokenizer = load_diag_tokenizer(Path::new(model_path), &locked_weights)?;
+    engine.set_generation_config(tokenizer.generation_config(config.ignore_eos));
     let arch_name = locked_weights.metadata().architecture().to_owned();
     let quant_str = QuantizationInfo::from_descriptors(locked_weights.metadata().tensors()).primary;
     let model_id = Path::new(model_path)
@@ -178,7 +174,6 @@ pub fn run_ephemeral_openai_server<W: Write>(
                     &quant_str,
                     n_ctx,
                     default_max_tokens,
-                    &gguf_view,
                     &tokenizer,
                     recipe.as_ref(),
                     &locked_weights,
@@ -213,8 +208,7 @@ fn handle_http_request(
     quant_str: &str,
     n_ctx: usize,
     default_max_tokens: usize,
-    gguf_view: &GgufFile<'_>,
-    tokenizer: &GgufTokenizer,
+    tokenizer: &DiagTokenizer,
     recipe: &dyn ArchRecipe,
     locked_weights: &LockedModelWeights,
     worker_pool: &WorkerPool,
@@ -273,7 +267,6 @@ fn handle_http_request(
             arch_name,
             n_ctx,
             default_max_tokens,
-            gguf_view,
             tokenizer,
             recipe,
             locked_weights,
@@ -303,7 +296,6 @@ fn handle_http_request(
             model_id,
             n_ctx,
             default_max_tokens,
-            gguf_view,
             tokenizer,
             recipe,
             locked_weights,
@@ -342,8 +334,7 @@ fn process_chat_completions(
     arch_name: &str,
     n_ctx: usize,
     default_max_tokens: usize,
-    gguf_view: &GgufFile<'_>,
-    tokenizer: &GgufTokenizer,
+    tokenizer: &DiagTokenizer,
     recipe: &dyn ArchRecipe,
     locked_weights: &LockedModelWeights,
     worker_pool: &WorkerPool,
@@ -369,7 +360,8 @@ fn process_chat_completions(
     let stop_strings = extract_stop_sequences(&payload);
 
     let formatted_prompt = format_chat_messages(tokenizer, arch_name, &messages);
-    let mut prompt_tokens = encode_formatted_prompt_utf8_safe(tokenizer, &formatted_prompt, true)
+    let mut prompt_tokens = tokenizer
+        .encode_formatted_prompt(&formatted_prompt, true)
         .map_err(|e| (400_u16, format!("prompt tokenization failed: {e}")))?;
     if prompt_tokens.is_empty() {
         prompt_tokens.push(tokenizer.special_tokens().bos_token_id.unwrap_or(0));
@@ -387,7 +379,7 @@ fn process_chat_completions(
     let remaining_ctx = n_ctx.saturating_sub(prompt_tokens.len());
     let effective_max_tokens = req_max_tokens.min(remaining_ctx);
 
-    let mut kv_arena = SingleSlotKvArena::from_gguf(gguf_view, n_ctx)
+    let mut kv_arena = SingleSlotKvArena::new(locked_weights.metadata(), n_ctx)
         .map_err(|e| (500_u16, format!("KV arena allocation failed: {e}")))?;
     let mut detok = tokenizer.streaming_detokenizer();
     let ignore_eos = engine.generation_config().ignore_eos;
@@ -489,8 +481,7 @@ fn process_text_completions(
     default_model_id: &str,
     n_ctx: usize,
     default_max_tokens: usize,
-    gguf_view: &GgufFile<'_>,
-    tokenizer: &GgufTokenizer,
+    tokenizer: &DiagTokenizer,
     recipe: &dyn ArchRecipe,
     locked_weights: &LockedModelWeights,
     worker_pool: &WorkerPool,
@@ -525,7 +516,8 @@ fn process_text_completions(
     for (choice_idx, input) in inputs.iter().enumerate() {
         let (raw_prompt_str, mut prompt_tokens) = match input {
             PromptInput::Text(s) => {
-                let toks = encode_formatted_prompt_utf8_safe(tokenizer, s, true)
+                let toks = tokenizer
+                    .encode_formatted_prompt(s, true)
                     .map_err(|e| (400_u16, format!("prompt tokenization failed: {e}")))?;
                 (s.clone(), toks)
             }
@@ -560,7 +552,6 @@ fn process_text_completions(
                 top_k,
                 &stop_strings,
                 n_ctx,
-                gguf_view,
                 tokenizer,
                 recipe,
                 locked_weights,
@@ -576,7 +567,7 @@ fn process_text_completions(
                 "finish_reason": finish_reason,
             }));
         } else {
-            let mut kv_arena = SingleSlotKvArena::from_gguf(gguf_view, n_ctx)
+            let mut kv_arena = SingleSlotKvArena::new(locked_weights.metadata(), n_ctx)
                 .map_err(|e| (500_u16, format!("KV arena allocation failed: {e}")))?;
             let mut detok = tokenizer.streaming_detokenizer();
             let ignore_eos = engine.generation_config().ignore_eos;
@@ -679,14 +670,13 @@ fn evaluate_completion_with_logprobs(
     top_k: usize,
     stop_strings: &[String],
     n_ctx: usize,
-    gguf_view: &GgufFile<'_>,
-    tokenizer: &GgufTokenizer,
+    tokenizer: &DiagTokenizer,
     recipe: &dyn ArchRecipe,
     locked_weights: &LockedModelWeights,
     worker_pool: &WorkerPool,
     resolved_policy: ClusterPhasePolicy,
 ) -> Result<(String, usize, &'static str, CompletionLogprobs), (u16, String)> {
-    let mut kv_arena = SingleSlotKvArena::from_gguf(gguf_view, n_ctx)
+    let mut kv_arena = SingleSlotKvArena::new(locked_weights.metadata(), n_ctx)
         .map_err(|e| (500_u16, format!("KV arena allocation failed: {e}")))?;
     let vocab_size = tokenizer.vocab_size();
     let logits_len = infer_logits_buffer_len(locked_weights, vocab_size);
@@ -832,7 +822,7 @@ fn generate_from_ready_context(
     vocab_size: usize,
     top_k: usize,
     stop_strings: &[String],
-    tokenizer: &GgufTokenizer,
+    tokenizer: &DiagTokenizer,
     recipe: &dyn ArchRecipe,
     locked_weights: &dyn ModelWeights,
     worker_pool: &WorkerPool,
@@ -850,7 +840,7 @@ fn generate_from_ready_context(
     let mut generated_text = String::new();
     let mut gen_count = 0_usize;
     let mut stopped = false;
-    let stop_ids = discover_stop_token_ids(tokenizer);
+    let stop_ids = tokenizer.stop_token_ids();
 
     let sample_len = vocab_size.min(ctx.logits().len());
     let mut current_token = sample_greedy_argmax(&ctx.logits()[..sample_len])
@@ -920,7 +910,7 @@ fn compute_step_logprobs(
     logits: &[f32],
     chosen_token: u32,
     top_k: usize,
-    tokenizer: &GgufTokenizer,
+    tokenizer: &DiagTokenizer,
 ) -> (f64, BTreeMap<String, f64>) {
     let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let max_f64 = f64::from(max_logit);
@@ -949,7 +939,7 @@ fn compute_step_logprobs(
     (chosen_lp, top_map)
 }
 
-fn decode_token_piece_lossy(tokenizer: &GgufTokenizer, token_id: u32) -> String {
+fn decode_token_piece_lossy(tokenizer: &DiagTokenizer, token_id: u32) -> String {
     tokenizer
         .decode_piece(token_id)
         .ok()
@@ -958,7 +948,7 @@ fn decode_token_piece_lossy(tokenizer: &GgufTokenizer, token_id: u32) -> String 
 }
 
 fn format_chat_messages(
-    tokenizer: &GgufTokenizer,
+    tokenizer: &DiagTokenizer,
     arch_name: &str,
     messages: &[ChatMessage],
 ) -> String {
@@ -981,7 +971,7 @@ fn format_chat_messages(
         }
     }
 
-    let tmpl = tokenizer.chat_template().raw_template().unwrap_or_default();
+    let tmpl = tokenizer.raw_chat_template().unwrap_or_default();
     if tmpl.contains("<|im_start|>")
         || matches!(
             arch_name,
@@ -1018,7 +1008,7 @@ fn format_chat_messages(
             combined.push_str(text);
         }
     }
-    format_single_turn_prompt(tokenizer, combined.trim())
+    tokenizer.format_single_turn_prompt(combined.trim())
 }
 
 fn extract_message_text(content: &Value) -> String {

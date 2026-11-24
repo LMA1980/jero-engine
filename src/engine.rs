@@ -2182,36 +2182,75 @@ mod tests {
         assert!(matches!(nan_err, K3Error::CapabilityMismatch { .. }));
     }
 
-    #[cfg(feature = "jero-arch-modernbert")]
-    fn overwrite_f32_tensor_tail(bytes: &mut [u8], tensor_specs: &[(&str, QuantType, &[usize])]) {
+    #[cfg(any(feature = "jero-arch-encoder", feature = "jero-arch-gemma"))]
+    fn overwrite_f32_tensors_deterministic(
+        bytes: &mut [u8],
+        tensor_specs: &[(&str, QuantType, &[usize])],
+    ) {
         let total_elems: usize = tensor_specs
             .iter()
             .map(|(_, _, shape)| shape.iter().product::<usize>())
             .sum();
-        let data_start = bytes.len() - total_elems * 4;
-        for idx in 0..total_elems {
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "small bounded test index fits f32"
-            )]
-            let val = (((idx * 7 + 3) % 19) as f32 - 9.0) * 0.05;
-            let offset = data_start + idx * 4;
-            bytes[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
+        let mut cursor = bytes.len() - total_elems * 4;
+        for &(name, _, shape) in tensor_specs {
+            let elems: usize = shape.iter().product();
+            let is_norm = name.contains("norm");
+            for idx in 0..elems {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "small bounded test index fits f32"
+                )]
+                let val = if is_norm {
+                    1.0_f32
+                } else {
+                    (((idx * 7 + 3) % 19) as f32 - 9.0) * 0.05
+                };
+                bytes[cursor..cursor + 4].copy_from_slice(&val.to_le_bytes());
+                cursor += 4;
+            }
         }
     }
 
-    #[cfg(feature = "jero-arch-modernbert")]
+    #[cfg(feature = "jero-arch-encoder")]
+    fn build_complete_modernbert_test_gguf(num_layers: usize, num_labels: usize) -> Vec<u8> {
+        use jero_core::{QuantType, test_helpers::create_synthetic_gguf_v3};
+
+        let mut owned_specs: Vec<(String, QuantType, Vec<usize>)> =
+            vec![("token_embd.weight".to_owned(), QuantType::F32, vec![8, 16])];
+        for l in 0..num_layers {
+            for (suffix, shape) in [
+                ("attn_norm.weight", vec![8]),
+                ("attn_q.weight", vec![8, 8]),
+                ("attn_k.weight", vec![8, 8]),
+                ("attn_v.weight", vec![8, 8]),
+                ("attn_output.weight", vec![8, 8]),
+                ("ffn_norm.weight", vec![8]),
+                ("ffn_up.weight", vec![8, 16]),
+                ("ffn_down.weight", vec![16, 8]),
+            ] {
+                owned_specs.push((format!("blk.{l}.{suffix}"), QuantType::F32, shape));
+            }
+        }
+        owned_specs.push((
+            "classifier.weight".to_owned(),
+            QuantType::F32,
+            vec![8, num_labels],
+        ));
+        let borrowed: Vec<(&str, QuantType, &[usize])> = owned_specs
+            .iter()
+            .map(|(n, q, s)| (n.as_str(), *q, s.as_slice()))
+            .collect();
+        let mut bytes = create_synthetic_gguf_v3("modernbert", 64, &borrowed);
+        overwrite_f32_tensors_deterministic(&mut bytes, &borrowed);
+        bytes
+    }
+
+    #[cfg(feature = "jero-arch-encoder")]
     #[test]
     fn test_modernbert_recipe_zero_kv_classify() {
         use jero_core::{GgufFile, QuantType, test_helpers::create_synthetic_gguf_v3};
 
-        let tensor_specs = [
-            ("token_embd.weight", QuantType::F32, &[8, 16][..]),
-            ("blk.0.attn_q.weight", QuantType::F32, &[8, 8][..]),
-            ("classifier.weight", QuantType::F32, &[8, 3][..]),
-        ];
-        let mut bytes = create_synthetic_gguf_v3("modernbert", 64, &tensor_specs);
-        overwrite_f32_tensor_tail(&mut bytes, &tensor_specs);
+        let bytes = build_complete_modernbert_test_gguf(2, 3);
         let gguf = GgufFile::parse(&bytes).expect("parse modernbert gguf");
 
         let mut recipe = crate::modernbert::ModernBertRecipe::new_modernbert();
@@ -2236,19 +2275,27 @@ mod tests {
             harvest_decision_logprobs(&logits, &[0, 1, 2]).expect("harvest class logprobs");
         let total_prob: f32 = harvested.iter().map(|(_, lp)| lp.exp()).sum();
         assert!((total_prob - 1.0).abs() < 1e-5);
+
+        // Missing layer/head weights must fail closed under ADR-045.
+        let incomplete_bytes = create_synthetic_gguf_v3(
+            "modernbert",
+            64,
+            &[("token_embd.weight", QuantType::F32, &[8, 16][..])],
+        );
+        let incomplete = GgufFile::parse(&incomplete_bytes).expect("parse incomplete");
+        assert!(
+            engine
+                .evaluate_classify(&recipe, &incomplete, &[2, 4], 64, 3)
+                .is_err()
+        );
     }
 
-    #[cfg(feature = "jero-arch-modernbert")]
+    #[cfg(feature = "jero-arch-encoder")]
     #[test]
     fn test_zero_kv_admission_and_logit_harvest() {
-        use jero_core::{GgufFile, QuantType, test_helpers::create_synthetic_gguf_v3};
+        use jero_core::GgufFile;
 
-        let tensor_specs = [
-            ("token_embd.weight", QuantType::F32, &[8, 16][..]),
-            ("classifier.weight", QuantType::F32, &[8, 2][..]),
-        ];
-        let mut bytes = create_synthetic_gguf_v3("modernbert", 128, &tensor_specs);
-        overwrite_f32_tensor_tail(&mut bytes, &tensor_specs);
+        let bytes = build_complete_modernbert_test_gguf(1, 2);
         let gguf = GgufFile::parse(&bytes).expect("parse gguf");
 
         // Tight RLIMIT_MEMLOCK barely above weight allocation must still admit zero-KV encoders.
@@ -2426,9 +2473,41 @@ mod tests {
     #[cfg(feature = "jero-arch-gemma")]
     #[test]
     fn test_fsm_logit_mask_and_jump_forward_checkpoint() {
-        use jero_core::{GgufFile, QuantType, test_helpers::create_synthetic_gguf_v3};
+        use jero_core::{
+            GgufFile, GgufValue, QuantType, test_helpers::create_synthetic_gguf_v3_with_kvs,
+        };
 
-        let bytes = create_synthetic_gguf_v3("functiongemma", 32, &[]);
+        let extra_kvs = [
+            ("functiongemma.block_count", GgufValue::Uint32(1)),
+            ("functiongemma.embedding_length", GgufValue::Uint32(8)),
+            ("functiongemma.feed_forward_length", GgufValue::Uint32(16)),
+            ("functiongemma.attention.head_count", GgufValue::Uint32(2)),
+            (
+                "functiongemma.attention.head_count_kv",
+                GgufValue::Uint32(1),
+            ),
+            ("functiongemma.attention.key_length", GgufValue::Uint32(4)),
+            ("functiongemma.context_length", GgufValue::Uint32(32)),
+        ];
+        let tensor_specs = [
+            ("token_embd.weight", QuantType::F32, &[8usize, 8][..]),
+            ("blk.0.attn_norm.weight", QuantType::F32, &[8][..]),
+            ("blk.0.attn_q.weight", QuantType::F32, &[8, 8][..]),
+            ("blk.0.attn_k.weight", QuantType::F32, &[8, 4][..]),
+            ("blk.0.attn_v.weight", QuantType::F32, &[8, 4][..]),
+            ("blk.0.attn_output.weight", QuantType::F32, &[8, 8][..]),
+            ("blk.0.attn_q_norm.weight", QuantType::F32, &[4][..]),
+            ("blk.0.attn_k_norm.weight", QuantType::F32, &[4][..]),
+            ("blk.0.ffn_norm.weight", QuantType::F32, &[8][..]),
+            ("blk.0.ffn_gate.weight", QuantType::F32, &[8, 16][..]),
+            ("blk.0.ffn_up.weight", QuantType::F32, &[8, 16][..]),
+            ("blk.0.ffn_down.weight", QuantType::F32, &[16, 8][..]),
+            ("output_norm.weight", QuantType::F32, &[8][..]),
+            ("output.weight", QuantType::F32, &[8, 8][..]),
+        ];
+        let mut bytes =
+            create_synthetic_gguf_v3_with_kvs("functiongemma", 32, &extra_kvs, &tensor_specs);
+        overwrite_f32_tensors_deterministic(&mut bytes, &tensor_specs);
         let gguf = GgufFile::parse(&bytes).expect("parse functiongemma");
         let mut recipe = crate::gemma::GemmaRecipe::new_functiongemma();
         recipe.num_layers = 1;
@@ -2463,7 +2542,14 @@ mod tests {
         assert_eq!(logits[0], f32::NEG_INFINITY);
         assert_eq!(logits[3], f32::NEG_INFINITY);
 
-        let _ = QuantType::F32;
+        // Empty weights fail closed under ADR-045.
+        let empty_bytes = create_synthetic_gguf_v3_with_kvs("functiongemma", 32, &extra_kvs, &[]);
+        let empty_gguf = GgufFile::parse(&empty_bytes).expect("parse empty functiongemma");
+        let mut empty_logits = [0.0_f32; 8];
+        let mut empty_ctx =
+            ExecutionContext::new(&[0_u32], 32, &mut empty_logits, kv_arena.as_mut_slice())
+                .expect("empty ctx");
+        assert!(recipe.prefill_step(&mut empty_ctx, &empty_gguf).is_err());
     }
 
     #[test]

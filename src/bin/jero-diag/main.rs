@@ -16,10 +16,12 @@
 )]
 
 pub mod bench;
+pub mod container;
 pub mod eval;
 pub mod parity;
 pub mod serve;
 
+use container::load_diag_tokenizer;
 use eval::EvalSuite;
 
 use std::env;
@@ -28,17 +30,16 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use jero_core::{CoordinationProfile, GgufFile, K3Error, ModelIdentity, QuantizationInfo};
+use jero_core::{CoordinationProfile, K3Error, ModelIdentity, QuantizationInfo};
 use jero_engine::affinity::{SplitStrategy, resolve_affinity_split, resolve_phase_policy};
 use jero_engine::forward::MatKernel;
 use jero_engine::memory::calculate_footprint;
 use jero_engine::{
-    A100_CLUSTER_MASK, ClusterPhasePolicy, GenerationConfig, LockedModelWeights,
-    SinglePromptEngine, SingleSlotKvArena, StreamAction, SystemMemoryInspector, WorkerPool,
-    X100_CLUSTER_MASK, tokenize_prompt_utf8_safe,
+    A100_CLUSTER_MASK, ClusterPhasePolicy, LockedModelWeights, SinglePromptEngine,
+    SingleSlotKvArena, StreamAction, SystemMemoryInspector, WorkerPool, X100_CLUSTER_MASK,
 };
 use jero_kernels_rvv::ime::ime_vmadot_count;
-use jero_tokenizer::{DetokenizeStep, GgufTokenizer};
+use jero_tokenizer::DetokenizeStep;
 use serde::{Deserialize, Serialize};
 
 /// Global atomic flag set when `SIGINT` or `SIGTERM` is received so the decode loop
@@ -697,10 +698,8 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
     ) = if let Some(policy) = config.phase_policy {
         let (locked_weights, recipe, _footprint) =
             LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
-        let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
-        let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
-        let prompt_tokens =
-            tokenize_prompt_utf8_safe(&tokenizer, prompt_text, !config.raw_prompt, n_ctx)?;
+        let tokenizer = load_diag_tokenizer(Path::new(model_path), &locked_weights)?;
+        let prompt_tokens = tokenizer.tokenize_prompt(prompt_text, !config.raw_prompt, n_ctx)?;
         let worker_pool = WorkerPool::for_phase_policy(
             policy,
             locked_weights.metadata(),
@@ -715,8 +714,7 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
         let effective_core_mask = format!("0x{:04X}", affinity.effective_mask);
         let thread_count = worker_pool.thread_count();
         let resolved_policy = worker_pool.phase_policy().unwrap_or(policy);
-        let gen_config =
-            GenerationConfig::from_tokenizer(&tokenizer).with_ignore_eos(config.ignore_eos);
+        let gen_config = tokenizer.generation_config(config.ignore_eos);
         let engine = SinglePromptEngine::new()
             .with_phase_policy(resolved_policy)
             .with_generation_config(gen_config);
@@ -749,23 +747,20 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
         let ime_supported =
             bench::probe_cluster_ime(&resolved_affinity, config.cluster.as_deref(), ime_on)?;
 
-        // 2. Open model with flock(LOCK_SH), GGUF parse, capability filter, pre-flight RAM admission, and mlock
+        // 2. Open model with flock(LOCK_SH), container parse, capability filter, pre-flight RAM admission, and mlock
         let (locked_weights, recipe, _footprint) =
             LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
 
-        // 3. Extract GGUF vocabulary/template and tokenize prompt in-process
-        let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
-        let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
-        let prompt_tokens =
-            tokenize_prompt_utf8_safe(&tokenizer, prompt_text, !config.raw_prompt, n_ctx)?;
+        // 3. Extract vocabulary/template and tokenize prompt in-process
+        let tokenizer = load_diag_tokenizer(Path::new(model_path), &locked_weights)?;
+        let prompt_tokens = tokenizer.tokenize_prompt(prompt_text, !config.raw_prompt, n_ctx)?;
         let resolved_policy = resolve_engine_policy(
             config.split,
             recipe.architecture_id(),
             prompt_tokens.len(),
             resolved_affinity.effective_mask,
         );
-        let gen_config =
-            GenerationConfig::from_tokenizer(&tokenizer).with_ignore_eos(config.ignore_eos);
+        let gen_config = tokenizer.generation_config(config.ignore_eos);
         (
             worker_pool,
             resolved_affinity,
@@ -787,7 +782,6 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
         .max_tokens
         .unwrap_or(128)
         .min(n_ctx.saturating_sub(prompt_tokens.len()));
-    let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
     let _repack_summary = locked_weights.prepare_repacked_weights(Some(&worker_pool))?;
     let model_view = locked_weights.model_view();
 
@@ -809,7 +803,7 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
             if is_abort_requested() {
                 break;
             }
-            let mut kv_arena = SingleSlotKvArena::from_gguf(&gguf_view, n_ctx)?;
+            let mut kv_arena = SingleSlotKvArena::new(locked_weights.metadata(), n_ctx)?;
             let ime_before = ime_vmadot_count();
             let mut summary = engine.evaluate_prompt_with_pool(
                 recipe.as_ref(),
@@ -959,23 +953,28 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
         .fold(0xCBF2_9CE4_8422_2325_u64, |h, &b| {
             (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
         });
-    let model_name = gguf_view
-        .metadata_value("general.name")
-        .and_then(|v| v.as_str())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| {
-            Path::new(model_path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_owned()
-        });
+    let model_name = match locked_weights.parse_container()? {
+        jero_engine::ParsedModelContainer::Gguf(gguf) => gguf
+            .metadata_value("general.name")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned),
+        jero_engine::ParsedModelContainer::SafeTensors(st) => {
+            st.metadata_value("general.name").map(str::to_owned)
+        }
+    }
+    .unwrap_or_else(|| {
+        Path::new(model_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_owned()
+    });
     let model_filename = Path::new(model_path)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(model_path)
         .to_owned();
-    let architecture = gguf_view.architecture().to_owned();
+    let architecture = locked_weights.metadata().architecture().to_owned();
     let model_identity = ModelIdentity {
         name: model_name,
         architecture: architecture.clone(),
@@ -1105,10 +1104,9 @@ pub fn run_single_eval_session<W: Write>(config: &DiagConfig, mut out: W) -> Res
     {
         let (locked_weights, recipe, _footprint) =
             LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
-        let gguf_probe = GgufFile::parse(locked_weights.as_bytes())?;
-        let tokenizer_probe = GgufTokenizer::from_gguf(&gguf_probe)?;
+        let tokenizer_probe = load_diag_tokenizer(Path::new(model_path), &locked_weights)?;
         let probe_tokens =
-            tokenize_prompt_utf8_safe(&tokenizer_probe, prompt_text, !config.raw_prompt, n_ctx)?;
+            tokenizer_probe.tokenize_prompt(prompt_text, !config.raw_prompt, n_ctx)?;
         let worker_pool = WorkerPool::for_phase_policy(
             policy,
             locked_weights.metadata(),
@@ -1135,7 +1133,7 @@ pub fn run_single_eval_session<W: Write>(config: &DiagConfig, mut out: W) -> Res
         worker_pool.verify_live_affinities()?;
         let _ = bench::probe_cluster_ime(&resolved_affinity, config.cluster.as_deref(), ime_on)?;
 
-        // 2. Open model with flock(LOCK_SH), GGUF parse, capability filter, pre-flight RAM admission, and mlock (US-01.2, US-01.3, Scenario 1 & 3)
+        // 2. Open model with flock(LOCK_SH), container parse, capability filter, pre-flight RAM admission, and mlock (US-01.2, US-01.3, Scenario 1 & 3)
         let (locked_weights, recipe, _footprint) =
             LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
         let phase_policy = match config.split {
@@ -1150,12 +1148,10 @@ pub fn run_single_eval_session<W: Write>(config: &DiagConfig, mut out: W) -> Res
         )
     };
 
-    // 3. Extract GGUF view/vocabulary/template, allocate 16-token paged KV cache arena, and tokenize prompt in-process
-    let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
-    let mut kv_arena = SingleSlotKvArena::from_gguf(&gguf_view, n_ctx)?;
-    let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
-    let prompt_tokens =
-        tokenize_prompt_utf8_safe(&tokenizer, prompt_text, !config.raw_prompt, n_ctx)?;
+    // 3. Extract vocabulary/template, allocate 16-token paged KV cache arena, and tokenize prompt in-process
+    let mut kv_arena = SingleSlotKvArena::new(locked_weights.metadata(), n_ctx)?;
+    let tokenizer = load_diag_tokenizer(Path::new(model_path), &locked_weights)?;
+    let prompt_tokens = tokenizer.tokenize_prompt(prompt_text, !config.raw_prompt, n_ctx)?;
     if config.phase_policy.is_none() {
         engine.set_phase_policy(resolve_engine_policy(
             config.split,
@@ -1164,8 +1160,7 @@ pub fn run_single_eval_session<W: Write>(config: &DiagConfig, mut out: W) -> Res
             worker_pool.affinity().effective_mask,
         ));
     }
-    let gen_config =
-        GenerationConfig::from_tokenizer(&tokenizer).with_ignore_eos(config.ignore_eos);
+    let gen_config = tokenizer.generation_config(config.ignore_eos);
     let stop_ids = gen_config.stop_token_ids.clone();
     engine.set_generation_config(gen_config);
 
