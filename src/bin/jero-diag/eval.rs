@@ -19,18 +19,18 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 
-use jero_core::{CoordinationProfile, GgufFile, K3Error, QuantizationInfo};
+use jero_core::{CoordinationProfile, K3Error, QuantizationInfo};
 use jero_engine::forward::{
     ForwardModel, Lane, MatKernel, PlacementPlan, measure_memory_bandwidth, measure_peak_macs,
 };
 use jero_engine::{
-    GenerationConfig, LockedModelWeights, SinglePromptEngine, SingleSlotKvArena, StreamAction,
-    SystemMemoryInspector, WorkerPool, discover_stop_token_ids, resolve_affinity,
-    tokenize_prompt_utf8_safe,
+    LockedModelWeights, SinglePromptEngine, SingleSlotKvArena, StreamAction, SystemMemoryInspector,
+    WorkerPool, resolve_affinity,
 };
-use jero_tokenizer::{DetokenizeStep, GgufTokenizer};
+use jero_tokenizer::DetokenizeStep;
 use serde::{Deserialize, Serialize};
 
+use crate::container::load_diag_tokenizer;
 use crate::{DiagConfig, is_abort_requested};
 
 /// Publicly recognized open-source evaluation suite selector.
@@ -719,15 +719,10 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
     ) = if let Some(policy) = config.phase_policy {
         let (locked_weights, recipe, footprint) =
             LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
-        let gguf_probe = GgufFile::parse(locked_weights.as_bytes())?;
-        let tok_probe = GgufTokenizer::from_gguf(&gguf_probe)?;
-        let sample_len = tokenize_prompt_utf8_safe(
-            &tok_probe,
-            &filtered_items[0].prompt,
-            apply_chat_template,
-            n_ctx,
-        )
-        .map_or(8, |t| t.len());
+        let tok_probe = load_diag_tokenizer(Path::new(model_path), &locked_weights)?;
+        let sample_len = tok_probe
+            .tokenize_prompt(&filtered_items[0].prompt, apply_chat_template, n_ctx)
+            .map_or(8, |t| t.len());
         let worker_pool = WorkerPool::for_phase_policy(
             policy,
             locked_weights.metadata(),
@@ -804,12 +799,9 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
         )
     };
     let resolved_affinity = worker_pool.affinity().clone();
-    let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
-    let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
-    let stop_token_ids = discover_stop_token_ids(&tokenizer);
-    engine.set_generation_config(
-        GenerationConfig::from_tokenizer(&tokenizer).with_ignore_eos(eval_cfg.ignore_eos),
-    );
+    let tokenizer = load_diag_tokenizer(Path::new(model_path), &locked_weights)?;
+    let stop_token_ids = tokenizer.stop_token_ids();
+    engine.set_generation_config(tokenizer.generation_config(eval_cfg.ignore_eos));
 
     let arch_name = locked_weights.metadata().architecture().to_owned();
     let quant_str = QuantizationInfo::from_descriptors(locked_weights.metadata().tensors()).primary;
@@ -835,8 +827,7 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
             suite_order.push(item.suite.clone());
         }
 
-        let prompt_tokens =
-            tokenize_prompt_utf8_safe(&tokenizer, &item.prompt, apply_chat_template, n_ctx)?;
+        let prompt_tokens = tokenizer.tokenize_prompt(&item.prompt, apply_chat_template, n_ctx)?;
         let eval_tokens = if prompt_tokens.len() >= n_ctx {
             &prompt_tokens[..n_ctx.saturating_sub(4).max(1)]
         } else {
@@ -844,7 +835,7 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
         };
 
         // Run pass 1 and pass 2 at temperature 0 to verify deterministic token generation
-        let mut kv_arena_1 = SingleSlotKvArena::from_gguf(&gguf_view, n_ctx)?;
+        let mut kv_arena_1 = SingleSlotKvArena::new(locked_weights.metadata(), n_ctx)?;
         let mut detok = tokenizer.streaming_detokenizer();
         let mut text_out = String::new();
         let summary_1 = engine.evaluate_prompt_with_pool(
@@ -885,7 +876,7 @@ pub fn run_public_eval_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> R
             text_out.push_str(&detok.finish());
         }
 
-        let mut kv_arena_2 = SingleSlotKvArena::from_gguf(&gguf_view, n_ctx)?;
+        let mut kv_arena_2 = SingleSlotKvArena::new(locked_weights.metadata(), n_ctx)?;
         let summary_2 = engine.evaluate_prompt_with_pool(
             recipe.as_ref(),
             &locked_weights,

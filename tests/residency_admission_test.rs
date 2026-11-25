@@ -181,9 +181,12 @@ fn test_hybrid_kv_admission() {
 }
 
 #[test]
+#[cfg(all(feature = "jero-arch-qwen", feature = "jero-kernels-rvv"))]
 fn test_qwen3_30b_a3b_admission() {
     use jero_engine::forward::{Lane, PlacementPlan};
-    use jero_engine::{Qwen3MoeRecipe, check_memory_admission_for_weight_bytes};
+    use jero_engine::{
+        Qwen3MoePlacementExt, Qwen3MoeRecipe, check_memory_admission_for_weight_bytes,
+    };
 
     // Qwen3-30B-A3B Q4_K_M profile (~17.5 GiB = 18,790,481,920 bytes, 128 experts, top-8 routed).
     let extra_kvs = [

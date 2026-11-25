@@ -11,7 +11,7 @@ use std::os::fd::OwnedFd;
 use std::path::Path;
 
 use jero_core::ipc::shm::DEFAULT_LIMIT_MEMLOCK_BYTES;
-use jero_core::{ArchRecipe, GgufFile, K3Error, ModelMetadata, ModelWeights, TensorView};
+use jero_core::{ArchRecipe, K3Error, ModelMetadata, ModelWeights, TensorView};
 
 use crate::affinity::WorkerPool;
 use crate::kv::SingleSlotKvArena;
@@ -166,8 +166,7 @@ impl LockedWeights {
         inspector: &I,
     ) -> Result<SingleSlotKvArena, WorkerError> {
         let _ = check_memory_admission_with(self.inner.metadata(), n_ctx, inspector)?;
-        let gguf = GgufFile::parse(self.as_slice())?;
-        Ok(SingleSlotKvArena::from_gguf(&gguf, n_ctx)?)
+        Ok(SingleSlotKvArena::new(self.inner.metadata(), n_ctx)?)
     }
 
     /// Returns mapped length of model weights in bytes.
@@ -259,10 +258,12 @@ impl ModelWeights for LockedWeights {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "jero-arch-synthetic")]
     use crate::memory::MockMemoryInspector;
     use jero_core::ipc::protocol::StatusCode;
     use jero_core::test_helpers::create_synthetic_gguf_v3;
     use std::io::Write;
+    #[cfg(feature = "jero-arch-synthetic")]
     use std::os::fd::AsRawFd;
 
     fn create_anonymous_fd_with_bytes(name: &str, bytes: &[u8]) -> OwnedFd {
@@ -316,6 +317,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jero-arch-synthetic")]
     #[cfg_attr(miri, ignore)]
     fn test_valid_model_mapping() {
         let gguf_bytes = create_synthetic_gguf_v3("synthetic", 32, &[]);
@@ -334,6 +336,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jero-arch-synthetic")]
     #[cfg_attr(miri, ignore)]
     fn test_exclusive_lock_conflict() {
         let gguf_bytes = create_synthetic_gguf_v3("synthetic", 32, &[]);
@@ -360,6 +363,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jero-arch-synthetic")]
     #[cfg_attr(miri, ignore)]
     fn test_memfd_admission_valid_miniature_gguf() {
         let gguf_bytes = create_synthetic_gguf_v3("synthetic", 32, &[]);
@@ -405,6 +409,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jero-arch-synthetic")]
     #[cfg_attr(miri, ignore)]
     fn test_memfd_admission_rejects_insufficient_memlock_headroom() {
         let gguf_bytes = create_synthetic_gguf_v3("synthetic", 32, &[]);

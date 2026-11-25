@@ -1,0 +1,85 @@
+{
+  "schema_version": "1.0.0",
+  "architecture": "gemma3",
+  "quantization_format": "Q8_0",
+  "prompt": "hello world",
+  "prompt_token_ids": [
+    1,
+    9,
+    8,
+    10
+  ],
+  "first_token_top_k": [
+    {
+      "token_id": 15,
+      "logit": 9.247429
+    },
+    {
+      "token_id": 8,
+      "logit": 7.627883
+    },
+    {
+      "token_id": 7,
+      "logit": 5.6013126
+    },
+    {
+      "token_id": 10,
+      "logit": 4.99647
+    },
+    {
+      "token_id": 12,
+      "logit": 4.5656395
+    },
+    {
+      "token_id": 9,
+      "logit": 4.525094
+    },
+    {
+      "token_id": 14,
+      "logit": 3.4617708
+    },
+    {
+      "token_id": 0,
+      "logit": 0.0
+    },
+    {
+      "token_id": 1,
+      "logit": 0.0
+    },
+    {
+      "token_id": 2,
+      "logit": 0.0
+    },
+    {
+      "token_id": 3,
+      "logit": 0.0
+    },
+    {
+      "token_id": 4,
+      "logit": 0.0
+    },
+    {
+      "token_id": 11,
+      "logit": -6.982295
+    },
+    {
+      "token_id": 6,
+      "logit": -8.648089
+    },
+    {
+      "token_id": 5,
+      "logit": -13.740013
+    },
+    {
+      "token_id": 13,
+      "logit": -14.75056
+    }
+  ],
+  "greedy_token_ids": [
+    15,
+    15,
+    12,
+    7
+  ],
+  "generated_text": "K3K3RVV\n"
+}

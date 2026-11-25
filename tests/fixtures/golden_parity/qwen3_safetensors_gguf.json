@@ -1,0 +1,85 @@
+{
+  "schema_version": "1.0.0",
+  "architecture": "qwen3",
+  "quantization_format": "F32",
+  "prompt": "hello world",
+  "prompt_token_ids": [
+    1,
+    9,
+    8,
+    10
+  ],
+  "first_token_top_k": [
+    {
+      "token_id": 15,
+      "logit": 4.0143743
+    },
+    {
+      "token_id": 7,
+      "logit": 3.306576
+    },
+    {
+      "token_id": 10,
+      "logit": 2.339139
+    },
+    {
+      "token_id": 5,
+      "logit": 1.8394957
+    },
+    {
+      "token_id": 13,
+      "logit": 1.6295103
+    },
+    {
+      "token_id": 9,
+      "logit": 0.5606611
+    },
+    {
+      "token_id": 0,
+      "logit": 0.0
+    },
+    {
+      "token_id": 1,
+      "logit": 0.0
+    },
+    {
+      "token_id": 2,
+      "logit": 0.0
+    },
+    {
+      "token_id": 3,
+      "logit": 0.0
+    },
+    {
+      "token_id": 4,
+      "logit": 0.0
+    },
+    {
+      "token_id": 14,
+      "logit": -0.26917124
+    },
+    {
+      "token_id": 12,
+      "logit": -1.3652911
+    },
+    {
+      "token_id": 11,
+      "logit": -1.8291218
+    },
+    {
+      "token_id": 6,
+      "logit": -2.6195388
+    },
+    {
+      "token_id": 8,
+      "logit": -2.9132495
+    }
+  ],
+  "greedy_token_ids": [
+    15,
+    15,
+    15,
+    15
+  ],
+  "generated_text": "K3K3K3K3"
+}

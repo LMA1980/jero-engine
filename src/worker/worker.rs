@@ -16,7 +16,7 @@ use jero_core::ipc::protocol::{
     send_msg_frame,
 };
 use jero_core::ipc::shm::SharedMemoryArena;
-use jero_core::{GgufFile, GgufValue, K3Error};
+use jero_core::{GgufFile, GgufValue, K3Error, SafeTensorsFile};
 use jero_tokenizer::GgufTokenizer;
 use zerocopy::FromBytes;
 
@@ -90,6 +90,23 @@ fn discover_worker_stop_tokens(weights: &LockedWeights) -> Vec<u32> {
         let mut ids = Vec::new();
         for key in ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"] {
             if let Some(id) = gguf.metadata_value(key).and_then(GgufValue::as_u32)
+                && !ids.contains(&id)
+            {
+                ids.push(id);
+            }
+        }
+        return ids;
+    }
+    if let Ok(st) = SafeTensorsFile::from_bytes(weights.as_slice()) {
+        let mut ids = Vec::new();
+        for key in [
+            "tokenizer.ggml.eos_token_id",
+            "tokenizer.ggml.eot_token_id",
+            "eos_token_id",
+        ] {
+            if let Some(id) = st
+                .metadata_value(key)
+                .and_then(|raw| raw.trim().parse::<u32>().ok())
                 && !ids.contains(&id)
             {
                 ids.push(id);

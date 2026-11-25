@@ -15,7 +15,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use jero_core::QuantType;
 use jero_core::ipc::shm::DEFAULT_LIMIT_MEMLOCK_BYTES;
 use jero_core::{
-    ArchRecipe, GgufFile, K3Error, ModelMetadata, ModelWeights, TensorDescriptor, TensorView,
+    ArchRecipe, GGUF_MAGIC, GgufFile, K3Error, ModelMetadata, ModelWeights, SafeTensorsFile,
+    TensorDescriptor, TensorView,
 };
 #[cfg(feature = "jero-kernels-rvv")]
 use jero_kernels_rvv::repack::{
@@ -24,10 +25,116 @@ use jero_kernels_rvv::repack::{
 };
 
 use crate::affinity::WorkerPool;
-use crate::capability::verify_model_capabilities;
+use crate::capability::{verify_model_capabilities, verify_safetensors_capabilities};
 use crate::memory::{
     MemoryFootprint, MemoryInspector, SystemMemoryInspector, check_memory_admission_with,
 };
+
+/// Detected binary container format backing [`LockedModelWeights`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelContainerFormat {
+    /// GGUF v3 binary container (`GGUF` magic `0x4655_4747`).
+    Gguf,
+    /// Hugging Face `SafeTensors` binary container.
+    SafeTensors,
+}
+
+impl ModelContainerFormat {
+    /// Detects the binary container format from raw leading file bytes (`GGUF` magic vs `SafeTensors`).
+    #[must_use]
+    pub fn detect(bytes: &[u8]) -> Self {
+        if bytes.len() >= 4
+            && u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) == GGUF_MAGIC
+        {
+            Self::Gguf
+        } else {
+            Self::SafeTensors
+        }
+    }
+}
+
+/// Zero-copy parsed container view over either a [`GgufFile`] or a [`SafeTensorsFile`].
+#[derive(Debug)]
+pub enum ParsedModelContainer<'a> {
+    /// Parsed GGUF v3 checkpoint.
+    Gguf(GgufFile<'a>),
+    /// Parsed `SafeTensors` checkpoint.
+    SafeTensors(SafeTensorsFile<'a>),
+}
+
+impl<'a> ParsedModelContainer<'a> {
+    /// Parses a memory-mapped checkpoint slice by inspecting magic bytes (`GGUF` vs `SafeTensors`).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] or [`K3Error::CapabilityMismatch`] on malformed input.
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, K3Error> {
+        match ModelContainerFormat::detect(bytes) {
+            ModelContainerFormat::Gguf => Ok(Self::Gguf(GgufFile::parse(bytes)?)),
+            ModelContainerFormat::SafeTensors => {
+                Ok(Self::SafeTensors(SafeTensorsFile::from_bytes(bytes)?))
+            }
+        }
+    }
+
+    /// Returns the detected container format.
+    #[must_use]
+    pub const fn format(&self) -> ModelContainerFormat {
+        match self {
+            Self::Gguf(_) => ModelContainerFormat::Gguf,
+            Self::SafeTensors(_) => ModelContainerFormat::SafeTensors,
+        }
+    }
+
+    /// Returns the extracted [`ModelMetadata`] regardless of container format.
+    #[must_use]
+    pub const fn metadata(&self) -> &ModelMetadata {
+        match self {
+            Self::Gguf(gguf) => gguf.metadata(),
+            Self::SafeTensors(st) => st.metadata(),
+        }
+    }
+
+    /// Returns the inner [`GgufFile`] when this container is GGUF.
+    #[must_use]
+    pub const fn as_gguf(&self) -> Option<&GgufFile<'a>> {
+        match self {
+            Self::Gguf(gguf) => Some(gguf),
+            Self::SafeTensors(_) => None,
+        }
+    }
+
+    /// Returns the inner [`SafeTensorsFile`] when this container is `SafeTensors`.
+    #[must_use]
+    pub const fn as_safetensors(&self) -> Option<&SafeTensorsFile<'a>> {
+        match self {
+            Self::Gguf(_) => None,
+            Self::SafeTensors(st) => Some(st),
+        }
+    }
+}
+
+impl ModelWeights for ParsedModelContainer<'_> {
+    fn tensor(&self, name: &str) -> Result<TensorView<'_>, K3Error> {
+        match self {
+            Self::Gguf(gguf) => gguf.tensor(name),
+            Self::SafeTensors(st) => st.tensor(name),
+        }
+    }
+
+    fn tensor_count(&self) -> usize {
+        match self {
+            Self::Gguf(gguf) => gguf.tensor_count(),
+            Self::SafeTensors(st) => st.tensor_count(),
+        }
+    }
+
+    fn total_weight_bytes(&self) -> usize {
+        match self {
+            Self::Gguf(gguf) => gguf.total_weight_bytes(),
+            Self::SafeTensors(st) => st.total_weight_bytes(),
+        }
+    }
+}
 
 static ACTIVE_LOCKED_MODEL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -340,6 +447,7 @@ pub struct LockedModelWeights {
     ptr: *mut u8,
     len: usize,
     is_locked: bool,
+    format: ModelContainerFormat,
     metadata: ModelMetadata,
     tensor_index: BTreeMap<String, usize>,
     repack_store: RepackedTensorStore,
@@ -358,6 +466,7 @@ type OpenedWeights = (
 );
 
 type ParsedWeights = (
+    ModelContainerFormat,
     ModelMetadata,
     Option<Box<dyn ArchRecipe>>,
     Option<MemoryFootprint>,
@@ -461,28 +570,32 @@ fn open_from_file_inner<I: MemoryInspector>(
     }
     let raw_ptr = raw_void_ptr.cast::<u8>();
 
-    // 4. Parse GGUF v3 header & verify capabilities and memory admission before mlock
+    // 4. Detect GGUF vs SafeTensors header, parse container & verify capabilities/admission before mlock
     // SAFETY: raw_ptr is valid for reads up to file_len.
     let slice = unsafe { std::slice::from_raw_parts(raw_ptr, file_len) };
     let parsed = (|| -> Result<ParsedWeights, K3Error> {
-        let gguf = GgufFile::parse(slice)?;
+        let container = ParsedModelContainer::parse(slice)?;
+        let format = container.format();
+        let metadata = container.metadata().clone();
         if let Some((opt_n_ctx, inspector)) = admission {
-            let recipe = verify_model_capabilities(&gguf)?;
+            let recipe = match &container {
+                ParsedModelContainer::Gguf(gguf) => verify_model_capabilities(gguf)?,
+                ParsedModelContainer::SafeTensors(st) => verify_safetensors_capabilities(st)?,
+            };
             let effective_n_ctx = if let Some(n) = opt_n_ctx {
                 n
             } else {
-                let meta_ctx = gguf.metadata().context_length();
+                let meta_ctx = metadata.context_length();
                 if meta_ctx > 0 { meta_ctx.min(64) } else { 64 }
             };
-            let footprint =
-                check_memory_admission_with(gguf.metadata(), effective_n_ctx, inspector)?;
-            Ok((gguf.metadata().clone(), Some(recipe), Some(footprint)))
+            let footprint = check_memory_admission_with(&metadata, effective_n_ctx, inspector)?;
+            Ok((format, metadata, Some(recipe), Some(footprint)))
         } else {
-            Ok((gguf.metadata().clone(), None, None))
+            Ok((format, metadata, None, None))
         }
     })();
 
-    let (metadata, recipe_opt, footprint_opt) = match parsed {
+    let (format, metadata, recipe_opt, footprint_opt) = match parsed {
         Ok(res) => res,
         Err(err) => {
             // SAFETY: Unmapping and releasing flock on pre-flight rejection before any mlock.
@@ -560,6 +673,7 @@ fn open_from_file_inner<I: MemoryInspector>(
             ptr: raw_ptr,
             len: file_len,
             is_locked,
+            format,
             metadata,
             tensor_index,
             repack_store,
@@ -706,6 +820,20 @@ impl LockedModelWeights {
     #[must_use]
     pub const fn is_locked(&self) -> bool {
         self.is_locked
+    }
+
+    /// Returns the detected binary container format (`GGUF` or `SafeTensors`).
+    #[must_use]
+    pub const fn container_format(&self) -> ModelContainerFormat {
+        self.format
+    }
+
+    /// Parses a zero-copy [`ParsedModelContainer`] view over the locked memory-mapped bytes.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] or [`K3Error::CapabilityMismatch`] if header parsing fails.
+    pub fn parse_container(&self) -> Result<ParsedModelContainer<'_>, K3Error> {
+        ParsedModelContainer::parse(self.as_bytes())
     }
 
     /// Returns the parsed [`ModelMetadata`] for the locked model.
@@ -1442,6 +1570,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jero-arch-synthetic")]
     #[cfg_attr(miri, ignore)]
     fn test_locked_weights_repeat_repack_reuse_and_drop_cleanup() {
         use crate::affinity::resolve_affinity;
@@ -1533,18 +1662,42 @@ mod tests {
         let _ = std::fs::remove_file(&temp_path);
     }
 
+    #[cfg(all(feature = "jero-kernels-rvv", not(miri)))]
+    fn build_synthetic_llama_repack_gguf_bytes() -> Vec<u8> {
+        use jero_core::GgufValue;
+        use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
+
+        let extra_kvs = [
+            ("llama.block_count", GgufValue::Uint32(1)),
+            ("llama.embedding_length", GgufValue::Uint32(256)),
+            ("llama.feed_forward_length", GgufValue::Uint32(512)),
+            ("llama.attention.head_count", GgufValue::Uint32(4)),
+            ("llama.attention.head_count_kv", GgufValue::Uint32(4)),
+        ];
+        let tensor_specs = [
+            ("token_embd.weight", QuantType::F32, &[256usize, 16][..]),
+            ("blk.0.attn_norm.weight", QuantType::F32, &[256][..]),
+            ("blk.0.attn_q.weight", QuantType::Q5_K, &[256, 256][..]),
+            ("blk.0.attn_k.weight", QuantType::Q4_K_M, &[256, 256][..]),
+            ("blk.0.attn_v.weight", QuantType::Q8_0, &[256, 256][..]),
+            ("blk.0.attn_output.weight", QuantType::F32, &[256, 256][..]),
+            ("blk.0.ffn_norm.weight", QuantType::F32, &[256][..]),
+            ("blk.0.ffn_gate.weight", QuantType::F32, &[256, 512][..]),
+            ("blk.0.ffn_up.weight", QuantType::F32, &[256, 512][..]),
+            ("blk.0.ffn_down.weight", QuantType::F32, &[512, 256][..]),
+            ("output_norm.weight", QuantType::F32, &[256][..]),
+            ("output.weight", QuantType::F32, &[256, 16][..]),
+        ];
+        create_synthetic_gguf_v3_with_kvs("llama", 32, &extra_kvs, &tensor_specs)
+    }
+
     #[test]
     #[cfg(all(feature = "jero-kernels-rvv", not(miri)))]
     fn test_repack_arena_budget_enforced_and_block_scaled_mins_accounted() {
         use crate::memory::{SystemMemoryInspector, calculate_footprint_with_slots};
         use std::io::Write;
 
-        let tensor_specs = [
-            ("blk.0.attn_q.weight", QuantType::Q5_K, &[256, 5][..]),
-            ("blk.0.attn_k.weight", QuantType::Q4_K_M, &[256, 5][..]),
-            ("blk.0.attn_v.weight", QuantType::Q8_0, &[32, 16][..]),
-        ];
-        let bytes = create_synthetic_gguf_v3("llama", 32, &tensor_specs);
+        let bytes = build_synthetic_llama_repack_gguf_bytes();
 
         let dir = std::env::temp_dir();
         let pid = std::process::id();
@@ -1634,6 +1787,163 @@ mod tests {
             .expect("repeat over-budget stays downgraded");
         assert!(repeat_rejected.downgraded);
         assert_eq!(repeat_rejected.resident_bytes, 0);
+
+        drop(locked);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(all(feature = "jero-arch-qwen", not(miri)))]
+    fn build_qwen3_test_safetensors_bytes(vocab: usize) -> Vec<u8> {
+        use jero_core::safetensors::test_helpers::create_synthetic_safetensors;
+
+        type Qwen3Row<'a> = (&'a str, &'a [usize], Option<(usize, f32)>);
+
+        let (hidden, ffn, head_dim, kv_dim) = (16_usize, 32_usize, 8_usize, 8_usize);
+        let table: [Qwen3Row<'_>; 14] = [
+            (
+                "model.embed_tokens.weight",
+                &[vocab, hidden],
+                Some((1, 0.05)),
+            ),
+            ("model.layers.0.input_layernorm.weight", &[hidden], None),
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                &[hidden, hidden],
+                Some((2, 0.04)),
+            ),
+            ("model.layers.0.self_attn.q_norm.weight", &[head_dim], None),
+            (
+                "model.layers.0.self_attn.k_proj.weight",
+                &[kv_dim, hidden],
+                Some((3, 0.04)),
+            ),
+            ("model.layers.0.self_attn.k_norm.weight", &[head_dim], None),
+            (
+                "model.layers.0.self_attn.v_proj.weight",
+                &[kv_dim, hidden],
+                Some((4, 0.04)),
+            ),
+            (
+                "model.layers.0.self_attn.o_proj.weight",
+                &[hidden, hidden],
+                Some((5, 0.04)),
+            ),
+            (
+                "model.layers.0.post_attention_layernorm.weight",
+                &[hidden],
+                None,
+            ),
+            (
+                "model.layers.0.mlp.gate_proj.weight",
+                &[ffn, hidden],
+                Some((6, 0.03)),
+            ),
+            (
+                "model.layers.0.mlp.up_proj.weight",
+                &[ffn, hidden],
+                Some((7, 0.03)),
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight",
+                &[hidden, ffn],
+                Some((8, 0.03)),
+            ),
+            ("model.norm.weight", &[hidden], None),
+            ("lm_head.weight", &[vocab, hidden], Some((9, 0.05))),
+        ];
+        let owned: Vec<(&str, &[usize], Vec<u8>)> = table
+            .iter()
+            .map(|&(name, shape, spec)| {
+                let len: usize = shape.iter().product();
+                let bytes = (0..len)
+                    .flat_map(|i| {
+                        let val = match spec {
+                            None => 1.0_f32,
+                            Some((seed, scale)) => {
+                                #[expect(
+                                    clippy::cast_precision_loss,
+                                    reason = "bounded test index fits f32"
+                                )]
+                                let d = ((((i * 11 + seed * 5 + 3) % 19) as f32) - 9.0) * scale;
+                                d
+                            }
+                        };
+                        val.to_le_bytes()
+                    })
+                    .collect();
+                (name, shape, bytes)
+            })
+            .collect();
+        let specs: Vec<(&str, QuantType, &[usize], &[u8])> = owned
+            .iter()
+            .map(|(n, s, b)| (*n, QuantType::F32, *s, b.as_slice()))
+            .collect();
+        create_synthetic_safetensors(
+            &[
+                ("general.architecture", "qwen3"),
+                ("num_hidden_layers", "1"),
+                ("hidden_size", "16"),
+                ("intermediate_size", "32"),
+                ("num_attention_heads", "2"),
+                ("num_key_value_heads", "1"),
+                ("head_dim", "8"),
+                ("vocab_size", "12"),
+                ("rms_norm_eps", "1e-6"),
+                ("rope_theta", "1000000"),
+            ],
+            &specs,
+        )
+    }
+
+    #[test]
+    #[cfg(all(feature = "jero-arch-qwen", not(miri)))]
+    fn test_locked_model_weights_safetensors_admission_and_forward() {
+        use crate::engine::SinglePromptEngine;
+        use crate::kv::SingleSlotKvArena;
+        use crate::memory::SystemMemoryInspector;
+        use std::io::Write;
+
+        let vocab = 12_usize;
+        let st_bytes = build_qwen3_test_safetensors_bytes(vocab);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let path = std::env::temp_dir().join(format!(
+            "jero_st_admission_{}_{ts}.safetensors",
+            std::process::id()
+        ));
+        {
+            let mut f = File::create(&path).expect("create temp safetensors");
+            f.write_all(&st_bytes).expect("write temp safetensors");
+            f.sync_all().expect("sync temp safetensors");
+        }
+
+        let (locked, recipe, footprint) =
+            LockedModelWeights::open_with_admission(&path, 16, &SystemMemoryInspector)
+                .expect("admit safetensors qwen3");
+        assert_eq!(locked.container_format(), ModelContainerFormat::SafeTensors);
+        assert!(matches!(
+            locked.parse_container().expect("parse container"),
+            ParsedModelContainer::SafeTensors(_)
+        ));
+        assert_eq!(recipe.architecture_id(), "qwen3");
+        assert!(footprint.weight_bytes > 0);
+        assert!(footprint.kv_bytes > 0);
+
+        let mut arena = SingleSlotKvArena::new(locked.metadata(), 16).expect("kv arena");
+        let mut engine = SinglePromptEngine::new();
+        let summary = engine
+            .evaluate_prompt(
+                recipe.as_ref(),
+                &locked,
+                &mut arena,
+                &[1, 3, 5],
+                vocab,
+                2,
+                |_| Ok(crate::engine::StreamAction::Continue),
+            )
+            .expect("qwen3 safetensors forward");
+        assert_eq!(summary.generated_tokens.len(), 2);
 
         drop(locked);
         let _ = std::fs::remove_file(&path);

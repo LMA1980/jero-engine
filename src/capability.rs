@@ -4,7 +4,8 @@
 //! before reserving or locking memory (ADR-017, ADR-023, ADR-024, US-01 Scenario 1).
 
 use jero_core::{
-    ArchRecipe, GgufArray, GgufFile, GgufValue, K3Error, ModelMetadata, TensorDescriptor,
+    ArchRecipe, GGUF_MAGIC, GgufArray, GgufFile, GgufValue, K3Error, ModelMetadata,
+    SafeTensorsFile, TensorDescriptor,
 };
 
 /// Architecture hyperparameters extracted from GGUF v3 metadata and tensor shape descriptors.
@@ -492,7 +493,7 @@ impl GgufHyperparams {
 pub struct RecipeRegistry;
 
 impl RecipeRegistry {
-    #[cfg(feature = "jero-kernels-rvv")]
+    #[cfg(feature = "jero-arch-qwen")]
     fn find_qwen_deepseek_recipe(architecture: &str) -> Option<&'static dyn ArchRecipe> {
         match architecture {
             "qwen2" => {
@@ -509,6 +510,11 @@ impl RecipeRegistry {
                 static QWEN3MOE: crate::qwen_deepseek::Qwen3MoeRecipe =
                     crate::qwen_deepseek::Qwen3MoeRecipe::new_30b_a3b();
                 Some(&QWEN3MOE)
+            }
+            "qwen3-embedding" => {
+                static QWEN3_EMBEDDING: crate::qwen_deepseek::QwenEmbeddingRecipe =
+                    crate::qwen_deepseek::QwenEmbeddingRecipe::new();
+                Some(&QWEN3_EMBEDDING)
             }
             "deepseek2" => {
                 static DEEPSEEK2: crate::qwen_deepseek::DeepSeek2Recipe =
@@ -542,7 +548,7 @@ impl RecipeRegistry {
             return Some(&SYNTHETIC);
         }
 
-        #[cfg(feature = "jero-kernels-rvv")]
+        #[cfg(feature = "jero-arch-qwen")]
         if let Some(recipe) = Self::find_qwen_deepseek_recipe(architecture) {
             return Some(recipe);
         }
@@ -601,7 +607,7 @@ impl RecipeRegistry {
         if architecture == "gemma2" {
             static GEMMA2: crate::gemma::GemmaRecipe = crate::gemma::GemmaRecipe::new_gemma2();
             return Some(&GEMMA2);
-        } else if architecture == "gemma3" {
+        } else if architecture == "gemma3" || architecture == "gemma3_text" {
             static GEMMA3: crate::gemma::GemmaRecipe = crate::gemma::GemmaRecipe::new_gemma3();
             return Some(&GEMMA3);
         } else if architecture == "gemma4" {
@@ -613,67 +619,139 @@ impl RecipeRegistry {
             return Some(&FUNCTIONGEMMA);
         }
 
-        #[cfg(feature = "jero-arch-modernbert")]
-        if architecture == "modernbert" {
-            static MODERNBERT: crate::modernbert::ModernBertRecipe =
-                crate::modernbert::ModernBertRecipe::new_modernbert();
-            return Some(&MODERNBERT);
-        } else if architecture == "bert" {
-            static BERT: crate::modernbert::ModernBertRecipe =
-                crate::modernbert::ModernBertRecipe::new_bert();
-            return Some(&BERT);
-        } else if architecture == "deberta-v3" {
-            static DEBERTA_V3: crate::forward::DebertaV3Recipe =
-                crate::forward::DebertaV3Recipe::new();
-            return Some(&DEBERTA_V3);
+        #[cfg(feature = "jero-arch-encoder")]
+        if let Some(recipe) = Self::find_encoder_recipe(architecture) {
+            return Some(recipe);
         }
 
         if let Some(recipe) = Self::find_machine_model_recipe(architecture) {
             return Some(recipe);
         }
 
-        #[cfg(feature = "jero-kernels-rvv")]
+        #[cfg(feature = "jero-arch-ssm")]
         if let Some(recipe) = Self::find_ssm_or_granite_recipe(architecture) {
             return Some(recipe);
         }
 
+        #[cfg(feature = "jero-arch-vision")]
+        if architecture == "clip" {
+            static CLIP: jero_arch_vision::ClipVisionRecipe =
+                jero_arch_vision::ClipVisionRecipe::new();
+            return Some(&CLIP);
+        } else if architecture == "siglip" {
+            static SIGLIP: jero_arch_vision::SiglipVisionRecipe =
+                jero_arch_vision::SiglipVisionRecipe::new();
+            return Some(&SIGLIP);
+        }
+
+        #[cfg(feature = "jero-arch-whisper")]
+        if architecture == "whisper" {
+            static WHISPER: jero_arch_whisper::WhisperRecipe =
+                jero_arch_whisper::WhisperRecipe::new();
+            return Some(&WHISPER);
+        }
+
         let _ = architecture;
         None
+    }
+
+    #[cfg(feature = "jero-arch-encoder")]
+    fn find_encoder_recipe(architecture: &str) -> Option<&'static dyn ArchRecipe> {
+        match architecture {
+            "modernbert" => {
+                static MODERNBERT: crate::modernbert::ModernBertRecipe =
+                    crate::modernbert::ModernBertRecipe::new_modernbert();
+                Some(&MODERNBERT)
+            }
+            "bert" => {
+                static BERT: crate::modernbert::ModernBertRecipe =
+                    crate::modernbert::ModernBertRecipe::new_bert();
+                Some(&BERT)
+            }
+            "nomic-bert" => {
+                static NOMIC_BERT: crate::modernbert::ModernBertRecipe =
+                    crate::modernbert::ModernBertRecipe::new_nomic_bert();
+                Some(&NOMIC_BERT)
+            }
+            "bge" => {
+                static BGE: crate::modernbert::ModernBertRecipe =
+                    crate::modernbert::ModernBertRecipe::new_bge();
+                Some(&BGE)
+            }
+            "jina-bert" => {
+                static JINA_BERT: crate::modernbert::ModernBertRecipe =
+                    crate::modernbert::ModernBertRecipe::new_jina_bert();
+                Some(&JINA_BERT)
+            }
+            "deberta-v3" => {
+                static DEBERTA_V3: crate::modernbert::DebertaV3Recipe =
+                    crate::modernbert::DebertaV3Recipe::new();
+                Some(&DEBERTA_V3)
+            }
+            "cross-encoder" => {
+                static CROSS_ENCODER: crate::modernbert::CrossEncoderRerankRecipe =
+                    crate::modernbert::CrossEncoderRerankRecipe::new();
+                Some(&CROSS_ENCODER)
+            }
+            "reranker" => {
+                static RERANKER: std::sync::LazyLock<crate::modernbert::CrossEncoderRerankRecipe> =
+                    std::sync::LazyLock::new(|| {
+                        let mut r = crate::modernbert::CrossEncoderRerankRecipe::new();
+                        r.encoder.architecture = "reranker";
+                        r
+                    });
+                Some(std::sync::LazyLock::force(&RERANKER))
+            }
+            "bge-reranker" => {
+                static BGE_RERANKER: crate::modernbert::CrossEncoderRerankRecipe =
+                    crate::modernbert::CrossEncoderRerankRecipe::new_bge_reranker();
+                Some(&BGE_RERANKER)
+            }
+            "jina-reranker" => {
+                static JINA_RERANKER: crate::modernbert::CrossEncoderRerankRecipe =
+                    crate::modernbert::CrossEncoderRerankRecipe::new_jina_reranker();
+                Some(&JINA_RERANKER)
+            }
+            "modernbert-reranker" => {
+                static MODERNBERT_RERANKER: crate::modernbert::CrossEncoderRerankRecipe =
+                    crate::modernbert::CrossEncoderRerankRecipe::new_modernbert_reranker();
+                Some(&MODERNBERT_RERANKER)
+            }
+            _ => None,
+        }
     }
 
     fn find_machine_model_recipe(architecture: &str) -> Option<&'static dyn ArchRecipe> {
-        #[cfg(feature = "jero-arch-ttm")]
-        if architecture == "ttm" {
-            static TTM: crate::machine_models::TtmRecipe = crate::machine_models::TtmRecipe::new();
-            return Some(&TTM);
-        }
-
-        #[cfg(feature = "jero-arch-ft-transformer")]
-        if architecture == "ft-transformer" {
-            static FT_TRANSFORMER: crate::machine_models::FtTransformerRecipe =
-                crate::machine_models::FtTransformerRecipe::new();
-            return Some(&FT_TRANSFORMER);
-        }
-
-        #[cfg(feature = "jero-arch-tabpfn-v2")]
-        if architecture == "tabpfn-v2" {
-            static TABPFN_V2: crate::machine_models::TabPfnV2Recipe =
-                crate::machine_models::TabPfnV2Recipe::new();
-            return Some(&TABPFN_V2);
-        }
-
-        #[cfg(feature = "jero-arch-decision-transformer")]
-        if architecture == "decision-transformer" {
-            static DECISION_TRANSFORMER: crate::machine_models::DecisionTransformerRecipe =
-                crate::machine_models::DecisionTransformerRecipe::new();
-            return Some(&DECISION_TRANSFORMER);
+        #[cfg(feature = "jero-arch-machine")]
+        match architecture {
+            "ttm" => {
+                static TTM: crate::machine_models::TtmRecipe =
+                    crate::machine_models::TtmRecipe::new();
+                return Some(&TTM);
+            }
+            "ft-transformer" => {
+                static FT_TRANSFORMER: crate::machine_models::FtTransformerRecipe =
+                    crate::machine_models::FtTransformerRecipe::new();
+                return Some(&FT_TRANSFORMER);
+            }
+            "tabpfn-v2" => {
+                static TABPFN_V2: crate::machine_models::TabPfnV2Recipe =
+                    crate::machine_models::TabPfnV2Recipe::new();
+                return Some(&TABPFN_V2);
+            }
+            "decision-transformer" => {
+                static DECISION_TRANSFORMER: crate::machine_models::DecisionTransformerRecipe =
+                    crate::machine_models::DecisionTransformerRecipe::new();
+                return Some(&DECISION_TRANSFORMER);
+            }
+            _ => {}
         }
 
         let _ = architecture;
         None
     }
 
-    #[cfg(feature = "jero-kernels-rvv")]
+    #[cfg(feature = "jero-arch-ssm")]
     fn find_ssm_or_granite_recipe(architecture: &str) -> Option<&'static dyn ArchRecipe> {
         match architecture {
             "mamba" => {
@@ -727,90 +805,117 @@ impl RecipeRegistry {
         }
     }
 
+    const COMPILED_ARCHITECTURES: &[&str] = &[
+        #[cfg(feature = "jero-arch-synthetic")]
+        "synthetic",
+        #[cfg(feature = "jero-arch-llama")]
+        "llama",
+        #[cfg(feature = "jero-arch-llama")]
+        "llama4",
+        #[cfg(any(feature = "jero-arch-qwen", feature = "jero-arch-llama"))]
+        "qwen2",
+        #[cfg(feature = "jero-arch-qwen")]
+        "qwen3",
+        #[cfg(feature = "jero-arch-qwen")]
+        "qwen3moe",
+        #[cfg(feature = "jero-arch-qwen")]
+        "qwen3-embedding",
+        #[cfg(feature = "jero-arch-qwen")]
+        "deepseek2",
+        #[cfg(feature = "jero-arch-qwen")]
+        "qwen35",
+        #[cfg(feature = "jero-arch-qwen")]
+        "qwen35moe",
+        #[cfg(feature = "jero-arch-ssm")]
+        "mamba",
+        #[cfg(feature = "jero-arch-ssm")]
+        "mamba2",
+        #[cfg(feature = "jero-arch-ssm")]
+        "rwkv6",
+        #[cfg(feature = "jero-arch-ssm")]
+        "rwkv7",
+        #[cfg(feature = "jero-arch-ssm")]
+        "jamba",
+        #[cfg(feature = "jero-arch-ssm")]
+        "zamba2",
+        #[cfg(feature = "jero-arch-ssm")]
+        "granitehybrid",
+        #[cfg(feature = "jero-arch-ssm")]
+        "lfm2",
+        #[cfg(feature = "jero-arch-ssm")]
+        "lfm2moe",
+        #[cfg(feature = "jero-arch-ssm")]
+        "granite",
+        #[cfg(feature = "jero-arch-mistral")]
+        "mistral",
+        #[cfg(feature = "jero-arch-mistral")]
+        "mistral3",
+        #[cfg(feature = "jero-arch-mistral")]
+        "mixtral",
+        #[cfg(feature = "jero-arch-phi3")]
+        "phi3",
+        #[cfg(feature = "jero-arch-phi3")]
+        "phi4",
+        #[cfg(feature = "jero-arch-bitnet")]
+        "bitnet",
+        #[cfg(feature = "jero-arch-bitnet")]
+        "bitnet-b1.58",
+        #[cfg(feature = "jero-arch-bitnet")]
+        "bitnet-25",
+        #[cfg(feature = "jero-arch-dory")]
+        "dory",
+        #[cfg(feature = "jero-arch-gemma")]
+        "gemma2",
+        #[cfg(feature = "jero-arch-gemma")]
+        "gemma3",
+        #[cfg(feature = "jero-arch-gemma")]
+        "gemma3_text",
+        #[cfg(feature = "jero-arch-gemma")]
+        "gemma4",
+        #[cfg(feature = "jero-arch-gemma")]
+        "functiongemma",
+        #[cfg(feature = "jero-arch-encoder")]
+        "modernbert",
+        #[cfg(feature = "jero-arch-encoder")]
+        "bert",
+        #[cfg(feature = "jero-arch-encoder")]
+        "nomic-bert",
+        #[cfg(feature = "jero-arch-encoder")]
+        "bge",
+        #[cfg(feature = "jero-arch-encoder")]
+        "jina-bert",
+        #[cfg(feature = "jero-arch-encoder")]
+        "deberta-v3",
+        #[cfg(feature = "jero-arch-encoder")]
+        "cross-encoder",
+        #[cfg(feature = "jero-arch-encoder")]
+        "reranker",
+        #[cfg(feature = "jero-arch-encoder")]
+        "bge-reranker",
+        #[cfg(feature = "jero-arch-encoder")]
+        "jina-reranker",
+        #[cfg(feature = "jero-arch-encoder")]
+        "modernbert-reranker",
+        #[cfg(feature = "jero-arch-machine")]
+        "ttm",
+        #[cfg(feature = "jero-arch-machine")]
+        "ft-transformer",
+        #[cfg(feature = "jero-arch-machine")]
+        "tabpfn-v2",
+        #[cfg(feature = "jero-arch-machine")]
+        "decision-transformer",
+        #[cfg(feature = "jero-arch-vision")]
+        "clip",
+        #[cfg(feature = "jero-arch-vision")]
+        "siglip",
+        #[cfg(feature = "jero-arch-whisper")]
+        "whisper",
+    ];
+
     /// Returns a list of architecture identifiers compiled into the current binary.
     #[must_use]
     pub const fn supported_architectures() -> &'static [&'static str] {
-        const ARCHS: &[&str] = &[
-            #[cfg(feature = "jero-arch-synthetic")]
-            "synthetic",
-            #[cfg(feature = "jero-arch-llama")]
-            "llama",
-            #[cfg(feature = "jero-arch-llama")]
-            "llama4",
-            #[cfg(any(feature = "jero-kernels-rvv", feature = "jero-arch-llama"))]
-            "qwen2",
-            #[cfg(feature = "jero-kernels-rvv")]
-            "qwen3",
-            #[cfg(feature = "jero-kernels-rvv")]
-            "qwen3moe",
-            #[cfg(feature = "jero-kernels-rvv")]
-            "deepseek2",
-            #[cfg(feature = "jero-kernels-rvv")]
-            "qwen35",
-            #[cfg(feature = "jero-kernels-rvv")]
-            "qwen35moe",
-            #[cfg(feature = "jero-kernels-rvv")]
-            "mamba",
-            #[cfg(feature = "jero-kernels-rvv")]
-            "mamba2",
-            #[cfg(feature = "jero-kernels-rvv")]
-            "rwkv6",
-            #[cfg(feature = "jero-kernels-rvv")]
-            "rwkv7",
-            #[cfg(feature = "jero-kernels-rvv")]
-            "jamba",
-            #[cfg(feature = "jero-kernels-rvv")]
-            "zamba2",
-            #[cfg(feature = "jero-kernels-rvv")]
-            "granitehybrid",
-            #[cfg(feature = "jero-kernels-rvv")]
-            "lfm2",
-            #[cfg(feature = "jero-kernels-rvv")]
-            "lfm2moe",
-            #[cfg(feature = "jero-kernels-rvv")]
-            "granite",
-            #[cfg(feature = "jero-arch-mistral")]
-            "mistral",
-            #[cfg(feature = "jero-arch-mistral")]
-            "mistral3",
-            #[cfg(feature = "jero-arch-mistral")]
-            "mixtral",
-            #[cfg(feature = "jero-arch-phi3")]
-            "phi3",
-            #[cfg(feature = "jero-arch-phi3")]
-            "phi4",
-            #[cfg(feature = "jero-arch-bitnet")]
-            "bitnet",
-            #[cfg(feature = "jero-arch-bitnet")]
-            "bitnet-b1.58",
-            #[cfg(feature = "jero-arch-bitnet")]
-            "bitnet-25",
-            #[cfg(feature = "jero-arch-dory")]
-            "dory",
-            #[cfg(feature = "jero-arch-gemma")]
-            "gemma2",
-            #[cfg(feature = "jero-arch-gemma")]
-            "gemma3",
-            #[cfg(feature = "jero-arch-gemma")]
-            "gemma4",
-            #[cfg(feature = "jero-arch-gemma")]
-            "functiongemma",
-            #[cfg(feature = "jero-arch-modernbert")]
-            "modernbert",
-            #[cfg(feature = "jero-arch-modernbert")]
-            "bert",
-            #[cfg(feature = "jero-arch-modernbert")]
-            "deberta-v3",
-            #[cfg(feature = "jero-arch-ttm")]
-            "ttm",
-            #[cfg(feature = "jero-arch-ft-transformer")]
-            "ft-transformer",
-            #[cfg(feature = "jero-arch-tabpfn-v2")]
-            "tabpfn-v2",
-            #[cfg(feature = "jero-arch-decision-transformer")]
-            "decision-transformer",
-        ];
-        ARCHS
+        Self::COMPILED_ARCHITECTURES
     }
 
     /// Hydrates a [`jero_arch_llama::LlamaRecipe`] from extracted [`GgufHyperparams`], mutating
@@ -907,8 +1012,13 @@ impl RecipeRegistry {
             return Some(Box::new(jero_arch_synthetic::SyntheticRecipe::new()));
         }
 
-        #[cfg(feature = "jero-kernels-rvv")]
+        #[cfg(feature = "jero-arch-qwen")]
         if let Some(recipe) = Self::hydrate_qwen_deepseek_recipe(params, metadata) {
+            return Some(recipe);
+        }
+
+        #[cfg(feature = "jero-arch-ssm")]
+        if let Some(recipe) = Self::hydrate_ssm_or_granite_recipe(params, metadata) {
             return Some(recipe);
         }
 
@@ -1174,7 +1284,8 @@ impl RecipeRegistry {
         }
 
         #[cfg(feature = "jero-arch-gemma")]
-        if arch == "gemma2" || arch == "gemma3" || arch == "functiongemma" {
+        if arch == "gemma2" || arch == "gemma3" || arch == "gemma3_text" || arch == "functiongemma"
+        {
             let mut recipe = match arch {
                 "gemma2" => crate::gemma::GemmaRecipe::new_gemma2(),
                 "functiongemma" => crate::gemma::GemmaRecipe::new_functiongemma(),
@@ -1294,9 +1405,9 @@ impl RecipeRegistry {
             return Some(Box::new(recipe));
         }
 
-        #[cfg(feature = "jero-arch-modernbert")]
+        #[cfg(feature = "jero-arch-encoder")]
         if arch == "deberta-v3" {
-            let mut recipe = crate::forward::DebertaV3Recipe::from_metadata(metadata);
+            let mut recipe = crate::modernbert::DebertaV3Recipe::from_metadata(metadata);
             if params.block_count > 0 {
                 recipe.num_layers = params.block_count;
             }
@@ -1312,7 +1423,35 @@ impl RecipeRegistry {
             return Some(Box::new(recipe));
         }
 
-        #[cfg(feature = "jero-arch-modernbert")]
+        #[cfg(feature = "jero-arch-encoder")]
+        if matches!(
+            arch,
+            "cross-encoder" | "reranker" | "bge-reranker" | "jina-reranker" | "modernbert-reranker"
+        ) && let Some(mut recipe) =
+            crate::modernbert::CrossEncoderRerankRecipe::from_metadata(arch, metadata)
+        {
+            if params.block_count > 0 {
+                recipe.encoder.num_layers = params.block_count;
+            }
+            if params.embedding_length > 0 {
+                recipe.encoder.hidden_dim = params.embedding_length;
+            }
+            if params.feed_forward_length > 0 {
+                recipe.encoder.ffn_dim = params.feed_forward_length;
+            } else if params.embedding_length > 0 {
+                recipe.encoder.ffn_dim = params.embedding_length.saturating_mul(2);
+            }
+            if params.head_count > 0 {
+                recipe.encoder.n_heads = params.head_count.min(recipe.encoder.hidden_dim).max(1);
+            }
+            if recipe.encoder.n_heads > 0 && recipe.encoder.hidden_dim >= recipe.encoder.n_heads {
+                recipe.encoder.head_dim =
+                    (recipe.encoder.hidden_dim / recipe.encoder.n_heads).max(1);
+            }
+            return Some(Box::new(recipe));
+        }
+
+        #[cfg(feature = "jero-arch-encoder")]
         if let Some(mut recipe) = crate::modernbert::ModernBertRecipe::from_metadata(arch, metadata)
         {
             if params.block_count > 0 {
@@ -1335,7 +1474,7 @@ impl RecipeRegistry {
             return Some(Box::new(recipe));
         }
 
-        #[cfg(feature = "jero-arch-ttm")]
+        #[cfg(feature = "jero-arch-machine")]
         if arch == "ttm" {
             return Some(Box::new(metadata.map_or_else(
                 crate::machine_models::TtmRecipe::new,
@@ -1343,7 +1482,7 @@ impl RecipeRegistry {
             )));
         }
 
-        #[cfg(feature = "jero-arch-ft-transformer")]
+        #[cfg(feature = "jero-arch-machine")]
         if arch == "ft-transformer" {
             return Some(Box::new(metadata.map_or_else(
                 crate::machine_models::FtTransformerRecipe::new,
@@ -1351,7 +1490,7 @@ impl RecipeRegistry {
             )));
         }
 
-        #[cfg(feature = "jero-arch-tabpfn-v2")]
+        #[cfg(feature = "jero-arch-machine")]
         if arch == "tabpfn-v2" {
             return Some(Box::new(metadata.map_or_else(
                 crate::machine_models::TabPfnV2Recipe::new,
@@ -1359,7 +1498,7 @@ impl RecipeRegistry {
             )));
         }
 
-        #[cfg(feature = "jero-arch-decision-transformer")]
+        #[cfg(feature = "jero-arch-machine")]
         if arch == "decision-transformer" {
             return Some(Box::new(metadata.map_or_else(
                 crate::machine_models::DecisionTransformerRecipe::new,
@@ -1367,11 +1506,34 @@ impl RecipeRegistry {
             )));
         }
 
+        #[cfg(feature = "jero-arch-vision")]
+        if arch == "clip" {
+            return Some(Box::new(metadata.map_or_else(
+                jero_arch_vision::ClipVisionRecipe::new,
+                jero_arch_vision::ClipVisionRecipe::from_metadata,
+            )));
+        } else if arch == "siglip" {
+            return Some(Box::new(metadata.map_or_else(
+                jero_arch_vision::SiglipVisionRecipe::new,
+                jero_arch_vision::SiglipVisionRecipe::from_metadata,
+            )));
+        }
+
+        #[cfg(feature = "jero-arch-whisper")]
+        if arch == "whisper" {
+            if let Some(meta) = metadata
+                && let Ok(recipe) = jero_arch_whisper::WhisperRecipe::from_metadata(meta)
+            {
+                return Some(Box::new(recipe));
+            }
+            return Some(Box::new(jero_arch_whisper::WhisperRecipe::new()));
+        }
+
         let _ = (arch, metadata);
         None
     }
 
-    #[cfg(feature = "jero-kernels-rvv")]
+    #[cfg(any(feature = "jero-arch-qwen", feature = "jero-arch-ssm"))]
     fn infer_qwen_head_dim(params: &GgufHyperparams, default: usize) -> usize {
         if params.key_length > 0 {
             params.key_length
@@ -1382,7 +1544,7 @@ impl RecipeRegistry {
         }
     }
 
-    #[cfg(feature = "jero-kernels-rvv")]
+    #[cfg(feature = "jero-arch-qwen")]
     fn hydrate_deepseek2_recipe(
         params: &GgufHyperparams,
         metadata: Option<&ModelMetadata>,
@@ -1448,7 +1610,7 @@ impl RecipeRegistry {
         Box::new(recipe)
     }
 
-    #[cfg(feature = "jero-kernels-rvv")]
+    #[cfg(feature = "jero-arch-qwen")]
     fn hydrate_qwen35_recipe(
         params: &GgufHyperparams,
         metadata: Option<&ModelMetadata>,
@@ -1499,7 +1661,7 @@ impl RecipeRegistry {
         Box::new(moe)
     }
 
-    #[cfg(feature = "jero-kernels-rvv")]
+    #[cfg(feature = "jero-arch-ssm")]
     fn hydrate_mamba_recipe(arch: &str, params: &GgufHyperparams) -> Box<dyn ArchRecipe> {
         let mut recipe = if arch == "mamba" {
             crate::ssm::Mamba2Recipe::new_mamba()
@@ -1542,7 +1704,7 @@ impl RecipeRegistry {
         Box::new(recipe)
     }
 
-    #[cfg(feature = "jero-kernels-rvv")]
+    #[cfg(feature = "jero-arch-ssm")]
     fn hydrate_rwkv_recipe(arch: &str, params: &GgufHyperparams) -> Box<dyn ArchRecipe> {
         let mut recipe = if arch == "rwkv6" {
             crate::ssm::Rwkv7Recipe::new_rwkv6()
@@ -1575,7 +1737,7 @@ impl RecipeRegistry {
         Box::new(recipe)
     }
 
-    #[cfg(feature = "jero-kernels-rvv")]
+    #[cfg(feature = "jero-arch-ssm")]
     fn hydrate_hybrid_ssm_base(
         arch: &str,
         params: &GgufHyperparams,
@@ -1662,7 +1824,7 @@ impl RecipeRegistry {
         recipe
     }
 
-    #[cfg(feature = "jero-kernels-rvv")]
+    #[cfg(feature = "jero-arch-ssm")]
     fn hydrate_lfm2moe_recipe(
         params: &GgufHyperparams,
         metadata: Option<&ModelMetadata>,
@@ -1681,7 +1843,7 @@ impl RecipeRegistry {
         Box::new(recipe)
     }
 
-    #[cfg(feature = "jero-kernels-rvv")]
+    #[cfg(feature = "jero-arch-ssm")]
     fn hydrate_granite_recipe(params: &GgufHyperparams) -> Box<dyn ArchRecipe> {
         let mut recipe = crate::ssm::GraniteRecipe::new();
         if params.block_count > 0 {
@@ -1725,7 +1887,7 @@ impl RecipeRegistry {
         Box::new(recipe)
     }
 
-    #[cfg(feature = "jero-kernels-rvv")]
+    #[cfg(feature = "jero-arch-qwen")]
     fn hydrate_qwen_deepseek_recipe(
         params: &GgufHyperparams,
         metadata: Option<&ModelMetadata>,
@@ -1771,6 +1933,11 @@ impl RecipeRegistry {
                 apply_qwen_dense_fields!(r);
                 Some(Box::new(r))
             }
+            "qwen3-embedding" => {
+                let mut r = crate::qwen_deepseek::QwenEmbeddingRecipe::new();
+                apply_qwen_dense_fields!(r.base);
+                Some(Box::new(r))
+            }
             "qwen3moe" => {
                 let mut r = crate::qwen_deepseek::Qwen3MoeRecipe::new_30b_a3b();
                 apply_qwen_dense_fields!(r.base);
@@ -1787,6 +1954,16 @@ impl RecipeRegistry {
             "deepseek2" => Some(Self::hydrate_deepseek2_recipe(params, metadata)),
             "qwen35" => Some(Self::hydrate_qwen35_recipe(params, metadata, false)),
             "qwen35moe" => Some(Self::hydrate_qwen35_recipe(params, metadata, true)),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "jero-arch-ssm")]
+    fn hydrate_ssm_or_granite_recipe(
+        params: &GgufHyperparams,
+        metadata: Option<&ModelMetadata>,
+    ) -> Option<Box<dyn ArchRecipe>> {
+        match params.architecture.as_str() {
             "mamba" | "mamba2" => Some(Self::hydrate_mamba_recipe(&params.architecture, params)),
             "rwkv6" | "rwkv7" => Some(Self::hydrate_rwkv_recipe(&params.architecture, params)),
             "jamba" | "zamba2" | "granitehybrid" | "lfm2" => Some(Box::new(
@@ -1809,7 +1986,14 @@ impl RecipeRegistry {
     #[must_use]
     pub fn instantiate_recipe_from_gguf(gguf: &GgufFile<'_>) -> Option<Box<dyn ArchRecipe>> {
         let params = GgufHyperparams::from_gguf(gguf);
-        #[cfg(any(feature = "jero-arch-phi3", feature = "jero-arch-mistral"))]
+        #[cfg(any(
+            feature = "jero-arch-phi3",
+            feature = "jero-arch-mistral",
+            feature = "jero-arch-gemma",
+            feature = "jero-arch-machine",
+            feature = "jero-arch-vision",
+            feature = "jero-arch-whisper",
+        ))]
         let arch = params.architecture.as_str();
 
         #[cfg(feature = "jero-arch-phi3")]
@@ -1830,33 +2014,127 @@ impl RecipeRegistry {
             return Some(Box::new(recipe));
         }
 
-        #[cfg(feature = "jero-arch-ttm")]
-        if params.architecture == "ttm" {
+        #[cfg(feature = "jero-arch-gemma")]
+        if matches!(arch, "gemma2" | "gemma3" | "gemma3_text" | "functiongemma")
+            && let Ok(recipe) = crate::gemma::GemmaRecipe::from_gguf(gguf)
+        {
+            return Some(Box::new(recipe));
+        } else if arch == "gemma4"
+            && let Ok(recipe) = crate::gemma::Gemma4Recipe::from_gguf(gguf)
+        {
+            return Some(Box::new(recipe));
+        }
+
+        #[cfg(feature = "jero-arch-machine")]
+        if arch == "ttm" {
             return Some(Box::new(crate::machine_models::TtmRecipe::from_gguf(gguf)));
         }
 
-        #[cfg(feature = "jero-arch-ft-transformer")]
-        if params.architecture == "ft-transformer" {
+        #[cfg(feature = "jero-arch-machine")]
+        if arch == "ft-transformer" {
             return Some(Box::new(
                 crate::machine_models::FtTransformerRecipe::from_gguf(gguf),
             ));
         }
 
-        #[cfg(feature = "jero-arch-tabpfn-v2")]
-        if params.architecture == "tabpfn-v2" {
+        #[cfg(feature = "jero-arch-machine")]
+        if arch == "tabpfn-v2" {
             return Some(Box::new(crate::machine_models::TabPfnV2Recipe::from_gguf(
                 gguf,
             )));
         }
 
-        #[cfg(feature = "jero-arch-decision-transformer")]
-        if params.architecture == "decision-transformer" {
+        #[cfg(feature = "jero-arch-machine")]
+        if arch == "decision-transformer" {
             return Some(Box::new(
                 crate::machine_models::DecisionTransformerRecipe::from_gguf(gguf),
             ));
         }
 
+        #[cfg(feature = "jero-arch-vision")]
+        if arch == "clip" {
+            return Some(Box::new(jero_arch_vision::ClipVisionRecipe::from_gguf(
+                gguf,
+            )));
+        } else if arch == "siglip" {
+            return Some(Box::new(jero_arch_vision::SiglipVisionRecipe::from_gguf(
+                gguf,
+            )));
+        }
+
+        #[cfg(feature = "jero-arch-whisper")]
+        if arch == "whisper"
+            && let Ok(recipe) = jero_arch_whisper::WhisperRecipe::from_gguf(gguf)
+        {
+            return Some(Box::new(recipe));
+        }
+
         Self::instantiate_from_hyperparams(&params, Some(gguf.metadata()))
+    }
+
+    /// Instantiates a boxed [`ArchRecipe`] dynamically hydrated from a parsed [`SafeTensorsFile`].
+    #[must_use]
+    pub fn instantiate_recipe_from_safetensors(
+        st: &SafeTensorsFile<'_>,
+    ) -> Option<Box<dyn ArchRecipe>> {
+        let arch = st.architecture();
+
+        #[cfg(feature = "jero-arch-gemma")]
+        if matches!(arch, "gemma2" | "gemma3" | "gemma3_text" | "functiongemma")
+            && let Ok(recipe) = crate::gemma::GemmaRecipe::from_safetensors(st)
+        {
+            return Some(Box::new(recipe));
+        } else if arch == "gemma4"
+            && let Ok(recipe) = crate::gemma::Gemma4Recipe::from_safetensors(st)
+        {
+            return Some(Box::new(recipe));
+        }
+
+        #[cfg(feature = "jero-arch-machine")]
+        match arch {
+            "ttm" => {
+                return Some(Box::new(
+                    crate::machine_models::TtmRecipe::from_safetensors(st),
+                ));
+            }
+            "ft-transformer" => {
+                return Some(Box::new(
+                    crate::machine_models::FtTransformerRecipe::from_safetensors(st),
+                ));
+            }
+            "tabpfn-v2" => {
+                return Some(Box::new(
+                    crate::machine_models::TabPfnV2Recipe::from_safetensors(st),
+                ));
+            }
+            "decision-transformer" => {
+                return Some(Box::new(
+                    crate::machine_models::DecisionTransformerRecipe::from_safetensors(st),
+                ));
+            }
+            _ => {}
+        }
+
+        #[cfg(feature = "jero-arch-vision")]
+        if arch == "clip" {
+            return Some(Box::new(
+                jero_arch_vision::ClipVisionRecipe::from_safetensors(st),
+            ));
+        } else if arch == "siglip" {
+            return Some(Box::new(
+                jero_arch_vision::SiglipVisionRecipe::from_safetensors(st),
+            ));
+        }
+
+        #[cfg(feature = "jero-arch-whisper")]
+        if arch == "whisper"
+            && let Ok(recipe) = jero_arch_whisper::WhisperRecipe::from_safetensors(st)
+        {
+            return Some(Box::new(recipe));
+        }
+
+        let _ = arch;
+        Self::instantiate_recipe(st.metadata())
     }
 }
 
@@ -2124,7 +2402,7 @@ fn validate_recipe_against_metadata(
         });
     }
 
-    #[cfg(feature = "jero-kernels-rvv")]
+    #[cfg(feature = "jero-arch-qwen")]
     crate::qwen_deepseek::validate_qwen_revision_from_probe(recipe.architecture_id(), |name| {
         metadata.find_tensor(name).is_some()
     })?;
@@ -2133,15 +2411,16 @@ fn validate_recipe_against_metadata(
 }
 
 /// Verifies that the model's architecture recipe is compiled, dynamically hydrates its GGUF
-/// hyperparameters, and validates that every tensor's quantization layout and structural
-/// `RoPE` / softcapping invariant is valid for the active backend (ADR-023, US-01 Scenario 1).
+/// hyperparameters, validates quantization/structural invariants, and enforces ADR-045
+/// `validate_model` weight checks whenever tensor descriptors are present (`!tensors().is_empty()`,
+/// preserving metadata-only verification for empty-tensor headers) (ADR-023, US-01 Scenario 1).
 ///
 /// # Errors
 ///
-/// Returns [`K3Error::CapabilityMismatch`] if:
+/// Returns [`K3Error::CapabilityMismatch`] or [`K3Error::TensorBoundsError`] if:
 /// - The model's `general.architecture` has no compiled recipe in this binary.
 /// - Any tensor in the model uses a quantization layout unsupported by the matching recipe.
-/// - Any extracted `RoPE`, softcapping, or `value_length` invariant fails validation.
+/// - Any extracted `RoPE`, softcapping, `value_length`, or ADR-045 weight-presence check fails.
 /// - The trained context window is zero.
 pub fn verify_model_capabilities(model: &GgufFile<'_>) -> Result<Box<dyn ArchRecipe>, K3Error> {
     validate_raw_gguf_hyperparams(model)?;
@@ -2157,7 +2436,57 @@ pub fn verify_model_capabilities(model: &GgufFile<'_>) -> Result<Box<dyn ArchRec
         }
     })?;
     validate_recipe_against_metadata(recipe.as_ref(), &params, model.metadata())?;
+    if !model.metadata().tensors().is_empty() {
+        recipe.validate_model(model.metadata(), model)?;
+    }
     Ok(recipe)
+}
+
+/// Verifies that a parsed [`SafeTensorsFile`] satisfies compiled recipe registration,
+/// quantization compatibility, metadata bounds, and ADR-045 `validate_model` checks when
+/// weights are present (`!tensors().is_empty()`).
+///
+/// # Errors
+///
+/// Returns [`K3Error::CapabilityMismatch`] or [`K3Error::TensorBoundsError`] on unsupported
+/// architectures, incompatible dtypes, or missing/malformed tensors.
+pub fn verify_safetensors_capabilities(
+    model: &SafeTensorsFile<'_>,
+) -> Result<Box<dyn ArchRecipe>, K3Error> {
+    let arch = model.metadata().architecture();
+    let recipe = RecipeRegistry::instantiate_recipe_from_safetensors(model).ok_or_else(|| {
+        K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!(
+                "architecture '{arch}' is not compiled into this binary (compiled recipes: {:?})",
+                RecipeRegistry::supported_architectures()
+            ),
+        }
+    })?;
+    let params = GgufHyperparams::from_metadata(model.metadata());
+    validate_recipe_against_metadata(recipe.as_ref(), &params, model.metadata())?;
+    if !model.metadata().tensors().is_empty() {
+        recipe.validate_model(model.metadata(), model)?;
+    }
+    Ok(recipe)
+}
+
+/// Detects `GGUF` (`0x4655_4747`) vs `SafeTensors` container framing and runs capability
+/// verification across either binary format.
+///
+/// # Errors
+/// Returns [`K3Error::TensorBoundsError`] or [`K3Error::CapabilityMismatch`] on malformed
+/// headers, uncompiled architectures, or ADR-045 validation failures.
+pub fn verify_container_capabilities(bytes: &[u8]) -> Result<Box<dyn ArchRecipe>, K3Error> {
+    if bytes.len() >= 4
+        && u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) == GGUF_MAGIC
+    {
+        let gguf = GgufFile::parse(bytes)?;
+        verify_model_capabilities(&gguf)
+    } else {
+        let st = SafeTensorsFile::from_bytes(bytes)?;
+        verify_safetensors_capabilities(&st)
+    }
 }
 
 /// Verifies that the extracted [`ModelMetadata`] satisfies compile-time recipe and
@@ -2229,52 +2558,130 @@ mod tests {
             assert!(archs.contains(&"gemma4"));
             assert!(archs.contains(&"functiongemma"));
         }
-        #[cfg(feature = "jero-arch-modernbert")]
+        #[cfg(feature = "jero-arch-encoder")]
         {
             assert!(archs.contains(&"modernbert"));
             assert!(archs.contains(&"bert"));
+            assert!(archs.contains(&"nomic-bert"));
+            assert!(archs.contains(&"bge"));
+            assert!(archs.contains(&"jina-bert"));
             assert!(archs.contains(&"deberta-v3"));
+            assert!(archs.contains(&"cross-encoder"));
+            assert!(archs.contains(&"reranker"));
+            assert!(archs.contains(&"bge-reranker"));
+            assert!(archs.contains(&"jina-reranker"));
+            assert!(archs.contains(&"modernbert-reranker"));
         }
-        #[cfg(feature = "jero-kernels-rvv")]
+        #[cfg(feature = "jero-arch-qwen")]
         {
             assert!(archs.contains(&"qwen2"));
             assert!(archs.contains(&"qwen3"));
             assert!(archs.contains(&"qwen3moe"));
+            assert!(archs.contains(&"qwen3-embedding"));
             assert!(archs.contains(&"deepseek2"));
             assert!(archs.contains(&"qwen35"));
             assert!(archs.contains(&"qwen35moe"));
             assert!(!archs.contains(&"qwen3.8"));
         }
+        #[cfg(feature = "jero-arch-vision")]
+        {
+            assert!(archs.contains(&"clip"));
+            assert!(archs.contains(&"siglip"));
+        }
+        #[cfg(feature = "jero-arch-whisper")]
+        assert!(archs.contains(&"whisper"));
     }
 
-    #[cfg(feature = "jero-arch-modernbert")]
+    #[cfg(feature = "jero-arch-encoder")]
+    fn patch_encoder_f32_chunks(bytes: &mut [u8], specs: &[(&str, QuantType, Vec<usize>)]) {
+        let chunks: Vec<Vec<u8>> = specs
+            .iter()
+            .enumerate()
+            .map(|(idx, (name, _, shape))| {
+                let elems: usize = shape.iter().product();
+                (0..elems)
+                    .flat_map(|i| {
+                        #[expect(
+                            clippy::cast_precision_loss,
+                            reason = "small deterministic test index fits f32"
+                        )]
+                        let val = if name.ends_with("norm.weight") {
+                            1.0_f32
+                        } else {
+                            (((i * 7 + idx * 5 + 3) % 19) as f32 - 9.0) * 0.05
+                        };
+                        val.to_le_bytes()
+                    })
+                    .collect()
+            })
+            .collect();
+        let total_bytes: usize = chunks.iter().map(Vec::len).sum();
+        let mut cursor = bytes.len() - total_bytes;
+        for chunk in chunks {
+            bytes[cursor..cursor + chunk.len()].copy_from_slice(&chunk);
+            cursor += chunk.len();
+        }
+    }
+
+    #[cfg(feature = "jero-arch-encoder")]
+    fn build_synthetic_encoder_gguf(arch: &str) -> Vec<u8> {
+        use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
+
+        let (h, ffn, vocab, labels, buckets) = (8, 16, 16, 3, 16);
+        let mut owned_specs: Vec<(&str, QuantType, Vec<usize>)> = vec![
+            ("token_embd.weight", QuantType::F32, vec![h, vocab]),
+            ("blk.0.attn_norm.weight", QuantType::F32, vec![h]),
+            ("blk.0.attn_q.weight", QuantType::F32, vec![h, h]),
+            ("blk.0.attn_k.weight", QuantType::F32, vec![h, h]),
+            ("blk.0.attn_v.weight", QuantType::F32, vec![h, h]),
+            ("blk.0.attn_output.weight", QuantType::F32, vec![h, h]),
+            ("blk.0.ffn_norm.weight", QuantType::F32, vec![h]),
+            ("blk.0.ffn_up.weight", QuantType::F32, vec![h, ffn]),
+            ("blk.0.ffn_down.weight", QuantType::F32, vec![ffn, h]),
+            ("classifier.weight", QuantType::F32, vec![h, labels]),
+            ("classifier.bias", QuantType::F32, vec![labels]),
+        ];
+        if arch == "deberta-v3" {
+            owned_specs.push(("rel_embeddings.weight", QuantType::F32, vec![h, buckets]));
+        }
+        if matches!(arch, "nomic-bert" | "jina-bert") {
+            owned_specs.push(("blk.0.ffn_gate.weight", QuantType::F32, vec![h, ffn]));
+        }
+        let tensor_specs: Vec<(&str, QuantType, &[usize])> = owned_specs
+            .iter()
+            .map(|(n, q, s)| (*n, *q, s.as_slice()))
+            .collect();
+        let keys = [
+            format!("{arch}.block_count"),
+            format!("{arch}.embedding_length"),
+            format!("{arch}.feed_forward_length"),
+            format!("{arch}.attention.head_count"),
+        ];
+        let kvs = [
+            (keys[0].as_str(), GgufValue::Uint32(1)),
+            (keys[1].as_str(), GgufValue::Uint32(8)),
+            (keys[2].as_str(), GgufValue::Uint32(16)),
+            (keys[3].as_str(), GgufValue::Uint32(2)),
+        ];
+        let mut bytes = create_synthetic_gguf_v3_with_kvs(arch, 64, &kvs, &tensor_specs);
+        patch_encoder_f32_chunks(&mut bytes, &owned_specs);
+        bytes
+    }
+
+    #[cfg(feature = "jero-arch-encoder")]
     #[test]
     fn test_modernbert_and_bert_classifier_pass() {
-        use jero_core::{
-            ExecutionContext, GgufValue, test_helpers::create_synthetic_gguf_v3_with_kvs,
-        };
+        use jero_core::ExecutionContext;
 
-        for arch in ["modernbert", "bert", "deberta-v3"] {
-            let tensor_specs = [
-                ("token_embd.weight", QuantType::F32, &[8, 16][..]),
-                ("blk.0.attn_q.weight", QuantType::F32, &[8, 8][..]),
-                ("classifier.weight", QuantType::F32, &[8, 3][..]),
-            ];
-            let bytes = if cfg!(miri) {
-                let k_blocks = format!("{arch}.block_count");
-                let k_emb = format!("{arch}.embedding_length");
-                let k_ffn = format!("{arch}.feed_forward_length");
-                let k_heads = format!("{arch}.attention.head_count");
-                let kvs = [
-                    (k_blocks.as_str(), GgufValue::Uint32(1)),
-                    (k_emb.as_str(), GgufValue::Uint32(8)),
-                    (k_ffn.as_str(), GgufValue::Uint32(16)),
-                    (k_heads.as_str(), GgufValue::Uint32(2)),
-                ];
-                create_synthetic_gguf_v3_with_kvs(arch, 64, &kvs, &tensor_specs)
-            } else {
-                create_synthetic_gguf_v3(arch, 64, &tensor_specs)
-            };
+        for arch in [
+            "modernbert",
+            "bert",
+            "nomic-bert",
+            "bge",
+            "jina-bert",
+            "deberta-v3",
+        ] {
+            let bytes = build_synthetic_encoder_gguf(arch);
             let model = GgufFile::parse(&bytes).expect("parse encoder model");
             let recipe = verify_model_capabilities(&model).expect("encoder capability check");
             assert_eq!(recipe.architecture_id(), arch);
@@ -2347,9 +2754,9 @@ mod tests {
             let llama4 = RecipeRegistry::find_recipe("llama4").expect("llama4 found");
             assert_eq!(llama4.architecture_id(), "llama4");
             let qwen2 = RecipeRegistry::find_recipe("qwen2").expect("qwen2 found");
-            #[cfg(feature = "jero-kernels-rvv")]
+            #[cfg(feature = "jero-arch-qwen")]
             assert_eq!(qwen2.architecture_id(), "qwen2");
-            #[cfg(not(feature = "jero-kernels-rvv"))]
+            #[cfg(not(feature = "jero-arch-qwen"))]
             assert_eq!(qwen2.architecture_id(), "llama");
         }
 
@@ -2483,6 +2890,12 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn test_issue_137_rope_value_length_softcap_extraction_and_hydration() {
+        #[cfg(any(
+            feature = "jero-arch-llama",
+            feature = "jero-arch-qwen",
+            feature = "jero-arch-phi3",
+            feature = "jero-arch-gemma"
+        ))]
         use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
 
         // 1. Llama 3.2 (llama3 RoPE scaling + explicit rope.dimension_count + orig_ctx_len)
@@ -2521,6 +2934,7 @@ mod tests {
         }
 
         // 2. Qwen2.5 (rope.dimension_count + yarn scaling + sliding_window)
+        #[cfg(feature = "jero-arch-qwen")]
         {
             let kvs = [
                 ("qwen2.block_count", GgufValue::Uint32(24)),
@@ -2633,7 +3047,7 @@ mod tests {
         }
 
         // 5. DeepSeek-R1-Distill (deepseek2 MLA + value_length & rope.dimension_count)
-        #[cfg(feature = "jero-kernels-rvv")]
+        #[cfg(feature = "jero-arch-qwen")]
         {
             let ds_kvs = [
                 ("deepseek2.block_count", GgufValue::Uint32(4)),
@@ -2814,6 +3228,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        feature = "jero-arch-phi3",
+        feature = "jero-arch-llama",
+        feature = "jero-arch-mistral"
+    ))]
     fn test_issue_120_mixed_quant_admission_phi3_llama_mistral() {
         let mixed_quants = [
             QuantType::Q4_0,
@@ -2843,6 +3262,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jero-arch-ssm")]
     fn test_ssm_shortconv_wkv_and_granite_hyperparams_extraction() {
         use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
 
@@ -2980,6 +3400,145 @@ mod tests {
                 ),
                 "expected invalid hyperparameter on {arch} to fail closed"
             );
+        }
+    }
+
+    #[cfg(any(
+        feature = "jero-arch-encoder",
+        feature = "jero-arch-qwen",
+        feature = "jero-arch-vision",
+        feature = "jero-arch-whisper"
+    ))]
+    fn assert_safetensors_meta_verifies(
+        meta: &[(&str, &str)],
+        expected_arch: &str,
+        requires_kv: bool,
+    ) {
+        use jero_core::safetensors::SafeTensorsFile;
+        use jero_core::safetensors::test_helpers::create_synthetic_safetensors;
+
+        let st_bytes = create_synthetic_safetensors(meta, &[]);
+        let st = SafeTensorsFile::from_bytes(&st_bytes).expect("parse st");
+        let recipe = verify_safetensors_capabilities(&st).expect("verify st");
+        assert_eq!(recipe.architecture_id(), expected_arch);
+        assert_eq!(recipe.requires_kv_cache(), requires_kv);
+    }
+
+    fn assert_multimodal_registry_flags() {
+        use crate::memory::architecture_requires_kv_cache;
+
+        let supported = RecipeRegistry::supported_architectures();
+        let checks = [
+            ("nomic-bert", false, cfg!(feature = "jero-arch-encoder")),
+            ("bge", false, cfg!(feature = "jero-arch-encoder")),
+            ("jina-bert", false, cfg!(feature = "jero-arch-encoder")),
+            ("bge-reranker", false, cfg!(feature = "jero-arch-encoder")),
+            ("jina-reranker", false, cfg!(feature = "jero-arch-encoder")),
+            ("qwen3-embedding", false, cfg!(feature = "jero-arch-qwen")),
+            ("clip", false, cfg!(feature = "jero-arch-vision")),
+            ("siglip", false, cfg!(feature = "jero-arch-vision")),
+            ("whisper", true, cfg!(feature = "jero-arch-whisper")),
+        ];
+        for (arch, expects_kv, compiled_in) in checks {
+            assert_eq!(
+                architecture_requires_kv_cache(arch),
+                expects_kv,
+                "unexpected KV requirement for {arch}"
+            );
+            if compiled_in {
+                assert!(
+                    supported.contains(&arch),
+                    "expected {arch} in RecipeRegistry"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_safetensors_and_multimodal_registry_hydration() {
+        assert_multimodal_registry_flags();
+
+        #[cfg(feature = "jero-arch-encoder")]
+        for arch in [
+            "nomic-bert",
+            "bge",
+            "jina-bert",
+            "bge-reranker",
+            "jina-reranker",
+        ] {
+            assert_safetensors_meta_verifies(
+                &[
+                    ("general.architecture", arch),
+                    ("num_hidden_layers", "1"),
+                    ("hidden_size", "8"),
+                    ("intermediate_size", "16"),
+                    ("num_attention_heads", "2"),
+                ],
+                arch,
+                false,
+            );
+        }
+        #[cfg(feature = "jero-arch-qwen")]
+        assert_safetensors_meta_verifies(
+            &[
+                ("general.architecture", "qwen3-embedding"),
+                ("num_hidden_layers", "1"),
+                ("hidden_size", "16"),
+                ("intermediate_size", "32"),
+                ("num_attention_heads", "2"),
+                ("num_key_value_heads", "1"),
+                ("head_dim", "8"),
+            ],
+            "qwen3-embedding",
+            false,
+        );
+        #[cfg(feature = "jero-arch-vision")]
+        for arch in ["clip", "siglip"] {
+            assert_safetensors_meta_verifies(
+                &[
+                    ("general.architecture", arch),
+                    ("clip.vision.image_size", "4"),
+                    ("clip.vision.patch_size", "2"),
+                    ("clip.vision.embedding_length", "8"),
+                ],
+                arch,
+                false,
+            );
+        }
+        #[cfg(feature = "jero-arch-whisper")]
+        assert_safetensors_meta_verifies(
+            &[
+                ("general.architecture", "whisper"),
+                ("num_mel_bins", "80"),
+                ("d_model", "16"),
+                ("encoder_attention_heads", "2"),
+                ("decoder_attention_heads", "2"),
+                ("encoder_ffn_dim", "32"),
+                ("decoder_ffn_dim", "32"),
+                ("max_source_positions", "8"),
+                ("max_target_positions", "12"),
+                ("vocab_size", "24"),
+            ],
+            "whisper",
+            true,
+        );
+
+        #[cfg(feature = "jero-arch-encoder")]
+        {
+            use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
+
+            let gguf_bytes = create_synthetic_gguf_v3_with_kvs(
+                "bge",
+                32,
+                &[
+                    ("bge.block_count", GgufValue::Uint32(1)),
+                    ("bge.embedding_length", GgufValue::Uint32(8)),
+                    ("bge.attention.head_count", GgufValue::Uint32(2)),
+                ],
+                &[],
+            );
+            let gguf_recipe = verify_container_capabilities(&gguf_bytes).expect("verify bge gguf");
+            assert_eq!(gguf_recipe.architecture_id(), "bge");
         }
     }
 }

@@ -5,7 +5,7 @@
 
 use std::ptr;
 
-use jero_core::{GgufFile, K3Error, ModelMetadata, align_up};
+use jero_core::{GgufFile, K3Error, ModelMetadata, SafeTensorsFile, align_up};
 
 use crate::capability::GgufHyperparams;
 use crate::memory::{KV_BLOCK_SIZE, system_page_size};
@@ -153,7 +153,20 @@ impl SingleSlotKvArena {
         }
 
         let params = GgufHyperparams::from_metadata(metadata);
-        let layer_count = params.block_count.max(1);
+        let layer_count = if let Some(dory) = metadata.dory() {
+            let virtual_layers = dory
+                .input_layer_count()
+                .saturating_add(
+                    dory.recurrent_layer_count()
+                        .saturating_mul(dory.num_loops()),
+                )
+                .saturating_add(dory.output_layer_count());
+            usize::try_from(virtual_layers)
+                .unwrap_or(params.block_count)
+                .max(1)
+        } else {
+            params.block_count.max(1)
+        };
         if metadata.architecture() == "deepseek2" || metadata.kv_lora_rank().is_some() {
             let kv_lora_rank = metadata.kv_lora_rank().unwrap_or(512).max(1);
             let qk_rope_head_dim = metadata.qk_rope_head_dim().unwrap_or(64).max(1);
@@ -170,6 +183,16 @@ impl SingleSlotKvArena {
             .max(1);
 
         Self::with_dimensions(layer_count, head_count_kv, head_dim, n_ctx)
+    }
+
+    /// Allocates and locks an in-process single-slot KV cache arena from a parsed
+    /// [`SafeTensorsFile`], mirroring [`Self::new`] and [`Self::from_gguf`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::new`].
+    pub fn from_safetensors(st: &SafeTensorsFile<'_>, n_ctx: usize) -> Result<Self, K3Error> {
+        Self::new(st.metadata(), n_ctx)
     }
 
     /// Allocates and locks an in-process single-slot KV cache arena from a parsed [`GgufFile`],

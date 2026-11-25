@@ -17,6 +17,34 @@ source.cargo = "jero-kv-cache"
 depends-on = ["jero-tokenizer"]
 source.cargo = "jero-tokenizer"
 
+[[plugins]]
+depends-on = ["jero-arch-gemma"]
+source.cargo = "jero-arch-gemma"
+
+[[plugins]]
+depends-on = ["jero-arch-qwen"]
+source.cargo = "jero-arch-qwen"
+
+[[plugins]]
+depends-on = ["jero-arch-encoder"]
+source.cargo = "jero-arch-encoder"
+
+[[plugins]]
+depends-on = ["jero-arch-ssm"]
+source.cargo = "jero-arch-ssm"
+
+[[plugins]]
+depends-on = ["jero-arch-machine"]
+source.cargo = "jero-arch-machine"
+
+[[plugins]]
+depends-on = ["jero-arch-vision"]
+source.cargo = "jero-arch-vision"
+
+[[plugins]]
+depends-on = ["jero-arch-whisper"]
+source.cargo = "jero-arch-whisper"
+
 [[installations]]
 name = "jero-diag"
 executable = "jero-diag"

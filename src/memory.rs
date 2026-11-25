@@ -215,7 +215,11 @@ pub fn gemma_layer_kv_policies(
         .collect()
 }
 
+#[cfg(feature = "jero-arch-ssm")]
+pub use jero_arch_ssm::HybridLayerKind;
+
 /// Disambiguates per-layer state backing across hybrid SSM/short-conv/attention architectures (`#59`).
+#[cfg(not(feature = "jero-arch-ssm"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HybridLayerKind {
     /// Standard transformer GQA attention layer backed by paged KV cache blocks.
@@ -857,13 +861,30 @@ pub fn calculate_footprint(
 }
 
 /// Returns `true` if `arch` requires an autoregressive KV cache allocation (`false` for
-/// single-pass encoders such as `modernbert`, `bert`, and `deberta-v3`, and non-autoregressive
-/// machine models such as `ttm`, `ft-transformer`, and `tabpfn-v2`).
+/// single-pass encoders/rerankers such as `modernbert`, `bert`, `deberta-v3`, `nomic-bert`,
+/// `bge`, `jina-bert`, `qwen3-embedding`, `cross-encoder`, vision encoders `clip`/`siglip`,
+/// and non-autoregressive machine models such as `ttm`, `ft-transformer`, and `tabpfn-v2`).
 #[must_use]
 pub const fn architecture_requires_kv_cache(arch: &str) -> bool {
     !matches!(
         arch.as_bytes(),
-        b"modernbert" | b"bert" | b"deberta-v3" | b"ttm" | b"ft-transformer" | b"tabpfn-v2"
+        b"modernbert"
+            | b"bert"
+            | b"deberta-v3"
+            | b"nomic-bert"
+            | b"bge"
+            | b"jina-bert"
+            | b"cross-encoder"
+            | b"reranker"
+            | b"bge-reranker"
+            | b"jina-reranker"
+            | b"modernbert-reranker"
+            | b"qwen3-embedding"
+            | b"clip"
+            | b"siglip"
+            | b"ttm"
+            | b"ft-transformer"
+            | b"tabpfn-v2"
     )
 }
 
