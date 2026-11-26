@@ -344,7 +344,7 @@ checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 [[package]]
 name = "jero-arch-bitnet"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-bitnet.git?branch=feat%2Fm10-multimodal-runtime#9cf1d4964ec6aa782a27e1e465883d1b6dc4dc6f"
+source = "git+https://github.com/LMA1980/jero-arch-bitnet.git?branch=main#52bfc7b7e38e0cce2badaec0d4bf345d236fe73a"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
@@ -353,7 +353,7 @@ dependencies = [
 [[package]]
 name = "jero-arch-dory"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-dory.git?branch=feat%2Fm10-multimodal-runtime#bbc93272252ec9e302ce542b00e3ed5b95ee8d07"
+source = "git+https://github.com/LMA1980/jero-arch-dory.git?branch=main#9af392137e5013e1ff5dbc8e144a5aa96ece4039"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
@@ -363,7 +363,7 @@ dependencies = [
 [[package]]
 name = "jero-arch-encoder"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-encoder.git?branch=feat%2Fm10-multimodal-runtime#2444aaa531ce4e8dc44306bb01b368cbe2cc5ec0"
+source = "git+https://github.com/LMA1980/jero-arch-encoder.git?branch=main#fc5a10c4fded93a09dbb0e9451d269b62c296408"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
@@ -372,7 +372,7 @@ dependencies = [
 [[package]]
 name = "jero-arch-gemma"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-gemma.git?branch=feat%2Fm10-multimodal-runtime#b4536cd2b0d5e70b36605e5d127eaf17ccb159aa"
+source = "git+https://github.com/LMA1980/jero-arch-gemma.git?branch=main#3240c54ac7f449399a72035cc12b7209e3b2b18f"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
@@ -382,7 +382,7 @@ dependencies = [
 [[package]]
 name = "jero-arch-llama"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-llama.git?branch=feat%2Fm10-multimodal-runtime#d6f7a5ae2fd0fe5ca721aa4c2089daae8725a696"
+source = "git+https://github.com/LMA1980/jero-arch-llama.git?branch=main#4be4658794bf72604ad96b3619817934de1a2f97"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
@@ -392,7 +392,7 @@ dependencies = [
 [[package]]
 name = "jero-arch-machine"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-machine.git?branch=feat%2Fm10-multimodal-runtime#f8d3d52e60dfa5b518adbc2ee3960c1fcc764918"
+source = "git+https://github.com/LMA1980/jero-arch-machine.git?branch=main#1f0dee9e76fbb47d1046a50bb98d3df6b21b981c"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
@@ -401,7 +401,7 @@ dependencies = [
 [[package]]
 name = "jero-arch-mistral"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-mistral.git?branch=feat%2Fm10-multimodal-runtime#8aef770787b2cf333666be00e76dd066fe7de18d"
+source = "git+https://github.com/LMA1980/jero-arch-mistral.git?branch=main#f78bc0ce443b3f7077e2b35a7d8f64675206c84f"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
@@ -411,7 +411,7 @@ dependencies = [
 [[package]]
 name = "jero-arch-phi3"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-phi3.git?branch=feat%2Fm10-multimodal-runtime#bb492c47c7195a22273507a265b6456fb07d62ba"
+source = "git+https://github.com/LMA1980/jero-arch-phi3.git?branch=main#740604ea95a0b89c0c5020685860762242268591"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
@@ -421,7 +421,7 @@ dependencies = [
 [[package]]
 name = "jero-arch-qwen"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-qwen.git?branch=feat%2Fm10-multimodal-runtime#14d76e6459ea5f0aab80f8336060150d3b05c5fc"
+source = "git+https://github.com/LMA1980/jero-arch-qwen.git?branch=main#e683e895a9ebf566af19269c4247d6d976e3fb4f"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
@@ -431,7 +431,7 @@ dependencies = [
 [[package]]
 name = "jero-arch-ssm"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-ssm.git?branch=feat%2Fm10-multimodal-runtime#4d34122448ba878ec99ab49ce6c003cf41105d6c"
+source = "git+https://github.com/LMA1980/jero-arch-ssm.git?branch=main#c01e56af6312313af55ce7b09450835248fbdfa3"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
@@ -441,7 +441,7 @@ dependencies = [
 [[package]]
 name = "jero-arch-synthetic"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-synthetic.git?branch=feat%2Fm10-multimodal-runtime#eebd83bad3dfbc6a9cdbcac902031be988298701"
+source = "git+https://github.com/LMA1980/jero-arch-synthetic.git?branch=main#183c854e92217ff38f23154280c372ffa9695813"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
@@ -450,7 +450,7 @@ dependencies = [
 [[package]]
 name = "jero-arch-vision"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-vision.git?branch=feat%2Fm10-multimodal-runtime#3799eb5d4ce4e809c81039e47eec9ad8b4251888"
+source = "git+https://github.com/LMA1980/jero-arch-vision.git?branch=main#929f624ae985bcdb117f10a7a421509cc9cdcf01"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
@@ -459,7 +459,7 @@ dependencies = [
 [[package]]
 name = "jero-arch-whisper"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-arch-whisper.git?branch=feat%2Fm10-multimodal-runtime#e049cc7198db4fcfb91ed52d20a72597082cbf61"
+source = "git+https://github.com/LMA1980/jero-arch-whisper.git?branch=main#0421980ba58a6cc5981dffde64503200d7dfaeec"
 dependencies = [
  "jero-core",
  "jero-kernels-rvv",
@@ -468,7 +468,7 @@ dependencies = [
 [[package]]
 name = "jero-core"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-core.git?branch=feat%2Fm10-multimodal-runtime#1e89b956b7828e30f8911ff4f0d6440f0d9c335c"
+source = "git+https://github.com/LMA1980/jero-core.git?branch=main#34381851e9e8f3a328655ae30299cd28e1011acc"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -517,7 +517,7 @@ dependencies = [
 [[package]]
 name = "jero-kernels-rvv"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-kernels-rvv.git?branch=feat%2Fm10-multimodal-runtime#d1f1479e5d54764b71bbb0bf4b937fd3663edca3"
+source = "git+https://github.com/LMA1980/jero-kernels-rvv.git?branch=main#d28aea39102c776d0deec4816fd991d303b5fa36"
 dependencies = [
  "jero-core",
 ]
@@ -525,7 +525,7 @@ dependencies = [
 [[package]]
 name = "jero-tokenizer"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-tokenizer.git?branch=feat%2Fm10-multimodal-runtime#0357bb203a1c46ff5f551809425a5172add2e0ce"
+source = "git+https://github.com/LMA1980/jero-tokenizer.git?branch=main#c03fea579bea3a6008ae13e00f2926185124f5c5"
 dependencies = [
  "jero-core",
 ]
