@@ -945,12 +945,22 @@ fn test_gemma3_q8_0_golden_parity_and_prompt_sensitivity() {
     assert_eq!(dump_a.architecture, "gemma3");
     verify_prompt_sensitivity(&dump_a, &dump_b)
         .expect("authentic GemmaRecipe must produce distinct logits for distinct prompts");
+    // On `riscv64` (non-Miri), `jero-arch-gemma` dispatches `vec_dot_q8_0` to RVV `Q8_0 x Q8_0`
+    // integer GEMV with on-the-fly `BlockQ8_0` activation quantization, whereas
+    // `GOLDEN_GEMMA3_Q8_0_JSON` was captured against scalar `f32`-activation execution.
+    // Keep greedy token sequence, full top-k rank ordering, and prompt sensitivity strict while
+    // bounding the `Q8_0` activation quantization delta on `riscv64`.
+    let (min_cosine_sim, max_abs_logit_err) = if cfg!(all(target_arch = "riscv64", not(miri))) {
+        (0.9995, 0.5)
+    } else {
+        (0.9999, 1.0e-4)
+    };
     verify_or_update_golden(
         "gemma3_authentic_q8_0.json",
         GOLDEN_GEMMA3_Q8_0_JSON,
         &dump_a,
         |actual, golden| {
-            verify_parity_against_golden(actual, golden, 0.9999, 1.0e-4)
+            verify_parity_against_golden(actual, golden, min_cosine_sim, max_abs_logit_err)
                 .expect("GemmaRecipe parity dump must match golden fixture");
         },
     );
